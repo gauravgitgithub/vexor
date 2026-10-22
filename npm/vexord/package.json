@@ -1,0 +1,28 @@
+{
+  "name": "vexord",
+  "version": "0.0.0",
+  "description": "Rust-native process manager for Node.js apps (pre-alpha). Installs the `vexor` command.",
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/gauravgitgithub/vexor.git"
+  },
+  "bin": {
+    "vexor": "bin/vexor.js"
+  },
+  "files": [
+    "bin/vexor.js",
+    "README.md",
+    "LICENSE-MIT",
+    "LICENSE-APACHE"
+  ],
+  "engines": {
+    "node": ">=10"
+  },
+  "optionalDependencies": {
+    "vexord-darwin-arm64": "0.0.0",
+    "vexord-darwin-x64": "0.0.0",
+    "vexord-linux-arm64": "0.0.0",
+    "vexord-linux-x64": "0.0.0"
+  }
+}

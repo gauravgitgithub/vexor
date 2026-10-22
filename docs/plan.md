@@ -19,8 +19,18 @@ Goal: `vexor start app.js --name api -i 1`, `stop`, `restart`, `delete`, `list -
 | 2.7 ✅ | Log capture + size rotation + drop policy (writer thread per log file, bounded queue, `drop`/`block` overflow, reopen after external move, write errors reported once) | 1 GB flood: ≤ 3 files of 1 MiB on disk, shim peak RSS ~6 MB, app exit 0 (macOS + Linux); block mode keeps all 200,000 lines across rotation; drop mode accounts for every byte |
 | 2.8 ✅ | Legacy runtime checks in CI (`legacy-node` job): static Linux x64 musl binary, `tests/legacy/node-smoke.sh` in `node:<v>-alpine` for Node 8, 10, 12, 14, 16, 18, 20, 22, 24 | 6 checks per version (ready via IPC, natural exit with IPC open, graceful SIGTERM, crash restart + crash-loop limit, args/env/cwd/instances, readiness timeout); all pass locally on linux-arm64; CI result below |
 
-## Phase 3: npm distribution
-Static musl builds need a C cross compiler for the bundled SQLite (`musl-gcc` from musl-tools natively, or cargo-zigbuild for cross targets); release binary is ~3.7 MB (was ~1 MB before SQLite). ES5 wrapper, platform packages (linux-x64/arm64 musl, darwin-arm64), release workflow with checksums, attestations and SBOM, clean-machine install test, `install.sh` route.
+## Phase 3: npm distribution (mostly done, not yet published)
+
+Done:
+- `vexord` launcher (ES5, no dependencies, no install scripts) + platform packages `vexord-{linux,darwin}-{x64,arm64}` with `os`/`cpu` filtering; `npm/scripts/stage.js` stamps the Cargo version and checks the package list against the launcher.
+- `install.sh`: direct binary install, mandatory SHA-256 check, no sudo.
+- CI on every push: static linux-x64 binary → launcher checks on Node 10–24 (npm 6, 8, 10, 11) and install.sh checksum checks; macOS launcher check.
+- `release.yml` on `v*.*.*` tags: 4 targets, `SHA256SUMS`, CycloneDX SBOM, build-provenance attestations, GitHub Release (prerelease), npm publish with provenance only when the `NPM_TOKEN` secret is set.
+
+Open:
+- Reserve the npm names (needs `npm login`), add `NPM_TOKEN`, cut `v0.1.0`. The release workflow has not run yet; its first run is the real test.
+- Static musl builds need a C cross compiler for the bundled SQLite (`musl-gcc`; cargo-zigbuild if cross-compiling); release binary is ~3.7 MB.
+- pnpm/yarn and `--ignore-scripts` install checks; darwin-x64 is built but only smoke-tested by `--version` skipping (cross-built on arm64 runners).
 
 ## Phase 4: PM2 compatibility
 Ecosystem loader (app's Node), field classifier + warnings, cluster-shim, health-gated `reload` (architecture.md §6a; acceptance: under constant `wrk2` load, cluster `-i 1` reload → 0 failed requests; replacement that never sends ready → old kept, reload reported failed, 0 failed requests; fork `start-first` on a fixed port → EADDRINUSE detected, old kept), `wait_ready`/`listen_timeout`, `save`/`resurrect`/`startup`, conformance fixtures diffed against PM2 7.x behaviour.

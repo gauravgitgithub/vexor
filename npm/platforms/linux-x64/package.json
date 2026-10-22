@@ -1,0 +1,14 @@
+{
+  "name": "vexord-linux-x64",
+  "version": "0.0.0",
+  "description": "The vexor binary for linux x64. Installed automatically by the `vexord` package.",
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/gauravgitgithub/vexor.git"
+  },
+  "os": ["linux"],
+  "cpu": ["x64"],
+  "files": ["bin/vexor", "LICENSE-MIT", "LICENSE-APACHE"],
+  "preferUnplugged": true
+}

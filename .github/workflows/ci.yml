@@ -50,9 +50,10 @@ jobs:
         with:
           command: check all
 
-  # Managed-app runtime compatibility (docs/compatibility.md §2): a static
-  # Linux x64 binary supervising apps on Node 8 through 24.
-  legacy-node:
+  # The static Linux x64 binary as users get it: managed-app runtime
+  # compatibility (docs/compatibility.md §2), the npm launcher on every
+  # supported Node/npm, and install.sh checksum verification.
+  linux-x64-static:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -65,16 +66,62 @@ jobs:
         run: |
           rustup target add x86_64-unknown-linux-musl
           cargo build --release --locked --target x86_64-unknown-linux-musl
-          mkdir -p dist
-          cp target/x86_64-unknown-linux-musl/release/vexor dist/
-      - name: Node 8, 10, 12, 14, 16, 18, 20, 22, 24
+          mkdir -p dist/x86_64-unknown-linux-musl
+          cp target/x86_64-unknown-linux-musl/release/vexor dist/x86_64-unknown-linux-musl/
+      - name: Managed apps on Node 8, 10, 12, 14, 16, 18, 20, 22, 24
         run: |
           failed=""
           for v in 8 10 12 14 16 18 20 22 24; do
-            docker run --rm -v "$PWD/dist":/v:ro -v "$PWD/tests/legacy":/t:ro \
+            docker run --rm -v "$PWD/dist/x86_64-unknown-linux-musl":/v:ro -v "$PWD/tests/legacy":/t:ro \
               "node:$v-alpine" /t/node-smoke.sh || failed="$failed $v"
           done
           if [ -n "$failed" ]; then
             echo "::error::legacy Node checks failed on:$failed"
             exit 1
           fi
+      - name: Pack npm packages
+        run: |
+          node npm/scripts/stage.js --dist dist --out stage --allow-missing
+          mkdir -p tgz
+          for d in stage/*; do (cd "$d" && npm pack --pack-destination ../../tgz); done
+      - name: npm launcher on Node 10, 12, 14, 16, 18, 20, 22, 24
+        run: |
+          failed=""
+          for v in 10 12 14 16 18 20 22 24; do
+            docker run --rm -v "$PWD/tgz":/tgz:ro -v "$PWD/npm/scripts":/s:ro \
+              "node:$v-alpine" /s/test-wrapper.sh /tgz || failed="$failed $v"
+          done
+          if [ -n "$failed" ]; then
+            echo "::error::npm launcher checks failed on:$failed"
+            exit 1
+          fi
+      - name: install.sh verifies checksums
+        run: |
+          mkdir -p rel/good rel/bad
+          cp LICENSE-MIT LICENSE-APACHE dist/x86_64-unknown-linux-musl/
+          tar -czf rel/good/vexor-x86_64-unknown-linux-musl.tar.gz \
+            -C dist/x86_64-unknown-linux-musl vexor LICENSE-MIT LICENSE-APACHE
+          (cd rel/good && sha256sum vexor-*.tar.gz > SHA256SUMS)
+          VEXOR_DOWNLOAD_BASE="file://$PWD/rel/good" VEXOR_INSTALL_DIR="$PWD/rel/bin" ./install.sh
+          rel/bin/vexor --version
+          cp rel/good/SHA256SUMS rel/bad/
+          { cat rel/good/vexor-x86_64-unknown-linux-musl.tar.gz; printf x; } > rel/bad/vexor-x86_64-unknown-linux-musl.tar.gz
+          if VEXOR_DOWNLOAD_BASE="file://$PWD/rel/bad" VEXOR_INSTALL_DIR="$PWD/rel/bin2" ./install.sh; then
+            echo "::error::install.sh accepted a tampered archive"
+            exit 1
+          fi
+          test ! -e rel/bin2/vexor
+
+  npm-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Build, pack, and check the npm launcher
+        run: |
+          cargo build --release --locked
+          mkdir -p dist/aarch64-apple-darwin tgz
+          cp target/release/vexor dist/aarch64-apple-darwin/
+          node npm/scripts/stage.js --dist dist --out stage --allow-missing
+          for d in stage/*; do (cd "$d" && npm pack --pack-destination ../../tgz); done
+          npm/scripts/test-wrapper.sh tgz

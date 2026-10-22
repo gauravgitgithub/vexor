@@ -6,6 +6,23 @@ PM2-compatible alternative.
 > **Status: pre-alpha.** Only the project skeleton exists. Nothing here is
 > usable yet, and none of the features described in `docs/` are implemented.
 
+## Install
+
+Not published yet. Once released:
+
+```sh
+npm install -g vexord        # installs the `vexor` command (launcher needs Node >= 10)
+```
+
+or, without npm or Node.js (checks the SHA-256 checksum before installing):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/gauravgitgithub/vexor/main/install.sh | sh
+```
+
+Prebuilt for Linux x64/arm64 (static, any distribution) and macOS arm64/x64.
+The apps vexor runs can use any Node.js version; Node 8 through 24 are tested.
+
 ## Design docs
 
 - [Architecture](docs/architecture.md)

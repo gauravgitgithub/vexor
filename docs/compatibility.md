@@ -44,8 +44,8 @@ PM2 baseline: PM2 7.x (7.1.0 latest, 7.0.4 installed locally) declares `engines.
 
 | Item | Promise |
 |---|---|
-| Node | ≥ 10 (tested 10, 12, 14, 16, 18, 20, 22, 24) |
-| npm | ≥ 6 (optional deps with `os`/`cpu` filtering) |
+| Node | ≥ 10: tested in CI on 10, 12, 14, 16, 18, 20, 22, 24 (Linux x64) and 24 (macOS arm64) |
+| npm | ≥ 6: tested with npm 6, 8, 10, 11 (global install; optional platform package resolution) |
 | Package managers | npm, pnpm, yarn classic; yarn berry PnP = `qualified` |
 | Below the floor | direct binary install: release tarball + SHA-256 + `install.sh` |
 

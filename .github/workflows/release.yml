@@ -1,0 +1,150 @@
+name: Release
+
+# Runs on a version tag (v1.2.3) that matches the workspace version in
+# Cargo.toml. Builds the binaries, publishes a GitHub Release with
+# checksums, SBOM and build-provenance attestations, then publishes the npm
+# packages with provenance, but only if the NPM_TOKEN secret is set.
+#
+# CI (ci.yml) already builds, packs and installs the same artifacts on every
+# push; a failed CI run on the tagged commit should block tagging.
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            musl: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+            musl: true
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Tag matches Cargo.toml version
+        run: |
+          version=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version *= *"\(.*\)"/\1/p' Cargo.toml)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $version"
+            exit 1
+          fi
+      - name: Install musl C toolchain (for bundled SQLite)
+        if: matrix.musl
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq musl-tools
+      - name: Build
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CC_aarch64_unknown_linux_musl: musl-gcc
+          TARGET: ${{ matrix.target }}
+        run: |
+          rustup target add "$TARGET"
+          cargo build --release --locked --target "$TARGET"
+          mkdir -p "pkg/$TARGET"
+          cp "target/$TARGET/release/vexor" LICENSE-MIT LICENSE-APACHE "pkg/$TARGET/"
+          tar -czf "vexor-$TARGET.tar.gz" -C "pkg/$TARGET" vexor LICENSE-MIT LICENSE-APACHE
+      - name: Smoke test
+        if: matrix.target != 'x86_64-apple-darwin'
+        run: pkg/${{ matrix.target }}/vexor --version
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: vexor-${{ matrix.target }}
+          path: vexor-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the GitHub Release
+      id-token: write # sign attestations / npm provenance
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: artifacts
+          pattern: vexor-*
+          merge-multiple: true
+      - name: Checksums
+        working-directory: artifacts
+        run: |
+          sha256sum vexor-*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+      - name: SBOM (CycloneDX)
+        run: |
+          cargo install cargo-cyclonedx --locked --quiet
+          cargo cyclonedx --format json --all-features
+          cp crates/vexor/vexor.cdx.json artifacts/vexor.cdx.json
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: artifacts/vexor-*.tar.gz
+      - name: GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" artifacts/* \
+            --title "$GITHUB_REF_NAME" --generate-notes --prerelease \
+            --verify-tag
+
+  npm:
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # npm provenance
+    env:
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+    steps:
+      - name: Skip unless NPM_TOKEN is configured
+        if: env.NPM_TOKEN == ''
+        run: echo "::notice::NPM_TOKEN is not set; skipping npm publish."
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: env.NPM_TOKEN != ''
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        if: env.NPM_TOKEN != ''
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: env.NPM_TOKEN != ''
+        with:
+          path: artifacts
+          pattern: vexor-*
+          merge-multiple: true
+      - name: Stage packages
+        if: env.NPM_TOKEN != ''
+        run: |
+          for f in artifacts/vexor-*.tar.gz; do
+            t=${f#artifacts/vexor-}; t=${t%.tar.gz}
+            mkdir -p "dist/$t" && tar -xzf "$f" -C "dist/$t" vexor
+          done
+          node npm/scripts/stage.js --dist dist --out stage
+      - name: Publish (platform packages first, launcher last)
+        if: env.NPM_TOKEN != ''
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          for d in stage/vexord-*; do
+            (cd "$d" && npm publish --provenance --access public)
+          done
+          (cd stage/vexord && npm publish --provenance --access public)

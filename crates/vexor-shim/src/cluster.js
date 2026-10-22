@@ -6,9 +6,13 @@
 // shim keeps one lifecycle state machine per worker and decides when to
 // start, stop and restart them.
 //
-//   shim -> primary: {cmd:'spawn', id}  {cmd:'signal', id, signal}  {cmd:'shutdown'}
+//   shim -> primary: {cmd:'spawn', id, instance}  {cmd:'signal', id, signal}
+//                    {cmd:'retire', id}  {cmd:'shutdown'}
 //   primary -> shim: {ev:'spawned', id, pid}  {ev:'spawn_failed', id, error}
 //                    {ev:'ready', id}  {ev:'listening', id}  {ev:'exit', id, code, signal}
+//
+// `id` names one worker process; `instance` is the instance number it
+// serves (a reload's replacement has a new id and the same instance).
 //
 // Plain ES5: it must run on every Node version the app may use.
 
@@ -69,7 +73,7 @@
     }
     if (msg.cmd === 'spawn') {
       var env = {};
-      env[config.instance_var] = String(msg.id);
+      env[config.instance_var] = String(msg.instance);
       try {
         var w = cluster.fork(env);
         workers[msg.id] = w;
@@ -84,6 +88,25 @@
           target.process.kill(msg.signal);
         } catch (e) {
           // Already gone; its exit event follows.
+        }
+      }
+    } else if (msg.cmd === 'retire') {
+      // Graceful retirement (reload): stop routing new connections to the
+      // worker and let in-flight ones finish (worker.disconnect closes its
+      // servers), then SIGTERM it. The shim sends SIGKILL after kill_timeout.
+      var old = workers[msg.id];
+      if (old) {
+        old.once('disconnect', function () {
+          try {
+            old.process.kill('SIGTERM');
+          } catch (e) {
+            // Already gone.
+          }
+        });
+        try {
+          old.disconnect();
+        } catch (e) {
+          old.process.kill('SIGTERM');
         }
       }
     } else if (msg.cmd === 'shutdown') {

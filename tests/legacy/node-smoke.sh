@@ -113,6 +113,19 @@ else
   fail "cluster mode" "$(states "$D/cl.events") $(cat "$D/cl.err" 2>/dev/null)"; kill "$pid" 2>/dev/null
 fi
 
+# 9. Cluster reload through the daemon: replacement ready, old retired.
+H="$D/vhome"
+if "$VEXOR" --home "$H" start --spec "$D/cluster.json" >/dev/null 2>&1 \
+  && "$VEXOR" --home "$H" reload cl > "$D/reload.out" 2>&1; then
+  restarts=$("$VEXOR" --home "$H" list --json | grep -c '"restarts": 1')
+  [ "$restarts" = 2 ] && pass "cluster reload" || fail "cluster reload" "restarts: $("$VEXOR" --home "$H" list --json | tr -d '\n ')"
+else
+  fail "cluster reload" "$(cat "$D/reload.out")"
+fi
+"$VEXOR" --home "$H" delete all >/dev/null 2>&1
+dpid=$(sed -n 's/.*"pid":\([0-9]*\).*"type":"daemon_started".*/\1/p' "$H/daemon.log" | tail -n 1)
+[ -n "$dpid" ] && kill "$dpid" 2>/dev/null
+
 # 7. An ES5 ecosystem file loads with this Node (vexor check, no daemon).
 cat > "$D/ecosystem.config.js" <<'ECOSYSTEM_END'
 var base = { name: 'eco', script: 'app.js', instances: 2, merge_logs: true };

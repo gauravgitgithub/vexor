@@ -50,6 +50,11 @@ enum Command {
     Stop { target: String },
     /// Restart apps (by name, or `all`).
     Restart { target: String },
+    /// Replace apps' processes without a gap where possible: cluster mode
+    /// (and fork mode with `reload_strategy: start_first`) starts the new
+    /// process and waits until it is healthy before stopping the old one;
+    /// otherwise this is a restart.
+    Reload { target: String },
     /// Stop apps and remove them (by name, or `all`).
     #[command(visible_alias = "del")]
     Delete { target: String },
@@ -175,6 +180,13 @@ fn main() -> ExitCode {
         Command::Restart { target } => send(
             &home,
             Request::Restart {
+                target: target_of(target),
+            },
+            false,
+        ),
+        Command::Reload { target } => send(
+            &home,
+            Request::Reload {
                 target: target_of(target),
             },
             false,

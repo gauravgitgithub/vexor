@@ -131,7 +131,7 @@ pub async fn serve(
     me: Identity,
     app: Arc<str>,
     stop: Arc<watch::Sender<bool>>,
-    restart: broadcast::Sender<()>,
+    restart: broadcast::Sender<crate::instance::Control>,
 ) {
     let mut current: Option<tokio::task::JoinHandle<()>> = None;
     loop {
@@ -175,7 +175,7 @@ async fn session(
     me: Identity,
     app: Arc<str>,
     stop: Arc<watch::Sender<bool>>,
-    restart: broadcast::Sender<()>,
+    restart: broadcast::Sender<crate::instance::Control>,
 ) {
     let (read, mut write) = stream.into_split();
 
@@ -249,7 +249,8 @@ async fn session(
             () = &mut changed => {}
             msg = rx.recv() => match msg {
                 Some(ToShim::Stop) => { stop.send_replace(true); }
-                Some(ToShim::Restart) => { let _ = restart.send(()); }
+                Some(ToShim::Restart) => { let _ = restart.send(crate::instance::Control::Restart); }
+                Some(ToShim::Reload) => { let _ = restart.send(crate::instance::Control::Reload); }
                 Some(ToShim::Hello { .. }) => {}
                 None => return,
             },

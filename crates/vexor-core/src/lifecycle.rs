@@ -55,6 +55,9 @@ pub enum Timer {
     Backoff,
     /// Graceful-stop deadline (PM2 `kill_timeout`).
     Stop,
+    /// Reload: readiness deadline (or required stable time) of the
+    /// replacement process.
+    Replacement,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,6 +90,18 @@ pub enum Event {
     Recovered {
         alive: bool,
     },
+    /// Operator `reload`: replace the running process without a gap when the
+    /// policy allows it (see [`InstancePolicy::reload`]), else restart.
+    Reload,
+    /// The replacement process was created.
+    ReplacementSpawned,
+    /// The replacement process could not be created.
+    ReplacementSpawnFailed,
+    /// The replacement reported ready (or started listening, in cluster
+    /// mode without `wait_ready`).
+    ReplacementReady,
+    /// The replacement exited before it was promoted.
+    ReplacementExited(ExitStatus),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,6 +118,26 @@ pub enum Effect {
         after: Duration,
         generation: u64,
     },
+    /// Reload: start a replacement process next to the running one.
+    SpawnReplacement,
+    /// Reload succeeded: the replacement becomes the instance's process, and
+    /// the previous one is stopped gracefully (SIGTERM, then SIGKILL after
+    /// `kill_timeout`). The caller does that; the previous process's exit is
+    /// not an [`Event::Exited`].
+    PromoteReplacement,
+    /// Reload failed or was interrupted: stop the replacement (if it is
+    /// running) and keep the current process.
+    AbandonReplacement,
+}
+
+/// How a reload's replacement proves it is healthy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplacementReady {
+    /// Wait for [`Event::ReplacementReady`] up to this long; no signal in
+    /// time means the reload fails and the current process is kept.
+    Signal(Duration),
+    /// No readiness signal: healthy once it has stayed up this long.
+    Stable(Duration),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -143,6 +178,10 @@ pub struct InstancePolicy {
     /// PM2 `kill_timeout`.
     pub kill_timeout: Duration,
     pub health: Option<HealthPolicy>,
+    /// `Some`: reload starts a replacement first and keeps the current
+    /// process until the replacement is healthy. `None`: reload is a restart
+    /// (stop, then start), as in PM2 fork mode.
+    pub reload: Option<ReplacementReady>,
 }
 
 impl Default for InstancePolicy {
@@ -152,6 +191,7 @@ impl Default for InstancePolicy {
             ready_timeout: None,
             kill_timeout: Duration::from_millis(1600), // PM2 default
             health: None,
+            reload: None,
         }
     }
 }
@@ -182,6 +222,8 @@ pub struct Instance {
     spawns: u64,
     last_exit: Option<ExitStatus>,
     error: Option<ErrorReason>,
+    /// A reload's replacement is running (or being started).
+    reloading: bool,
 }
 
 impl Instance {
@@ -200,6 +242,7 @@ impl Instance {
             spawns: 0,
             last_exit: None,
             error: None,
+            reloading: false,
         }
     }
 
@@ -238,6 +281,11 @@ impl Instance {
         self.error
     }
 
+    /// A reload is in progress.
+    pub fn reloading(&self) -> bool {
+        self.reloading
+    }
+
     pub fn armed_timer(&self) -> Option<(Timer, u64)> {
         self.timer
     }
@@ -254,6 +302,10 @@ impl Instance {
     pub fn handle(&mut self, event: Event, ctx: Ctx) -> Vec<Effect> {
         let mut fx = Vec::new();
         use State as S;
+        // Anything that ends or replaces the current process ends a reload.
+        if self.reloading && matches!(event, Event::Stop | Event::Restart | Event::Exited(_)) {
+            self.abandon_reload(&mut fx);
+        }
         match event {
             Event::Start => {
                 self.desired = Desired::Running;
@@ -349,7 +401,42 @@ impl Instance {
                     }
                     (Timer::Backoff, S::Backoff) => self.spawn(ctx.now, &mut fx),
                     (Timer::Stop, S::Stopping) => fx.push(Effect::ForceKill),
+                    (Timer::Replacement, S::Online | S::Unhealthy) if self.reloading => {
+                        match self.policy.reload {
+                            Some(ReplacementReady::Stable(_)) => self.promote(ctx.now, &mut fx),
+                            _ => self.abandon_reload(&mut fx),
+                        }
+                    }
                     _ => {}
+                }
+            }
+            Event::Reload => {
+                self.desired = Desired::Running;
+                match (self.state, self.policy.reload) {
+                    (S::Online | S::Unhealthy, Some(ready)) => {
+                        if !self.reloading {
+                            self.reloading = true;
+                            fx.push(Effect::SpawnReplacement);
+                            let after = match ready {
+                                ReplacementReady::Signal(t) | ReplacementReady::Stable(t) => t,
+                            };
+                            self.arm(Timer::Replacement, after, &mut fx);
+                        }
+                    }
+                    // Not running, or no start-first reload: restart.
+                    _ => return self.handle(Event::Restart, ctx),
+                }
+            }
+            Event::ReplacementSpawned => {}
+            Event::ReplacementSpawnFailed | Event::ReplacementExited(_) => {
+                if self.reloading {
+                    self.abandon_reload(&mut fx);
+                }
+            }
+            Event::ReplacementReady => {
+                if self.reloading && matches!(self.policy.reload, Some(ReplacementReady::Signal(_)))
+                {
+                    self.promote(ctx.now, &mut fx);
                 }
             }
             Event::Recovered { alive } => {
@@ -373,6 +460,24 @@ impl Instance {
             }
         }
         fx
+    }
+
+    fn abandon_reload(&mut self, fx: &mut Vec<Effect>) {
+        self.reloading = false;
+        if matches!(self.timer, Some((Timer::Replacement, _))) {
+            self.timer = None;
+        }
+        fx.push(Effect::AbandonReplacement);
+    }
+
+    fn promote(&mut self, now: Millis, fx: &mut Vec<Effect>) {
+        self.reloading = false;
+        self.timer = None;
+        self.state = State::Online;
+        self.started_at = Some(now);
+        self.health_failures = 0;
+        self.spawns += 1;
+        fx.push(Effect::PromoteReplacement);
     }
 
     fn reset_budget(&mut self) {
@@ -425,6 +530,9 @@ impl Instance {
         }
         self.health_failures = self.health_failures.saturating_add(1);
         if self.health_failures >= hp.restart_after {
+            if self.reloading {
+                self.abandon_reload(fx);
+            }
             self.begin_stop(AfterStop::Recover { unstable: false }, fx);
         } else if self.health_failures >= hp.unhealthy_after {
             self.state = State::Unhealthy;

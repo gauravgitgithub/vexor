@@ -180,6 +180,7 @@ enum Op {
     StartExisting,
     Stop,
     Restart,
+    Reload,
     Delete,
 }
 
@@ -294,6 +295,7 @@ impl Daemon {
             Request::StartExisting { target } => self.for_each(target, Op::StartExisting).await,
             Request::Stop { target } => self.for_each(target, Op::Stop).await,
             Request::Restart { target } => self.for_each(target, Op::Restart).await,
+            Request::Reload { target } => self.for_each(target, Op::Reload).await,
             Request::Delete { target } => self.for_each(target, Op::Delete).await,
         }
     }
@@ -316,6 +318,7 @@ impl Daemon {
                 Op::StartExisting => self.start_existing(&mut store, name).await,
                 Op::Stop => self.stop(&mut store, name).await,
                 Op::Restart => self.restart(&mut store, name).await,
+                Op::Reload => self.reload(&mut store, name).await,
                 Op::Delete => self.delete(&mut store, name).await,
             };
             if let Err(e) = result {
@@ -437,6 +440,85 @@ impl Daemon {
             self.wait_settled(name, instances, None, START_WAIT).await;
         }
         Ok(())
+    }
+
+    /// Replace each instance's process; start-first where the app's policy
+    /// allows (cluster mode, or `reload_strategy: start_first`), so the app
+    /// keeps serving. Fails, naming the instances, if a replacement never
+    /// became healthy: those keep their previous process.
+    async fn reload(&self, store: &mut Store, name: &str) -> Result<(), String> {
+        let Some(entry) = store.get(name).cloned() else {
+            return Err("not found".into());
+        };
+        let running = entry.desired == Desired::Running && self.shim_pid(name).is_some();
+        if !running {
+            // Nothing to replace: start it.
+            return self.start_existing(store, name).await;
+        }
+        let policy = entry.spec.instance_policy();
+        let ready = match policy.reload {
+            Some(
+                vexor_core::ReplacementReady::Signal(t) | vexor_core::ReplacementReady::Stable(t),
+            ) => t,
+            None => START_WAIT,
+        };
+        let timeout = policy.kill_timeout + ready + START_WAIT;
+        let live = self.live(name).unwrap_or_default();
+        if policy.reload.is_none() {
+            // Stop-first: a restart.
+            let before = self.restart_counts(name);
+            self.send(name, ToShim::Reload).await?;
+            self.wait_settled(name, entry.spec.instances, Some(before), timeout)
+                .await;
+            return Ok(());
+        }
+        // Start-first: each instance reports `reload` succeeded or failed.
+        let before = live.reloads();
+        self.send(name, ToShim::Reload).await?;
+        let deadline = tokio::time::Instant::now() + timeout;
+        let instances: Vec<u64> = (0..u64::from(entry.spec.instances)).collect();
+        let (mut failed, mut pending);
+        loop {
+            let now = live.reloads();
+            failed = Vec::new();
+            pending = Vec::new();
+            for i in &instances {
+                let (ok0, bad0) = before.get(i).copied().unwrap_or_default();
+                let (ok1, bad1) = now.get(i).copied().unwrap_or_default();
+                if bad1 > bad0 {
+                    failed.push(i.to_string());
+                } else if ok1 <= ok0 {
+                    pending.push(i.to_string());
+                }
+            }
+            if pending.is_empty() || tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(POLL).await;
+        }
+        let mut problems = Vec::new();
+        if !failed.is_empty() {
+            problems.push(format!(
+                "the replacement for instance(s) {} did not become healthy; their previous processes are still running",
+                failed.join(", ")
+            ));
+        }
+        if !pending.is_empty() {
+            problems.push(format!(
+                "instance(s) {} did not finish reloading in time",
+                pending.join(", ")
+            ));
+        }
+        if problems.is_empty() {
+            self.wait_settled(name, entry.spec.instances, None, START_WAIT)
+                .await;
+            Ok(())
+        } else {
+            Err(format!(
+                "reload did not complete: {} (see `vexor events {name}`)",
+                problems.join("; ")
+            ))
+        }
     }
 
     async fn delete(&self, store: &mut Store, name: &str) -> Result<(), String> {

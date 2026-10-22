@@ -131,7 +131,7 @@ pub fn validate(spec: &AppSpec) -> Result<(), String> {
 pub async fn run(spec: AppSpec, home: Option<PathBuf>) -> i32 {
     let (stop_tx, stop_rx) = watch::channel(false);
     let stop_tx = Arc::new(stop_tx);
-    let (restart_tx, _) = tokio::sync::broadcast::channel::<()>(16);
+    let (restart_tx, _) = tokio::sync::broadcast::channel::<instance::Control>(16);
     let (mut term, mut int) = match (
         signal(SignalKind::terminate()),
         signal(SignalKind::interrupt()),

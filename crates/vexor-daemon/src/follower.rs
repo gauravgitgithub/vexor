@@ -33,6 +33,8 @@ pub struct Live(Arc<Mutex<LiveInner>>);
 struct LiveInner {
     shim_pid: Option<u32>,
     snapshot: BTreeMap<u64, Value>,
+    /// Reload outcomes seen per instance: (succeeded, failed).
+    reloads: BTreeMap<u64, (u64, u64)>,
 }
 
 impl Live {
@@ -53,11 +55,25 @@ impl Live {
             .collect();
     }
 
+    /// Reload outcomes seen per instance so far: (succeeded, failed).
+    pub fn reloads(&self) -> BTreeMap<u64, (u64, u64)> {
+        self.lock().reloads.clone()
+    }
+
     fn state_event(&self, event: &Value) {
-        if event["type"] == "state"
-            && let Some(i) = event["instance"].as_u64()
-        {
+        let Some(i) = event["instance"].as_u64() else {
+            return;
+        };
+        if event["type"] == "state" {
             self.lock().snapshot.insert(i, event.clone());
+        } else if event["type"] == "reload" {
+            let mut l = self.lock();
+            let counts = l.reloads.entry(i).or_default();
+            if event["outcome"] == "succeeded" {
+                counts.0 += 1;
+            } else {
+                counts.1 += 1;
+            }
         }
     }
 

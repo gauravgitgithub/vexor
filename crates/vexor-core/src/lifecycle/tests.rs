@@ -44,9 +44,21 @@ fn check_invariants(i: &Instance) {
             let expect = i.policy().ready_timeout.map(|_| Timer::Ready);
             assert_eq!(timer, expect);
         }
-        State::Stopped | State::Online | State::Unhealthy | State::Errored | State::Unknown => {
+        State::Online | State::Unhealthy => {
+            // Only a reload arms a timer while running.
+            let expect = i.reloading().then_some(Timer::Replacement);
+            assert_eq!(timer, expect, "{:?} reloading={}", i.state(), i.reloading());
+        }
+        State::Stopped | State::Errored | State::Unknown => {
             assert_eq!(timer, None, "no timer in {:?}", i.state());
         }
+    }
+    if i.reloading() {
+        assert!(matches!(i.state(), State::Online | State::Unhealthy));
+        assert!(
+            i.policy().reload.is_some(),
+            "reload without a start-first policy"
+        );
     }
     assert_eq!(i.state() == State::Errored, i.error().is_some());
 }
@@ -60,6 +72,12 @@ fn check_effects(i: &Instance, fx: &[Effect]) {
             Effect::ArmTimer {
                 timer, generation, ..
             } => assert_eq!(i.armed_timer(), Some((timer, generation))),
+            Effect::SpawnReplacement => assert!(i.reloading()),
+            Effect::PromoteReplacement => {
+                assert!(!i.reloading());
+                assert_eq!(i.state(), State::Online);
+            }
+            Effect::AbandonReplacement => assert!(!i.reloading()),
         }
     }
 }
@@ -402,12 +420,135 @@ fn commands_while_unknown_update_desired_only() {
     assert_eq!(fx[0], Effect::SignalStop);
 }
 
+// -------------------------------------------------------------------- reload
+
+fn with_reload(ready: ReplacementReady) -> InstancePolicy {
+    InstancePolicy {
+        reload: Some(ready),
+        ..InstancePolicy::default()
+    }
+}
+
+#[test]
+fn reload_without_start_first_policy_is_a_restart() {
+    let mut i = online(InstancePolicy::default());
+    let fx = step(&mut i, Event::Reload, 5_000);
+    assert_eq!(fx[0], Effect::SignalStop);
+    assert_eq!(i.state(), State::Stopping);
+}
+
+#[test]
+fn reload_promotes_a_replacement_that_reports_ready() {
+    let mut i = online(with_reload(ReplacementReady::Signal(MS(3_000))));
+    let fx = step(&mut i, Event::Reload, 5_000);
+    assert_eq!(fx[0], Effect::SpawnReplacement);
+    assert_eq!(
+        armed(&fx).map(|a| (a.0, a.1)),
+        Some((Timer::Replacement, MS(3_000)))
+    );
+    assert_eq!(
+        i.state(),
+        State::Online,
+        "the current process keeps serving"
+    );
+    assert_eq!(
+        step(&mut i, Event::Reload, 5_001),
+        vec![],
+        "one reload at a time"
+    );
+    step(&mut i, Event::ReplacementSpawned, 5_010);
+    assert_eq!(
+        step(&mut i, Event::ReplacementReady, 5_500),
+        vec![Effect::PromoteReplacement]
+    );
+    assert_eq!(i.state(), State::Online);
+    assert!(!i.reloading());
+    assert_eq!(i.restarts(), 1);
+    assert_eq!(
+        i.uptime(Millis(6_500)),
+        Some(MS(1_000)),
+        "uptime counts from promotion"
+    );
+}
+
+#[test]
+fn reload_keeps_the_current_process_when_the_replacement_fails() {
+    for failure in [
+        Event::ReplacementExited(ExitStatus {
+            code: Some(1),
+            signal: None,
+        }),
+        Event::ReplacementSpawnFailed,
+    ] {
+        let mut i = online(with_reload(ReplacementReady::Signal(MS(3_000))));
+        step(&mut i, Event::Reload, 5_000);
+        assert_eq!(
+            step(&mut i, failure, 5_100),
+            vec![Effect::AbandonReplacement]
+        );
+        assert_eq!(i.state(), State::Online);
+        assert!(!i.reloading());
+        assert_eq!(i.restarts(), 0);
+    }
+    // No ready signal in time.
+    let mut i = online(with_reload(ReplacementReady::Signal(MS(3_000))));
+    step(&mut i, Event::Reload, 5_000);
+    assert_eq!(fire(&mut i, 8_000), vec![Effect::AbandonReplacement]);
+    assert_eq!(i.state(), State::Online);
+}
+
+#[test]
+fn stable_replacement_is_promoted_after_its_stable_time() {
+    let mut i = online(with_reload(ReplacementReady::Stable(MS(1_000))));
+    step(&mut i, Event::Reload, 5_000);
+    step(&mut i, Event::ReplacementSpawned, 5_010);
+    assert_eq!(
+        step(&mut i, Event::ReplacementReady, 5_100),
+        vec![],
+        "readiness is not used"
+    );
+    assert_eq!(fire(&mut i, 6_000), vec![Effect::PromoteReplacement]);
+}
+
+#[test]
+fn interruptions_abandon_the_replacement() {
+    let policy = with_reload(ReplacementReady::Signal(MS(3_000)));
+    // The current process crashes mid-reload: replacement dropped, crash handled.
+    let mut i = online(policy.clone());
+    step(&mut i, Event::Reload, 5_000);
+    let fx = step(&mut i, exit(1), 5_100);
+    assert_eq!(fx[0], Effect::AbandonReplacement);
+    assert_eq!(i.state(), State::Backoff);
+    // Stop mid-reload.
+    let mut i = online(policy.clone());
+    step(&mut i, Event::Reload, 5_000);
+    let fx = step(&mut i, Event::Stop, 5_100);
+    assert_eq!(fx[..2], [Effect::AbandonReplacement, Effect::SignalStop]);
+    // Restart mid-reload.
+    let mut i = online(policy);
+    step(&mut i, Event::Reload, 5_000);
+    let fx = step(&mut i, Event::Restart, 5_100);
+    assert_eq!(fx[..2], [Effect::AbandonReplacement, Effect::SignalStop]);
+}
+
+#[test]
+fn reload_of_a_stopped_instance_starts_it() {
+    let mut i = Instance::new(with_reload(ReplacementReady::Signal(MS(3_000))));
+    assert_eq!(step(&mut i, Event::Reload, 0), vec![Effect::Spawn]);
+}
+
 // ---------------------------------------------- exhaustive (state × event)
 
 /// Build an instance in every state, with both policies that change behaviour.
 fn every_state() -> Vec<Instance> {
     let mut out = vec![];
-    for policy in [InstancePolicy::default(), with_ready(), with_health()] {
+    for policy in [
+        InstancePolicy::default(),
+        with_ready(),
+        with_health(),
+        with_reload(ReplacementReady::Signal(MS(3_000))),
+        with_reload(ReplacementReady::Stable(MS(1_000))),
+    ] {
         let fresh = Instance::new(policy.clone());
         out.push(fresh.clone()); // Stopped
 
@@ -425,6 +566,10 @@ fn every_state() -> Vec<Instance> {
             unhealthy.handle(Event::Health { ok: false }, ctx(1));
         }
         out.push(unhealthy);
+
+        let mut reloading = on.clone();
+        reloading.handle(Event::Reload, ctx(2));
+        out.push(reloading);
 
         let mut stopping = on.clone();
         stopping.handle(Event::Stop, ctx(5_000));
@@ -474,8 +619,18 @@ fn every_event(i: &Instance) -> Vec<Event> {
         }),
         Event::Recovered { alive: true },
         Event::Recovered { alive: false },
+        Event::Reload,
+        Event::ReplacementSpawned,
+        Event::ReplacementSpawnFailed,
+        Event::ReplacementReady,
+        Event::ReplacementExited(ExitStatus::default()),
     ];
-    for timer in [Timer::Ready, Timer::Backoff, Timer::Stop] {
+    for timer in [
+        Timer::Ready,
+        Timer::Backoff,
+        Timer::Stop,
+        Timer::Replacement,
+    ] {
         events.push(Event::TimerFired {
             timer,
             generation: 0,
@@ -510,7 +665,12 @@ fn every_event_in_every_state_keeps_invariants() {
 #[test]
 fn stale_timers_never_have_effects() {
     for base in every_state() {
-        for timer in [Timer::Ready, Timer::Backoff, Timer::Stop] {
+        for timer in [
+            Timer::Ready,
+            Timer::Backoff,
+            Timer::Stop,
+            Timer::Replacement,
+        ] {
             for generation in [0, base.generation + 1, u64::MAX] {
                 let mut i = base.clone();
                 let fx = i.handle(Event::TimerFired { timer, generation }, ctx(20_000));
@@ -536,9 +696,10 @@ fn arb_policy() -> impl Strategy<Value = InstancePolicy> {
         0u64..3_000,
         0u32..20,
         proptest::option::of(1u64..5_000),
+        proptest::option::of((any::<bool>(), 1u64..5_000)),
     )
         .prop_map(
-            |(backoff, jitter, min_uptime, max_restarts, ready)| InstancePolicy {
+            |(backoff, jitter, min_uptime, max_restarts, ready, reload)| InstancePolicy {
                 restart: RestartPolicy {
                     backoff,
                     jitter: if jitter { Jitter::Equal } else { Jitter::None },
@@ -550,6 +711,13 @@ fn arb_policy() -> impl Strategy<Value = InstancePolicy> {
                 health: Some(HealthPolicy {
                     unhealthy_after: 1,
                     restart_after: 3,
+                }),
+                reload: reload.map(|(signal, ms)| {
+                    if signal {
+                        ReplacementReady::Signal(MS(ms))
+                    } else {
+                        ReplacementReady::Stable(MS(ms))
+                    }
                 }),
                 ..InstancePolicy::default()
             },
@@ -567,11 +735,21 @@ fn arb_event() -> impl Strategy<Value = Event> {
         any::<bool>().prop_map(|ok| Event::Health { ok }),
         (proptest::option::of(0i32..3))
             .prop_map(|code| Event::Exited(ExitStatus { code, signal: None })),
-        (0u8..3, 0u64..40).prop_map(|(t, generation)| Event::TimerFired {
-            timer: [Timer::Ready, Timer::Backoff, Timer::Stop][usize::from(t)],
+        (0u8..4, 0u64..40).prop_map(|(t, generation)| Event::TimerFired {
+            timer: [
+                Timer::Ready,
+                Timer::Backoff,
+                Timer::Stop,
+                Timer::Replacement
+            ][usize::from(t)],
             generation,
         }),
         any::<bool>().prop_map(|alive| Event::Recovered { alive }),
+        Just(Event::Reload),
+        Just(Event::ReplacementSpawned),
+        Just(Event::ReplacementSpawnFailed),
+        Just(Event::ReplacementReady),
+        Just(Event::ReplacementExited(ExitStatus::default())),
     ]
 }
 

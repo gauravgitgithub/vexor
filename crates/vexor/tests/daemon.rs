@@ -537,3 +537,202 @@ fn no_new_shim_while_a_dead_shims_instances_survive() {
         .args(["-KILL", &pids[0].to_string()])
         .status();
 }
+
+// ------------------------------------------------------------------ reload
+
+/// The SERVER app, except that it exits at startup while `broken` exists in
+/// its working directory (a bad deploy).
+const RELOADABLE: &str = r"
+if (require('fs').existsSync('broken')) { console.error('bad deploy'); process.exit(1); }
+var http = require('http');
+http.createServer(function (req, res) { res.setHeader('Connection', 'close'); res.end(process.pid + ' 0'); })
+  .listen(+process.env.PORT, '127.0.0.1', function () { process.send('ready') });
+";
+
+fn reloadable_app(home: &mut Home, node: &str, port: u16, cluster: bool, extra_policy: Value) {
+    let script = home.path("app.js");
+    std::fs::write(&script, RELOADABLE).expect("write app");
+    let mut policy = json!({ "ready_timeout_ms": 10000, "kill_timeout_ms": 3000 });
+    if let (Value::Object(p), Value::Object(e)) = (&mut policy, extra_policy) {
+        p.extend(e);
+    }
+    let mut extra = json!({
+        "env": { "PORT": port.to_string() },
+        "node_ipc": true,
+        "policy": policy,
+    });
+    let args: Vec<String> = if cluster {
+        extra["cluster"] = json!({ "script": script });
+        vec![]
+    } else {
+        vec![script.to_string_lossy().into_owned()]
+    };
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    home.add_app("web", node, &args, extra);
+}
+
+fn restarts(home: &Home) -> u64 {
+    let out = home.cli(&["list", "--json"]);
+    let apps: Vec<Value> = serde_json::from_slice(&out.stdout).expect("json");
+    apps[0]["snapshot"][0]["restarts"]
+        .as_u64()
+        .expect("restarts")
+}
+
+#[test]
+fn cluster_reload_under_load_has_zero_failed_requests() {
+    let Some(node) = which("node") else {
+        eprintln!("skipping: node not found on PATH");
+        return;
+    };
+    let mut home = Home::new();
+    let port = free_port();
+    let addr: SocketAddr = ([127, 0, 0, 1], port).into();
+    reloadable_app(&mut home, &node, port, true, json!({}));
+    home.start_daemon();
+    let first = server_pid(&wait_http(addr));
+
+    let load = Load::start(addr);
+    std::thread::sleep(Duration::from_millis(300));
+    for _ in 0..3 {
+        let out = home.cli(&["reload", "web"]);
+        assert!(
+            out.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&out.stderr),
+            home.diagnostics("web")
+        );
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    let (ok, failures, pids) = load.finish();
+    eprintln!(
+        "3 cluster reloads under load: {ok} requests ok, {} failed, {} pids",
+        failures.len(),
+        pids.len()
+    );
+    assert!(
+        failures.is_empty(),
+        "{} failed: {:?}\n{}",
+        failures.len(),
+        &failures[..failures.len().min(5)],
+        home.diagnostics("web")
+    );
+    assert!(ok > 50, "only {ok} requests");
+    assert_eq!(
+        pids.len(),
+        4,
+        "the original and three replacements served: {pids:?}"
+    );
+    assert!(pids.contains(&first));
+    assert_eq!(restarts(&home), 3);
+    // Old workers were retired: one instance, one process answering.
+    std::thread::sleep(Duration::from_millis(3500)); // kill_timeout backstop
+    let answering: BTreeSet<u64> = (0..30)
+        .filter_map(|_| get(addr, "/").ok())
+        .map(|b| server_pid(&b))
+        .collect();
+    assert_eq!(
+        answering.len(),
+        1,
+        "old workers still serving: {answering:?}"
+    );
+}
+
+#[test]
+fn failed_reload_keeps_the_old_process_and_loses_no_requests() {
+    let Some(node) = which("node") else {
+        eprintln!("skipping: node not found on PATH");
+        return;
+    };
+    let mut home = Home::new();
+    let port = free_port();
+    let addr: SocketAddr = ([127, 0, 0, 1], port).into();
+    reloadable_app(&mut home, &node, port, true, json!({}));
+    home.start_daemon();
+    let first = server_pid(&wait_http(addr));
+
+    std::fs::write(home.path("broken"), "").expect("break the deploy");
+    let load = Load::start(addr);
+    std::thread::sleep(Duration::from_millis(200));
+    let out = home.cli(&["reload", "web"]);
+    std::thread::sleep(Duration::from_millis(300));
+    let (ok, failures, pids) = load.finish();
+
+    assert_eq!(out.status.code(), Some(1), "reload must report failure");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("reload did not complete"), "{stderr}");
+    assert!(
+        failures.is_empty(),
+        "{} failed: {:?}",
+        failures.len(),
+        &failures[..failures.len().min(5)]
+    );
+    assert!(ok > 20, "only {ok} requests");
+    assert_eq!(pids, BTreeSet::from([first]), "only the old process served");
+    assert_eq!(restarts(&home), 0);
+    let events = home.cli(&["events", "web", "--json"]);
+    let events: Vec<Value> = serde_json::from_slice(&events.stdout).expect("json");
+    assert!(
+        events
+            .iter()
+            .any(|e| e["type"] == "reload" && e["outcome"] == "failed"),
+        "{events:#?}"
+    );
+}
+
+#[test]
+fn fork_reload_defaults_to_restart() {
+    let Some(node) = which("node") else {
+        eprintln!("skipping: node not found on PATH");
+        return;
+    };
+    let mut home = Home::new();
+    let port = free_port();
+    let addr: SocketAddr = ([127, 0, 0, 1], port).into();
+    reloadable_app(&mut home, &node, port, false, json!({}));
+    home.start_daemon();
+    let first = server_pid(&wait_http(addr));
+    let out = home.cli(&["reload", "web"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let second = server_pid(&wait_http(addr));
+    assert_ne!(first, second);
+    assert_eq!(restarts(&home), 1);
+}
+
+#[test]
+fn fork_start_first_on_a_fixed_port_fails_safely() {
+    let Some(node) = which("node") else {
+        eprintln!("skipping: node not found on PATH");
+        return;
+    };
+    let mut home = Home::new();
+    let port = free_port();
+    let addr: SocketAddr = ([127, 0, 0, 1], port).into();
+    reloadable_app(
+        &mut home,
+        &node,
+        port,
+        false,
+        json!({ "reload_strategy": "start_first" }),
+    );
+    home.start_daemon();
+    let first = server_pid(&wait_http(addr));
+    let out = home.cli(&["reload", "web"]);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "the replacement can't bind the port"
+    );
+    assert_eq!(
+        server_pid(&wait_http(addr)),
+        first,
+        "the old process keeps serving"
+    );
+    assert_eq!(restarts(&home), 0);
+    let err = std::fs::read_to_string(home.path("web.err")).unwrap_or_default();
+    assert!(err.contains("EADDRINUSE"), "{err}");
+}

@@ -58,6 +58,13 @@ pub enum ShimEvent<'a> {
         path: &'a Path,
         error: String,
     },
+    /// A reload of `instance` finished: `succeeded` (replacement promoted)
+    /// or `failed` (replacement abandoned, previous process kept).
+    Reload {
+        app: &'a str,
+        instance: u32,
+        outcome: &'static str,
+    },
     SpawnError {
         app: &'a str,
         instance: u32,

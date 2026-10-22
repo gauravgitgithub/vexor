@@ -31,6 +31,9 @@ pub enum ToShim {
     Stop,
     /// Restart every instance (also revives stopped or errored ones).
     Restart,
+    /// Reload every instance: start-first where the app's reload policy
+    /// allows it, otherwise a restart.
+    Reload,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -99,6 +102,9 @@ pub enum Request {
         target: Target,
     },
     Restart {
+        target: Target,
+    },
+    Reload {
         target: Target,
     },
     /// Stop and forget.

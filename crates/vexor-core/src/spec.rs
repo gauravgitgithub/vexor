@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::lifecycle::{HealthPolicy, InstancePolicy};
+use crate::lifecycle::{HealthPolicy, InstancePolicy, ReplacementReady};
 use crate::restart::{Backoff, Jitter, RestartPolicy};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,6 +50,31 @@ pub struct AppSpec {
     /// listening sockets. `args` above is not used.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cluster: Option<ClusterSpec>,
+}
+
+impl AppSpec {
+    /// The lifecycle policy for this app's instances, including how
+    /// `reload` works (docs/architecture.md §6a).
+    pub fn instance_policy(&self) -> InstancePolicy {
+        let mut p = self.policy.to_policy();
+        let start_first = match self.policy.reload_strategy {
+            ReloadStrategy::Auto => self.cluster.is_some(),
+            ReloadStrategy::StartFirst => true,
+            ReloadStrategy::StopFirst => false,
+        };
+        if start_first {
+            p.reload = Some(match p.ready_timeout {
+                Some(t) => ReplacementReady::Signal(t),
+                None if self.cluster.is_some() => ReplacementReady::Signal(
+                    self.policy
+                        .reload_timeout_ms
+                        .map_or(DEFAULT_RELOAD_TIMEOUT, Duration::from_millis),
+                ),
+                None => ReplacementReady::Stable(p.restart.min_uptime.max(Duration::from_secs(1))),
+            });
+        }
+        p
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -142,7 +167,29 @@ pub struct PolicySpec {
     pub kill_timeout_ms: u64,
     pub health_unhealthy_after: Option<u32>,
     pub health_restart_after: Option<u32>,
+    /// How `reload` replaces processes.
+    pub reload_strategy: ReloadStrategy,
+    /// Reload: how long a replacement may take to become ready (cluster
+    /// mode without `ready_timeout_ms`, where "listening" counts as ready).
+    pub reload_timeout_ms: Option<u64>,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReloadStrategy {
+    /// Start-first in cluster mode, stop-first in fork mode (as PM2).
+    #[default]
+    Auto,
+    /// Start the replacement, wait until it is healthy, then stop the old
+    /// process. In fork mode this needs an app that can run twice at once
+    /// (no fixed port, or `reusePort`).
+    StartFirst,
+    /// Stop, then start: a restart.
+    StopFirst,
+}
+
+/// Reload readiness deadline in cluster mode when nothing else is set.
+const DEFAULT_RELOAD_TIMEOUT: Duration = Duration::from_secs(30);
 
 impl Default for PolicySpec {
     fn default() -> Self {
@@ -161,6 +208,8 @@ impl Default for PolicySpec {
             kill_timeout_ms: millis(p.kill_timeout),
             health_unhealthy_after: None,
             health_restart_after: None,
+            reload_strategy: ReloadStrategy::Auto,
+            reload_timeout_ms: None,
         }
     }
 }
@@ -202,6 +251,7 @@ impl PolicySpec {
             ready_timeout: self.ready_timeout_ms.map(ms),
             kill_timeout: ms(self.kill_timeout_ms),
             health,
+            reload: None,
         }
     }
 }

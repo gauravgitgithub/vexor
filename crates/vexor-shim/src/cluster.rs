@@ -34,6 +34,13 @@ const MAX_LINE: usize = 64 * 1024;
 /// How long the primary gets to exit after `shutdown` before SIGKILL.
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(5);
 
+/// An event about one worker process, identified by its worker id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerMsg {
+    pub wid: u32,
+    pub ev: WorkerEvent,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkerEvent {
     Spawned {
@@ -48,9 +55,16 @@ pub enum WorkerEvent {
 }
 
 enum Cmd {
-    Subscribe(u32, mpsc::UnboundedSender<WorkerEvent>),
-    Spawn(u32),
+    /// Events for workers of this instance.
+    Subscribe(u32, mpsc::UnboundedSender<WorkerMsg>),
+    /// Fork worker `wid` for instance `instance`.
+    Spawn {
+        wid: u32,
+        instance: u32,
+    },
     Signal(u32, Signal),
+    /// Graceful retirement: disconnect, then SIGTERM (see cluster.js).
+    Retire(u32),
     Shutdown(oneshot::Sender<()>),
 }
 
@@ -58,6 +72,7 @@ enum Cmd {
 #[derive(Debug, Clone)]
 pub struct Cluster {
     tx: mpsc::UnboundedSender<Cmd>,
+    next_wid: Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl Cluster {
@@ -70,27 +85,43 @@ impl Cluster {
             err,
             primary: None,
             subscribers: BTreeMap::new(),
+            instance_of: BTreeMap::new(),
             live: BTreeSet::new(),
             pending: BTreeSet::new(),
             log_tasks: Vec::new(),
         };
         tokio::spawn(actor.run(rx));
-        Cluster { tx }
+        Cluster {
+            tx,
+            next_wid: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        }
     }
 
-    /// Events for worker `id` (one subscriber per id).
-    pub fn subscribe(&self, id: u32) -> mpsc::UnboundedReceiver<WorkerEvent> {
+    /// Events for the workers of `instance` (one subscriber per instance).
+    pub fn subscribe(&self, instance: u32) -> mpsc::UnboundedReceiver<WorkerMsg> {
         let (tx, rx) = mpsc::unbounded_channel();
-        let _ = self.tx.send(Cmd::Subscribe(id, tx));
+        let _ = self.tx.send(Cmd::Subscribe(instance, tx));
         rx
     }
 
-    pub fn spawn(&self, id: u32) {
-        let _ = self.tx.send(Cmd::Spawn(id));
+    /// Fork a worker for `instance`; returns its worker id. Its `Spawned` or
+    /// `SpawnFailed` arrives as an event.
+    pub fn spawn(&self, instance: u32) -> u32 {
+        let wid = self
+            .next_wid
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let _ = self.tx.send(Cmd::Spawn { wid, instance });
+        wid
     }
 
-    pub fn signal(&self, id: u32, sig: Signal) {
-        let _ = self.tx.send(Cmd::Signal(id, sig));
+    pub fn signal(&self, wid: u32, sig: Signal) {
+        let _ = self.tx.send(Cmd::Signal(wid, sig));
+    }
+
+    /// Stop routing connections to worker `wid`, let in-flight ones finish,
+    /// then SIGTERM it.
+    pub fn retire(&self, wid: u32) {
+        let _ = self.tx.send(Cmd::Retire(wid));
     }
 
     /// Stop the primary (its workers must already have been stopped).
@@ -116,7 +147,9 @@ struct Actor {
     out: Sink,
     err: Sink,
     primary: Option<Primary>,
-    subscribers: BTreeMap<u32, mpsc::UnboundedSender<WorkerEvent>>,
+    subscribers: BTreeMap<u32, mpsc::UnboundedSender<WorkerMsg>>,
+    /// Worker id -> instance number, for routing events.
+    instance_of: BTreeMap<u32, u32>,
     /// Workers the primary reported as spawned and not yet exited.
     live: BTreeSet<u32>,
     /// Spawn requests sent but not yet answered.
@@ -130,8 +163,15 @@ impl Actor {
             tokio::select! {
                 cmd = rx.recv() => match cmd {
                     Some(Cmd::Subscribe(id, tx)) => { self.subscribers.insert(id, tx); }
-                    Some(Cmd::Spawn(id)) => self.spawn(id).await,
+                    Some(Cmd::Spawn { wid, instance }) => self.spawn(wid, instance).await,
                     Some(Cmd::Signal(id, sig)) => self.signal(id, sig).await,
+                    Some(Cmd::Retire(id)) => {
+                        if self.live.contains(&id)
+                            && !self.send(&json!({ "cmd": "retire", "id": id })).await
+                        {
+                            self.primary_gone().await;
+                        }
+                    }
                     Some(Cmd::Shutdown(done)) => {
                         self.shutdown().await;
                         let _ = done.send(());
@@ -148,24 +188,29 @@ impl Actor {
         }
     }
 
-    fn tell(&self, id: u32, ev: WorkerEvent) {
-        if let Some(tx) = self.subscribers.get(&id) {
-            let _ = tx.send(ev);
+    fn tell(&self, wid: u32, ev: WorkerEvent) {
+        if let Some(instance) = self.instance_of.get(&wid)
+            && let Some(tx) = self.subscribers.get(instance)
+        {
+            let _ = tx.send(WorkerMsg { wid, ev });
         }
     }
 
-    async fn spawn(&mut self, id: u32) {
+    async fn spawn(&mut self, wid: u32, instance: u32) {
+        self.instance_of.insert(wid, instance);
         if self.primary.is_none()
             && let Err(e) = self.start_primary()
         {
             self.tell(
-                id,
+                wid,
                 WorkerEvent::SpawnFailed(format!("cannot start the cluster primary: {e}")),
             );
+            self.instance_of.remove(&wid);
             return;
         }
-        self.pending.insert(id);
-        if !self.send(&json!({ "cmd": "spawn", "id": id })).await {
+        self.pending.insert(wid);
+        let msg = json!({ "cmd": "spawn", "id": wid, "instance": instance });
+        if !self.send(&msg).await {
             self.primary_gone().await;
         }
     }
@@ -277,6 +322,7 @@ impl Actor {
                     .and_then(Value::as_str)
                     .unwrap_or("unknown error");
                 self.tell(id, WorkerEvent::SpawnFailed(e.to_owned()));
+                self.instance_of.remove(&id);
             }
             "ready" => self.tell(id, WorkerEvent::Ready),
             "listening" => self.tell(id, WorkerEvent::Listening),
@@ -291,6 +337,7 @@ impl Actor {
                     .and_then(Value::as_str)
                     .and_then(signal_number);
                 self.tell(id, WorkerEvent::Exited(ExitStatus { code, signal }));
+                self.instance_of.remove(&id);
             }
             _ => {}
         }
@@ -320,6 +367,7 @@ impl Actor {
                 WorkerEvent::SpawnFailed("the cluster primary exited".into()),
             );
         }
+        self.instance_of.clear();
     }
 
     async fn shutdown(&mut self) {

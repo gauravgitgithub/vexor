@@ -39,6 +39,8 @@ Open:
 
 4.2 ✅ Cluster mode: ES5 cluster primary (`crates/vexor-shim/src/cluster.js`) on the app's Node holds the shared listening sockets; the shim keeps one state machine per worker and drives workers through it (spawn / signal / events). Primary death → its group is killed and every worker restarts under its own policy. `exec_mode: cluster` in ecosystem files; `vexor start app.js -i N` is cluster mode (as in PM2), `--fork` opts out. Tested: workers share a port and are replaced individually (others keep serving), primary death restarts all, readiness per worker, graceful stop; cluster check on Node 8–24.
 
+4.3 ✅ Health-gated `vexor reload`: reload is a phase of the core state machine (replacement spawned next to the current process; promoted when healthy; abandoned, keeping the current process, on exit, spawn failure or timeout; interrupted by stop/restart/crash). Cluster mode is start-first (healthy = `ready` with `wait_ready`, else `listening`); fork mode is stop-first unless `reload_strategy: start_first` (healthy = `ready`, else up for `min_uptime`). Old cluster workers retire gracefully (`worker.disconnect()`, then SIGTERM, SIGKILL after `kill_timeout`). Tested: 3 reloads of a 1-instance cluster app under load with 0 failed requests and exactly one worker left; failed reload keeps the old process with 0 failed requests and is reported within a second; fork default = restart; fork start-first on a fixed port fails safely (EADDRINUSE); 6 core unit tests + property tests; cluster reload on Node 8–24.
+
 Remaining: 
 ## Phase 5: migration
 dry-run, backup, journaled apply, rollback (docs/migration.md).

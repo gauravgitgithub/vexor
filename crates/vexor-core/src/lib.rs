@@ -11,8 +11,8 @@ pub mod time;
 
 pub use lifecycle::{
     AfterStop, Ctx, Effect, ErrorReason, Event, ExitStatus, HealthPolicy, Instance, InstancePolicy,
-    State, Timer,
+    ReplacementReady, State, Timer,
 };
 pub use restart::{Backoff, Jitter, MIN_RESTART_INTERVAL, RestartPolicy};
-pub use spec::{AppSpec, ClusterSpec, LogSpec, Overflow, PolicySpec};
+pub use spec::{AppSpec, ClusterSpec, LogSpec, Overflow, PolicySpec, ReloadStrategy};
 pub use time::Millis;

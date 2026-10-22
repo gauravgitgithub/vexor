@@ -191,6 +191,15 @@ Whether the old and new instances can overlap depends on the port:
 - Every reload reports which strategy ran, and says "restart, not zero
   downtime" when it was `stop-first`.
 
+Implemented (plan 4.3) as a phase of the core state machine (`Event::Reload`,
+`Replacement*` events, `SpawnReplacement` / `PromoteReplacement` /
+`AbandonReplacement` effects, `Timer::Replacement`). Without
+`ready_timeout`, cluster reload waits for `listening` up to
+`reload_timeout_ms` (default 30 s); fork start-first waits until the
+replacement has been up for `min_uptime` (at least 1 s). Retired cluster
+workers are disconnected first (no new connections, in-flight ones finish),
+then sent SIGTERM, then SIGKILL after `kill_timeout`.
+
 **For a single-instance HTTP app, the zero-downtime path is cluster mode with
 one instance.** `vexor migrate --dry-run` and `doctor` suggest it for fork-mode
 apps that listen on a port.

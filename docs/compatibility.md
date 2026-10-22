@@ -56,7 +56,7 @@ The wrapper is a zero-dependency ES5 script with no `postinstall` and no network
 | PM2 | Vexor | Notes |
 |---|---|---|
 | start / stop / restart / delete | same | accepts name, id, `all`, config file |
-| reload | same | start new → wait healthy → retire old; failed replacement keeps old running. Fork mode on a fixed port **falls back to restart and says so** (architecture.md §6a) |
+| reload | same | Implemented. Cluster mode: start new → wait healthy → retire old gracefully; a failed replacement keeps the old process and `reload` exits 1 naming the instances. Fork mode: restart by default (as PM2); `reload_strategy: start_first` for apps that can run twice (no fixed port, or `reusePort`) |
 | list / ls / status | same | `--json` stable schema |
 | logs | same | `--lines`, `--raw`, `--err/--out` |
 | describe / show | same | env values redacted by default |

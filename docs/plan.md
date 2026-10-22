@@ -30,7 +30,8 @@ Done:
 Open:
 - Reserve the npm names (needs `npm login`), add `NPM_TOKEN`, cut `v0.1.0`. The release workflow has not run yet; its first run is the real test.
 - Static musl builds need a C cross compiler for the bundled SQLite (`musl-gcc`; cargo-zigbuild if cross-compiling); release binary is ~3.7 MB.
-- pnpm/yarn and `--ignore-scripts` install checks; darwin-x64 is built but only smoke-tested by `--version` skipping (cross-built on arm64 runners).
+- pnpm/yarn and `--ignore-scripts` install checks.
+- darwin-x64 is cross-built on an arm64 runner and not run at all yet (the release smoke test skips it); it needs an Intel runner before it can be advertised.
 
 ## Phase 4: PM2 compatibility
 Ecosystem loader (app's Node), field classifier + warnings, cluster-shim, health-gated `reload` (architecture.md §6a; acceptance: under constant `wrk2` load, cluster `-i 1` reload → 0 failed requests; replacement that never sends ready → old kept, reload reported failed, 0 failed requests; fork `start-first` on a fixed port → EADDRINUSE detected, old kept), `wait_ready`/`listen_timeout`, `save`/`resurrect`/`startup`, conformance fixtures diffed against PM2 7.x behaviour.

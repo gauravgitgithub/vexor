@@ -129,6 +129,16 @@ impl Home {
         }
     }
 
+    /// The shim's event log and the app's stderr, for failure messages.
+    fn diagnostics(&self, app: &str) -> String {
+        let read = |p: &str| std::fs::read_to_string(self.path(p)).unwrap_or_default();
+        format!(
+            "--- shims/{app}.log ---\n{}\n--- {app}.err ---\n{}",
+            read(&format!("shims/{app}.log")),
+            read(&format!("{app}.err"))
+        )
+    }
+
     fn shim_pids(&self) -> BTreeSet<u64> {
         self.log()
             .iter()
@@ -171,11 +181,25 @@ fn which(program: &str) -> Option<String> {
     path.starts_with('/').then_some(path)
 }
 
+/// A port for a test server, outside the OS ephemeral range (Linux 32768+,
+/// macOS 49152+). Ports from `bind(0)` come from that range, which outgoing
+/// connections also use: while a test app is down, another test's client
+/// connection could take its port and the restart would fail with
+/// EADDRINUSE. Seen once on a CI x64 runner.
 fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .and_then(|l| l.local_addr())
-        .map(|a| a.port())
-        .expect("free port")
+    use std::sync::atomic::{AtomicU16, Ordering};
+    // Spread concurrent test processes apart; tests within one process take
+    // successive ports.
+    static NEXT: AtomicU16 = AtomicU16::new(0);
+    let base = 20_000 + u16::try_from(std::process::id() % 500).unwrap_or(0) * 20;
+    loop {
+        let offset = NEXT.fetch_add(1, Ordering::Relaxed);
+        let port = 20_000 + (base - 20_000 + offset) % 10_000;
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+        assert!(offset < 10_000, "no free port in 20000-29999");
+    }
 }
 
 /// One HTTP/1.0 GET; the body on success.
@@ -385,9 +409,10 @@ fn shim_restarts_crashed_app_while_daemon_is_down() {
         .rfind(|e| e["type"] == "shim_connected")
         .expect("connected");
     let snap = &connected["snapshot"][0];
-    assert_eq!(snap["state"], "online", "{connected}");
-    assert_eq!(snap["restarts"], 1, "{connected}");
-    assert_eq!(snap["pid"], after, "{connected}");
+    let why = home.diagnostics("web");
+    assert_eq!(snap["state"], "online", "{connected}\n{why}");
+    assert_eq!(snap["restarts"], 1, "{connected}\n{why}");
+    assert_eq!(snap["pid"], after, "{connected}\n{why}");
 }
 
 #[test]

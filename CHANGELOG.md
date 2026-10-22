@@ -3,7 +3,7 @@
 All notable changes to Vexor. Versions follow [Semantic Versioning](https://semver.org/);
 before 1.0, minor versions may include breaking changes, which are listed here.
 
-## 0.1.0 (unreleased, prerelease)
+## 0.1.0 (2026-10-22, prerelease)
 
 First public prerelease. **Not yet recommended for production**: there is no
 PM2 migration tool, no memory/watch/cron restarts, and no published

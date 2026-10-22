@@ -35,20 +35,29 @@ esac
 target="$arch-$os"
 asset="vexor-$target.tar.gz"
 
-if [ -n "${VEXOR_DOWNLOAD_BASE:-}" ]; then
-  base="$VEXOR_DOWNLOAD_BASE"
-elif [ "$VERSION" = latest ]; then
-  base="https://github.com/$REPO/releases/latest/download"
-else
-  base="https://github.com/$REPO/releases/download/$VERSION"
-fi
-
 if command -v curl >/dev/null 2>&1; then
   fetch() { curl -fsSL --proto '=https,file' --retry 2 -o "$2" "$1"; }
 elif command -v wget >/dev/null 2>&1; then
   fetch() { wget -q -O "$2" "$1"; }
 else
   die "need curl or wget"
+fi
+
+# "latest" means the newest release, prereleases included (GitHub's own
+# releases/latest skips prereleases, which all 0.x releases are).
+if [ -z "${VEXOR_DOWNLOAD_BASE:-}" ] && [ "$VERSION" = latest ]; then
+  meta=$(mktemp)
+  fetch "https://api.github.com/repos/$REPO/releases?per_page=1" "$meta" ||
+    die "cannot look up the latest release; pass a version, e.g. sh -s -- v0.1.0"
+  VERSION=$(sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' "$meta" | head -n 1)
+  rm -f "$meta"
+  [ -n "$VERSION" ] || die "no releases found for $REPO"
+fi
+
+if [ -n "${VEXOR_DOWNLOAD_BASE:-}" ]; then
+  base="$VEXOR_DOWNLOAD_BASE"
+else
+  base="https://github.com/$REPO/releases/download/$VERSION"
 fi
 
 if command -v sha256sum >/dev/null 2>&1; then

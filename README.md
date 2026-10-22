@@ -3,12 +3,12 @@
 A Rust-native process manager for production Node.js apps, designed as a
 PM2-compatible alternative.
 
-> **Status: pre-alpha.** Only the project skeleton exists. Nothing here is
-> usable yet, and none of the features described in `docs/` are implemented.
+> **Status: prerelease (0.1.0).** Usable for evaluation, not yet recommended
+> for production: PM2 migration, memory/watch/cron restarts and published
+> benchmarks are still missing. See [CHANGELOG.md](CHANGELOG.md) and
+> [docs/plan.md](docs/plan.md).
 
 ## Install
-
-Not published yet. Once released:
 
 ```sh
 npm install -g vexord        # installs the `vexor` command (launcher needs Node >= 10)

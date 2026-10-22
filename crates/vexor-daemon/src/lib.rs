@@ -290,7 +290,7 @@ impl Daemon {
                     Err(e) => error(ErrorCode::Internal, e.to_string()),
                 }
             }
-            Request::Start { spec } => self.start_new(*spec).await,
+            Request::Start { spec, start } => self.start_new(*spec, start).await,
             Request::StartExisting { target } => self.for_each(target, Op::StartExisting).await,
             Request::Stop { target } => self.for_each(target, Op::Stop).await,
             Request::Restart { target } => self.for_each(target, Op::Restart).await,
@@ -333,7 +333,7 @@ impl Daemon {
         }
     }
 
-    async fn start_new(&self, spec: AppSpec) -> Response {
+    async fn start_new(&self, spec: AppSpec, start: bool) -> Response {
         if let Err(e) = vexor_shim::validate(&spec) {
             return error(ErrorCode::InvalidSpec, e);
         }
@@ -349,6 +349,9 @@ impl Daemon {
                     ),
                 );
             }
+            if !start {
+                return self.ok_one(self.status(&store, &name));
+            }
             return match self.start_existing(&mut store, &name).await {
                 Ok(()) => self.ok_one(self.status(&store, &name)),
                 Err(e) => error(ErrorCode::Internal, e),
@@ -356,7 +359,11 @@ impl Daemon {
         }
         let entry = AppEntry {
             spec,
-            desired: Desired::Running,
+            desired: if start {
+                Desired::Running
+            } else {
+                Desired::Stopped
+            },
         };
         if let Err(e) = store.update(|apps| {
             apps.insert(name.clone(), entry.clone());
@@ -369,6 +376,9 @@ impl Daemon {
         self.log.write(json!({ "type": "app_added", "app": name }));
         self.events
             .record_daemon(Some(&name), "app_added", json!({}));
+        if !start {
+            return self.ok_one(self.status(&store, &name));
+        }
         if let Err(e) = self.wait_connected(&name).await {
             return error(ErrorCode::Internal, e);
         }
@@ -620,7 +630,7 @@ async fn client(stream: UnixStream, daemon: Arc<Daemon>) {
 /// The request without its spec (specs carry environment values).
 fn request_summary(r: &Request) -> Value {
     match r {
-        Request::Start { spec } => json!({ "type": "start", "name": spec.name }),
+        Request::Start { spec, .. } => json!({ "type": "start", "name": spec.name }),
         other => serde_json::to_value(other).unwrap_or(Value::Null),
     }
 }

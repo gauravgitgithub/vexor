@@ -883,6 +883,7 @@ dependencies = [
  "tempfile",
  "vexor-core",
  "vexor-daemon",
+ "vexor-pm2",
  "vexor-proto",
  "vexor-shim",
 ]
@@ -910,6 +911,16 @@ dependencies = [
  "vexor-core",
  "vexor-proto",
  "vexor-shim",
+]
+
+[[package]]
+name = "vexor-pm2"
+version = "0.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+ "vexor-core",
 ]
 
 [[package]]

@@ -85,4 +85,15 @@ spec noready "setInterval(function(){},1000)" '{"ready_timeout_ms":500,"max_rest
 got=$(states "$D/noready.events")
 [ "$got" = "starting stopping errored" ] && pass "readiness timeout" || fail "readiness timeout" "$got"
 
+# 7. An ES5 ecosystem file loads with this Node (vexor check, no daemon).
+cat > "$D/ecosystem.config.js" <<'ECOSYSTEM_END'
+var base = { name: 'eco', script: 'app.js', instances: 2, merge_logs: true };
+module.exports = { apps: [base] };
+ECOSYSTEM_END
+out=$("$VEXOR" --home "$D/home" check "$D/ecosystem.config.js" --interpreter "$NODE" --json 2>&1); code=$?
+case "$out" in
+  *'"name": "eco"'*) [ "$code" = 0 ] && pass "ecosystem file loads" || fail "ecosystem file loads" "exit $code" ;;
+  *) fail "ecosystem file loads" "$out" ;;
+esac
+
 exit "$FAILED"

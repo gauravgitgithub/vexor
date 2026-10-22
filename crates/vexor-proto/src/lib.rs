@@ -87,6 +87,9 @@ pub enum Request {
     /// already running.
     Start {
         spec: Box<vexor_core::AppSpec>,
+        /// False: add the app but leave it stopped (PM2 `autostart: false`).
+        #[serde(default = "yes")]
+        start: bool,
     },
     /// Start apps that already exist.
     StartExisting {
@@ -168,6 +171,10 @@ pub struct AppStatus {
 pub enum Desired {
     Running,
     Stopped,
+}
+
+fn yes() -> bool {
+    true
 }
 
 /// Write one message as a JSON line.

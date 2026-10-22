@@ -25,8 +25,27 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Start a script, or start existing apps by name (or `all`).
+    /// Start a script or an ecosystem file, or start existing apps by name
+    /// (or `all`).
     Start(StartArgs),
+    /// Check an ecosystem file without starting anything: shows each app's
+    /// translation and every unsupported or ignored setting.
+    Check {
+        /// Ecosystem file (.js, .cjs, .mjs, .json).
+        file: PathBuf,
+        /// Only these apps (comma-separated).
+        #[arg(long)]
+        only: Option<String>,
+        /// Apply `env_<NAME>` from the file.
+        #[arg(long = "env", value_name = "NAME")]
+        env: Option<String>,
+        /// Node.js used to evaluate a JavaScript ecosystem file.
+        #[arg(long)]
+        interpreter: Option<String>,
+        /// Machine-readable output.
+        #[arg(long)]
+        json: bool,
+    },
     /// Stop apps (by name, or `all`). They stay stopped across daemon restarts.
     Stop { target: String },
     /// Restart apps (by name, or `all`).
@@ -74,7 +93,7 @@ enum Command {
 
 #[derive(Debug, Args)]
 pub struct StartArgs {
-    /// Script or executable to start, or the name of an existing app, or `all`.
+    /// Script, ecosystem file, name of an existing app, or `all`.
     pub target: Option<String>,
     /// App name [default: script file name without extension]
     #[arg(long)]
@@ -89,9 +108,17 @@ pub struct StartArgs {
     /// Working directory [default: current directory]
     #[arg(long)]
     pub cwd: Option<PathBuf>,
-    /// Set an environment variable (repeatable).
-    #[arg(long = "env", value_name = "KEY=VALUE")]
+    /// Set an environment variable (repeatable). With an ecosystem file:
+    /// the environment name whose `env_<NAME>` to apply, as in PM2.
+    #[arg(long = "env", value_name = "KEY=VALUE|NAME")]
     pub env: Vec<String>,
+    /// Ecosystem file: only start these apps (comma-separated).
+    #[arg(long)]
+    pub only: Option<String>,
+    /// Ecosystem file: start even if some settings are unsupported in a way
+    /// that changes how the app behaves (they are listed first).
+    #[arg(long)]
+    pub allow_unsupported: bool,
     /// Pass this shell's whole environment to the app (PM2 behaviour).
     /// By default only a small allowlist is passed (see docs/security.md T2).
     #[arg(long)]
@@ -123,10 +150,17 @@ fn main() -> ExitCode {
             &spec,
             managed.then_some(home.as_path()),
         )),
-        Command::Start(args) => match spec::start_request(&args, &home) {
-            Ok(req) => send(&home, req, false),
+        Command::Start(args) => match spec::start_plan(&args, &home) {
+            Ok(plan) => run_plan(&home, plan, args.allow_unsupported),
             Err(msg) => fail(&msg),
         },
+        Command::Check {
+            file,
+            only,
+            env,
+            interpreter,
+            json,
+        } => check(&home, file, only, env, interpreter, json),
         Command::Stop { target } => send(
             &home,
             Request::Stop {
@@ -238,6 +272,141 @@ fn send(home: &std::path::Path, req: Request, json: bool) -> ExitCode {
                 code::FAILED
             })
         }
+    }
+}
+
+/// Print an ecosystem file's findings to stderr.
+fn print_notes(notes: &[vexor_pm2::Note]) {
+    use vexor_pm2::Severity;
+    for n in notes {
+        let level = match n.severity {
+            Severity::Fatal => "error",
+            Severity::Partial => "warning",
+            Severity::Ignored => "note",
+        };
+        eprintln!("vexor: {level}: {}: {}: {}", n.app, n.field, n.message);
+    }
+}
+
+fn run_plan(home: &std::path::Path, plan: spec::Plan, allow_unsupported: bool) -> ExitCode {
+    print_notes(&plan.notes);
+    if plan.has_fatal() && !allow_unsupported {
+        eprintln!(
+            "vexor: nothing was started: the errors above would change how the apps behave. \
+             Fix them, or pass --allow-unsupported to start anyway."
+        );
+        return ExitCode::from(code::FAILED);
+    }
+    if plan.requests.len() == 1 {
+        let req = plan.requests.into_iter().next().expect("one request");
+        return send(home, req, false);
+    }
+    let total = plan.requests.len();
+    let mut apps = Vec::new();
+    let mut failed = 0;
+    for req in plan.requests {
+        match client::request(home, &req) {
+            Ok(Response::Ok { apps: a, warnings }) => {
+                print_warnings(&warnings);
+                apps.extend(a);
+            }
+            Ok(Response::Error { message, .. }) => {
+                failed += 1;
+                eprintln!("vexor: {message}");
+            }
+            Ok(Response::Events { .. }) => {}
+            Err(e) => {
+                eprintln!("vexor: {e}");
+                return ExitCode::from(code::DAEMON_UNREACHABLE);
+            }
+        }
+    }
+    print_table(&apps);
+    match failed {
+        0 => ExitCode::SUCCESS,
+        n if n == total => ExitCode::from(code::FAILED),
+        _ => ExitCode::from(code::PARTIAL),
+    }
+}
+
+fn check(
+    home: &std::path::Path,
+    file: PathBuf,
+    only: Option<String>,
+    env: Option<String>,
+    interpreter: Option<String>,
+    json: bool,
+) -> ExitCode {
+    let args = StartArgs {
+        target: Some(file.to_string_lossy().into_owned()),
+        name: None,
+        instances: None,
+        interpreter,
+        cwd: None,
+        env: env.into_iter().collect(),
+        inherit_env: false,
+        spec: None,
+        args: Vec::new(),
+        only,
+        allow_unsupported: false,
+    };
+    if !spec::is_ecosystem(&file) {
+        return fail(&format!("{} is not an ecosystem file", file.display()));
+    }
+    let plan = match spec::start_plan(&args, home) {
+        Ok(p) => p,
+        Err(e) => return fail(&e),
+    };
+    let specs: Vec<serde_json::Value> = plan
+        .requests
+        .iter()
+        .filter_map(|r| match r {
+            Request::Start { spec, start } => {
+                let mut v = serde_json::to_value(spec).ok()?;
+                // Values may be secrets: show the keys only.
+                if let Some(env) = v.get_mut("env").and_then(|e| e.as_object_mut()) {
+                    for val in env.values_mut() {
+                        *val = serde_json::Value::String("<redacted>".into());
+                    }
+                }
+                v["autostart"] = serde_json::Value::Bool(*start);
+                Some(v)
+            }
+            _ => None,
+        })
+        .collect();
+    if json {
+        let out = serde_json::json!({ "apps": specs, "notes": plan.notes });
+        println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+    } else {
+        for s in &specs {
+            println!(
+                "{}: {} {} (instances: {}, cwd: {}{})",
+                s["name"].as_str().unwrap_or("?"),
+                s["exec"].as_str().unwrap_or("?"),
+                s["args"]
+                    .as_array()
+                    .map(|a| a
+                        .iter()
+                        .filter_map(|x| x.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" "))
+                    .unwrap_or_default(),
+                s["instances"],
+                s["cwd"].as_str().unwrap_or("?"),
+                if s["autostart"] == false {
+                    ", autostart: false"
+                } else {
+                    ""
+                }
+            );
+        }
+        print_notes(&plan.notes);
+    }
+    if plan.has_fatal() {
+        ExitCode::from(code::FAILED)
+    } else {
+        ExitCode::SUCCESS
     }
 }
 

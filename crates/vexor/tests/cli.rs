@@ -389,7 +389,10 @@ fn crash_budget_and_history_survive_a_daemon_kill() {
         "cwd": env.work.path(),
         "env": { "PATH": "/usr/bin:/bin" },
         "logs": { "out": env.work.path().join("crash.out"), "err": env.work.path().join("crash.err") },
-        "policy": { "max_restarts": 3 },
+        // A long min_uptime keeps every run unstable even on a loaded
+        // machine; this test is about the budget surviving a daemon kill,
+        // not about the min_uptime boundary.
+        "policy": { "max_restarts": 3, "min_uptime_ms": 10000 },
     });
     std::fs::write(&spec, json.to_string()).expect("spec");
     env.ok(&["start", "--spec", &spec.to_string_lossy()]);
@@ -410,7 +413,12 @@ fn crash_budget_and_history_survive_a_daemon_kill() {
         assert!(Instant::now() < deadline, "never errored: {app}");
         std::thread::sleep(Duration::from_millis(100));
     };
-    assert_eq!(app["snapshot"][0]["restarts"], 3, "{app}");
+    assert_eq!(
+        app["snapshot"][0]["restarts"],
+        3,
+        "{app}\nhistory: {:#?}",
+        events(&env, "crash")
+    );
     let runs = std::fs::read_to_string(env.work.path().join("crash.out")).expect("out");
     assert_eq!(runs.lines().count(), 4, "1 start + 3 restarts");
 
@@ -504,4 +512,160 @@ fn events_command_table_and_filters() {
     let limited: Vec<Value> =
         serde_json::from_str(&env.ok(&["events", "--limit", "2", "--json"])).expect("json");
     assert_eq!(limited.len(), 2);
+}
+
+// --------------------------------------------------------- ecosystem files
+
+fn ecosystem(env: &Env, body: &str) -> PathBuf {
+    let path = env.work.path().join("ecosystem.config.js");
+    std::fs::write(&path, body).expect("write ecosystem");
+    path
+}
+
+const ECOSYSTEM: &str = r"
+module.exports = {
+  apps: [
+    { name: 'a', script: './loop.sh', env: { MODE: 'dev' }, env_production: { MODE: 'prod' } },
+    { name: 'b', script: 'loop.sh', instances: 2, merge_logs: true, autostart: false },
+    { name: 'm', script: 'loop.sh', max_memory_restart: '300M' },
+  ],
+};
+";
+
+#[test]
+fn ecosystem_check_reports_without_starting() {
+    if which("node").is_none() {
+        eprintln!("skipping: node not found");
+        return;
+    }
+    let env = Env::new();
+    ecosystem(&env, ECOSYSTEM);
+    let out = env.run(&[
+        "check",
+        "ecosystem.config.js",
+        "--json",
+        "--env",
+        "production",
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "fatal field must fail the check"
+    );
+    let report: Value = serde_json::from_slice(&out.stdout).expect("json");
+    let names: Vec<_> = report["apps"]
+        .as_array()
+        .expect("apps")
+        .iter()
+        .map(|a| a["name"].as_str().unwrap_or("").to_owned())
+        .collect();
+    assert_eq!(names, ["a", "b", "m"]);
+    assert_eq!(
+        report["apps"][0]["env"]["MODE"], "<redacted>",
+        "values are not shown"
+    );
+    assert_eq!(report["apps"][1]["autostart"], false);
+    assert!(
+        report["notes"]
+            .as_array()
+            .expect("notes")
+            .iter()
+            .any(|n| n["field"] == "max_memory_restart" && n["severity"] == "fatal")
+    );
+    assert!(
+        !env.home.path().join("daemon.sock").exists(),
+        "check must not start the daemon"
+    );
+}
+
+#[test]
+fn ecosystem_start_blocks_on_unsupported_then_starts_selected_apps() {
+    if which("node").is_none() {
+        eprintln!("skipping: node not found");
+        return;
+    }
+    let env = Env::new();
+    ecosystem(&env, ECOSYSTEM);
+    let out = env.run(&["start", "ecosystem.config.js"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("nothing was started"));
+    assert!(
+        !env.home.path().join("daemon.sock").exists(),
+        "nothing reached the daemon"
+    );
+
+    env.ok(&[
+        "start",
+        "ecosystem.config.js",
+        "--only",
+        "a,b",
+        "--env",
+        "production",
+    ]);
+    let state = env.state();
+    assert_eq!(state["apps"]["a"]["spec"]["env"]["MODE"], "prod");
+    assert_eq!(state["apps"]["a"]["desired"], "running");
+    assert_eq!(state["apps"]["b"]["desired"], "stopped", "autostart: false");
+    assert!(state["apps"].get("m").is_none());
+    assert_eq!(states(&env.app("a")), ["online"]);
+
+    // The unsupported app can still be started deliberately.
+    env.ok(&[
+        "start",
+        "ecosystem.config.js",
+        "--only",
+        "m",
+        "--allow-unsupported",
+    ]);
+    assert_eq!(states(&env.app("m")), ["online"]);
+}
+
+#[test]
+fn json_ecosystem_needs_no_node() {
+    let env = Env::new();
+    std::fs::write(
+        env.work.path().join("apps.json"),
+        r#"{"apps":[{"name":"j","script":"loop.sh","args":"--x 'a b'"}]}"#,
+    )
+    .expect("write");
+    let out = env
+        .cmd(&["check", "apps.json", "--json"])
+        .env("PATH", "/usr/bin:/bin")
+        .output()
+        .expect("run");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: Value = serde_json::from_slice(&out.stdout).expect("json");
+    // `.sh` runs with bash, as in PM2: the script comes first.
+    let args = report["apps"][0]["args"].as_array().expect("args");
+    assert!(
+        args[0].as_str().is_some_and(|a| a.ends_with("/loop.sh")),
+        "{args:?}"
+    );
+    assert_eq!(
+        args[1..],
+        [serde_json::json!("--x"), serde_json::json!("a b")]
+    );
+    assert!(
+        report["apps"][0]["exec"]
+            .as_str()
+            .is_some_and(|e| e.ends_with("bash")),
+        "{report}"
+    );
+}
+
+#[test]
+fn ecosystem_load_errors_are_reported() {
+    if which("node").is_none() {
+        eprintln!("skipping: node not found");
+        return;
+    }
+    let env = Env::new();
+    ecosystem(&env, "module.exports = {;\n");
+    let out = env.run(&["start", "ecosystem.config.js"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("SyntaxError"));
 }

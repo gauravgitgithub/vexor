@@ -78,6 +78,13 @@ Exit codes: 0 ok, 1 command failed, 2 usage error, 3 daemon unreachable, 4 parti
 
 ## 5. Ecosystem field classification (PM2 7.0.4 `lib/API/schema.json`, 65 fields)
 
+Implemented in `crates/vexor-pm2` (4.1). `vexor check ecosystem.config.js` prints every finding without starting anything; `vexor start` refuses to start while any `fatal` finding remains, unless `--allow-unsupported`. Current classification (supersedes the table below where they differ):
+
+- **fatal** (until implemented): `exec_mode: cluster`, `watch: true`, `max_memory_restart`, `cron_restart`, `uid`/`gid`/`username`, `increment_var`, `shutdown_with_message`, `.ts`/`.coffee` without `interpreter`, function/RegExp values, `wait_ready` on a non-Node app, malformed values.
+- **partial**: `merge_logs` (instances always share log files), `log_file` (no combined log), `listen_timeout` without `wait_ready`.
+- **ignored** (reported): PM2 Plus/monitoring fields, `namespace`, `pid_file`, `kill_retry_time`, `force`, `log_type`, `time`, `log_date_format`, `filter_env`, `windowsHide`, unknown fields.
+- `instances` without `exec_mode` runs N fork-mode processes (they can't share a port). `args`/`node_args` strings are split shell-style (quotes, backslashes) with no expansion. Environment: caller allowlist (or `--inherit-env`), then `env`, then `env_<NAME>`. Relative `cwd` resolves against the ecosystem file's directory and `script` against `cwd` (to confirm against PM2 in the conformance suite).
+
 | Class | Fields |
 |---|---|
 | supported | name, script, cwd, args, interpreter/exec_interpreter, node_args/interpreter_args, env, env_*, instances, exec_mode, autorestart, max_restarts, min_uptime, restart_delay, exp_backoff_restart_delay, kill_timeout, wait_ready, listen_timeout, shutdown_with_message, stop_exit_codes, out_file, error_file, log_file, merge_logs, log_date_format, time, disable_logs, namespace, instance_var, increment_var, treekill, max_memory_restart, pid_file, autostart, append_env_to_name, kill_retry_time, filter_env, name_prefix |

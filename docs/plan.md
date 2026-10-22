@@ -34,8 +34,10 @@ Open:
 - darwin-x64 is cross-built on an arm64 runner and not run at all yet (the release smoke test skips it); it needs an Intel runner before it can be advertised.
 
 ## Phase 4: PM2 compatibility
-Ecosystem loader (app's Node), field classifier + warnings, cluster-shim, health-gated `reload` (architecture.md §6a; acceptance: under constant `wrk2` load, cluster `-i 1` reload → 0 failed requests; replacement that never sends ready → old kept, reload reported failed, 0 failed requests; fork `start-first` on a fixed port → EADDRINUSE detected, old kept), `wait_ready`/`listen_timeout`, `save`/`resurrect`/`startup`, conformance fixtures diffed against PM2 7.x behaviour.
 
+4.1 ✅ Ecosystem files (`crates/vexor-pm2`): ES5 loader run on the app's own Node (`.js/.cjs/.mjs`; `.json` without Node), every PM2 field classified (supported / partial / ignored / fatal; unknown fields reported), `vexor start <ecosystem> [--only] [--env NAME] [--allow-unsupported]`, `vexor check`, `autostart: false`. Tested: 21 translator/loader unit tests, 4 CLI tests, loading an ES5 config on Node 8–24.
+
+Remaining: 
 ## Phase 5: migration
 dry-run, backup, journaled apply, rollback (docs/migration.md).
 

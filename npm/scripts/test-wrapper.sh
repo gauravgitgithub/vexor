@@ -60,14 +60,20 @@ else
 fi
 
 # A binary killed by a signal makes the launcher die by the same signal.
+# Wait for the daemon's "started" log line, not its socket: the socket
+# appears slightly earlier, and the pid comes from that line.
 H3="$T/h3"
 "$V" --home "$H3" daemon >/dev/null 2>&1 & lpid=$!
-if wait_for "$H3/daemon.sock" 10; then
-  bpid=$(sed -n 's/.*"pid":\([0-9]*\).*"type":"daemon_started".*/\1/p' "$H3/daemon.log" | tail -n 1)
+i=0; bpid=""
+while [ -z "$bpid" ] && [ "$i" -lt 100 ]; do
+  bpid=$(sed -n 's/.*"pid":\([0-9]*\).*"type":"daemon_started".*/\1/p' "$H3/daemon.log" 2>/dev/null | tail -n 1)
+  i=$((i + 1)); [ -z "$bpid" ] && sleep 0.1
+done
+if [ -n "$bpid" ]; then
   kill -KILL "$bpid"; wait "$lpid"; code=$?
   [ "$code" = 137 ] && pass "signal death re-raised" || fail "signal death re-raised" "exit $code"
 else
-  fail "signal death re-raised" "daemon did not start"; kill "$lpid" 2>/dev/null
+  fail "signal death re-raised" "daemon did not start"; kill -KILL "$lpid" 2>/dev/null
 fi
 
 # VEXOR_BINARY override.

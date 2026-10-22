@@ -19,6 +19,7 @@ env:
 jobs:
   fmt:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # rust-toolchain.toml selects the pinned toolchain; rustup installs it on first use.
@@ -26,6 +27,7 @@ jobs:
 
   clippy:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
@@ -37,6 +39,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
@@ -44,6 +47,7 @@ jobs:
 
   deny:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
@@ -55,6 +59,7 @@ jobs:
   # supported Node/npm, and install.sh checksum verification.
   linux-x64-static:
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
@@ -72,7 +77,7 @@ jobs:
         run: |
           failed=""
           for v in 8 10 12 14 16 18 20 22 24; do
-            docker run --rm -v "$PWD/dist/x86_64-unknown-linux-musl":/v:ro -v "$PWD/tests/legacy":/t:ro \
+            timeout 300 docker run --rm -v "$PWD/dist/x86_64-unknown-linux-musl":/v:ro -v "$PWD/tests/legacy":/t:ro \
               "node:$v-alpine" /t/node-smoke.sh || failed="$failed $v"
           done
           if [ -n "$failed" ]; then
@@ -88,7 +93,7 @@ jobs:
         run: |
           failed=""
           for v in 10 12 14 16 18 20 22 24; do
-            docker run --rm -v "$PWD/tgz":/tgz:ro -v "$PWD/npm/scripts":/s:ro \
+            timeout 300 docker run --rm -v "$PWD/tgz":/tgz:ro -v "$PWD/npm/scripts":/s:ro \
               "node:$v-alpine" /s/test-wrapper.sh /tgz || failed="$failed $v"
           done
           if [ -n "$failed" ]; then
@@ -114,6 +119,7 @@ jobs:
 
   npm-macos:
     runs-on: macos-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3

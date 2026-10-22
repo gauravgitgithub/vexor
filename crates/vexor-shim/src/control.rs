@@ -281,7 +281,10 @@ mod tests {
                 .is_none()
         );
         drop(held);
-        assert!(try_lock(&path).expect("lock").is_some());
+        // Another test in this process may fork a child at this moment; the
+        // child briefly shares the lock until it execs (CLOEXEC). Retry for
+        // that window, as daemon and shim do at startup.
+        assert!(lock_with_retry(&path, LOCK_WAIT).expect("lock").is_some());
     }
 
     #[test]

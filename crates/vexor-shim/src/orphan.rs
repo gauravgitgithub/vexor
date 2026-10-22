@@ -9,32 +9,67 @@
 //!   the shim shuts down. On macOS they re-parent to launchd and are out of
 //!   reach; that limitation is documented in docs/compatibility.md.
 
-use std::collections::HashSet;
+use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use crate::identity::Identity;
 
 /// PIDs of instance leaders. They are the shim's own children, waited on by
-/// tokio; orphan handling must never reap them.
+/// tokio; orphan handling must never reap them. In daemon mode their
+/// identities are also persisted, so the daemon can detect survivors of a
+/// shim crash.
 #[derive(Debug, Clone, Default)]
-pub struct Managed(Arc<Mutex<HashSet<u32>>>);
+pub struct Managed(Arc<Mutex<Leaders>>);
+
+#[derive(Debug, Default)]
+struct Leaders {
+    pids: BTreeMap<u32, Option<Identity>>,
+    persist: Option<PathBuf>,
+}
 
 impl Managed {
-    pub fn insert(&self, pid: u32) {
-        self.lock().insert(pid);
+    pub fn persisted(path: PathBuf) -> Self {
+        let m = Managed::default();
+        m.lock().persist = Some(path);
+        m.save();
+        m
+    }
+
+    pub fn insert(&self, pid: u32, identity: Option<Identity>) {
+        self.lock().pids.insert(pid, identity);
+        self.save();
     }
 
     pub fn remove(&self, pid: u32) {
-        self.lock().remove(&pid);
+        self.lock().pids.remove(&pid);
+        self.save();
     }
 
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     fn contains(&self, pid: u32) -> bool {
-        self.lock().contains(&pid)
+        self.lock().pids.contains_key(&pid)
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashSet<u32>> {
-        // The set stays consistent even if a holder panicked mid-update.
+    fn save(&self) {
+        let leaders = self.lock();
+        let Some(path) = &leaders.persist else {
+            return;
+        };
+        let ids: Vec<&Identity> = leaders.pids.values().flatten().collect();
+        let result = serde_json::to_vec(&ids)
+            .map_err(std::io::Error::other)
+            .and_then(|json| crate::control::write_atomic(path, &json));
+        if let Err(e) = result {
+            eprintln!(
+                "vexor shim: cannot record instance pids in {}: {e}",
+                path.display()
+            );
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Leaders> {
+        // The map stays consistent even if a holder panicked mid-update.
         self.0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)

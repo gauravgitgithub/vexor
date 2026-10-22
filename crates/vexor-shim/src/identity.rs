@@ -3,9 +3,9 @@
 
 use std::io;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Identity {
     pub pid: u32,
     /// Opaque, platform-specific start time. Only compared for equality.

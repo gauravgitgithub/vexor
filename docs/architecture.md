@@ -229,6 +229,35 @@ Cost: one extra process per app. Text pages of the shared binary are shared
 across processes, so per-shim private RSS is expected to be well under 1 MB
 (unverified; measured in B3). Benchmarks count shims as supervisor overhead.
 
+### Implemented (plan step 2.4b)
+
+- Files under `$VEXOR_HOME/shims/`: `<app>.lock` (flock held for the shim's
+  life: one shim per app, and "lock free" means "no shim"), `<app>.sock`
+  (control socket, 0600, peer UID checked on both sides), `<app>.pids.json`
+  (instance leader identities), `<app>.log` (shim's own output).
+- Protocol (`crates/vexor-proto`): JSON lines. Daemon sends `hello` with an
+  optional `resume {shim_start, last_seq}`; shim answers `welcome` (identity,
+  next sequence number, latest state per instance), replays buffered events
+  if resuming the same shim incarnation, then streams. The buffer holds
+  10,000 events; anything older is reported as `gap`, never silently skipped.
+- The daemon (`vexor daemon --home DIR`) takes `daemon.lock`, then for each
+  `apps/*.json` connects to the shim or launches it (own process group,
+  output to the shim log). If no shim holds the lock but its recorded
+  instances are still alive (a shim crash), it does **not** launch a new
+  shim: it logs `orphaned_instances` and waits. The adoption fallback
+  described above is not implemented yet.
+- Verified: HTTP app under back-to-back requests from one client while the
+  daemon is `kill -9`ed and restarted 100 times: 0 failed requests, same app
+  PID, one shim launched, every request logged exactly once in order
+  (macOS arm64 ×5, Linux arm64 ×3). A crashed app is restarted by the shim
+  while the daemon is down. A mutant where the shim stops its apps when the
+  daemon disconnects fails these tests.
+
+Not yet: resume across daemon restarts (needs `events.db`, step 2.6b; a fresh
+daemon gets the current snapshot, not missed history), operator commands
+(step 2.5), desired state so a deliberately stopped shim is not relaunched
+(2.6), in-place shim upgrade, and adopting a dead shim's instances.
+
 ### What zero downtime does and does not cover
 
 | Event | App downtime | Why |

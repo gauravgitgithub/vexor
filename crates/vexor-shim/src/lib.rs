@@ -1,23 +1,30 @@
 //! `vexor shim`: the per-app data plane (docs/architecture.md §2, §7).
 //!
 //! A shim parents every instance of one app, owns their pipes and log files,
-//! and runs the restart loop. This step (plan 2.3) runs in the foreground from
-//! a spec file and reports lifecycle events on stdout; the daemon connection
-//! comes in step 2.4b.
+//! and runs the restart loop.
+//!
+//! Two modes:
+//! - Foreground (`vexor shim --spec FILE`): reports events on stdout and exits
+//!   once every instance has ended.
+//! - Daemon-managed (`--home DIR`): additionally takes the per-app lock, serves
+//!   the control socket, records instance identities, and stays up after its
+//!   instances end (so their final state stays visible) until told to stop.
 
+mod control;
 mod identity;
 mod instance;
 mod orphan;
 mod output;
 mod process;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::watch;
 use vexor_core::{AppSpec, State};
 
+pub use control::{Paths, private_dir, shims_dir, try_lock};
 pub use identity::Identity;
 
 /// Exit codes of `vexor shim`.
@@ -28,12 +35,15 @@ pub mod exit {
     pub const ERRORED: i32 = 1;
     /// The spec is unreadable or invalid.
     pub const BAD_SPEC: i32 = 2;
+    /// Another shim already supervises this app.
+    pub const ALREADY_RUNNING: i32 = 4;
     /// The runtime or signal handlers could not be set up.
     pub const INTERNAL: i32 = 70;
 }
 
-/// Load a spec file, then supervise the app until every instance has ended.
-pub fn run_from_file(path: &Path) -> i32 {
+/// Load a spec file, then supervise the app. With `home`, run daemon-managed
+/// (see the crate docs).
+pub fn run_from_file(path: &Path, home: Option<&Path>) -> i32 {
     let spec = match load_spec(path) {
         Ok(s) => s,
         Err(msg) => {
@@ -51,7 +61,7 @@ pub fn run_from_file(path: &Path) -> i32 {
             return exit::INTERNAL;
         }
     };
-    rt.block_on(run(spec))
+    rt.block_on(run(spec, home.map(Path::to_path_buf)))
 }
 
 fn load_spec(path: &Path) -> Result<AppSpec, String> {
@@ -64,8 +74,19 @@ fn load_spec(path: &Path) -> Result<AppSpec, String> {
 }
 
 fn validate(spec: &AppSpec) -> Result<(), String> {
-    if spec.name.is_empty() {
-        return Err("`name` is empty".into());
+    // The name becomes part of file names under $VEXOR_HOME (security.md T5).
+    let name_ok = !spec.name.is_empty()
+        && spec.name.len() <= 64
+        && !spec.name.starts_with('.')
+        && spec
+            .name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+    if !name_ok {
+        return Err(format!(
+            "`name` must be 1-64 characters of A-Z, a-z, 0-9, '-', '_', '.', not starting with '.', got {:?}",
+            spec.name
+        ));
     }
     if !spec.exec.is_absolute() {
         return Err(format!(
@@ -91,10 +112,11 @@ fn validate(spec: &AppSpec) -> Result<(), String> {
     Ok(())
 }
 
-/// Supervise `spec` until every instance has ended. SIGTERM or SIGINT stops
-/// all instances gracefully.
-pub async fn run(spec: AppSpec) -> i32 {
+/// Supervise `spec`. SIGTERM or SIGINT (or `ToShim::Stop`) stops all
+/// instances gracefully.
+pub async fn run(spec: AppSpec, home: Option<PathBuf>) -> i32 {
     let (stop_tx, stop_rx) = watch::channel(false);
+    let stop_tx = Arc::new(stop_tx);
     let (mut term, mut int) = match (
         signal(SignalKind::terminate()),
         signal(SignalKind::interrupt()),
@@ -111,15 +133,61 @@ pub async fn run(spec: AppSpec) -> i32 {
             "vexor shim: cannot become child subreaper, escaped descendants won't be tracked: {e}"
         );
     }
-    let managed = orphan::Managed::default();
-    let reaper = tokio::spawn(watch_orphans(spec.name.clone(), managed.clone()));
+    let out = output::Output::new(true);
+
+    // Daemon-managed mode: lock, control socket, persisted identities.
+    let mut presence = None;
+    let managed = match &home {
+        None => orphan::Managed::default(),
+        Some(home) => match claim(home, &spec.name) {
+            Ok(Claim::Taken) => {
+                eprintln!(
+                    "vexor shim: another shim already supervises {:?}",
+                    spec.name
+                );
+                return exit::ALREADY_RUNNING;
+            }
+            Ok(Claim::Ours {
+                lock,
+                listener,
+                paths,
+            }) => {
+                let me = match Identity::of(std::process::id()) {
+                    Ok(me) => me,
+                    Err(e) => {
+                        eprintln!("vexor shim: cannot read own identity: {e}");
+                        return exit::INTERNAL;
+                    }
+                };
+                let server = tokio::spawn(control::serve(
+                    listener,
+                    out.clone(),
+                    me,
+                    Arc::from(spec.name.as_str()),
+                    stop_tx.clone(),
+                ));
+                let managed = orphan::Managed::persisted(paths.pids.clone());
+                presence = Some((lock, server, paths));
+                managed
+            }
+            Err(e) => {
+                eprintln!("vexor shim: cannot set up {}: {e}", home.display());
+                return exit::INTERNAL;
+            }
+        },
+    };
+    let reaper = tokio::spawn(watch_orphans(
+        spec.name.clone(),
+        managed.clone(),
+        out.clone(),
+    ));
 
     let spec = Arc::new(spec);
     let epoch = tokio::time::Instant::now();
     let mut set = tokio::task::JoinSet::new();
     for index in 0..spec.instances {
         let runner =
-            instance::Runner::new(spec.clone(), index, output::Output, epoch, managed.clone());
+            instance::Runner::new(spec.clone(), index, out.clone(), epoch, managed.clone());
         set.spawn(runner.run(stop_rx.clone()));
     }
 
@@ -134,13 +202,32 @@ pub async fn run(spec: AppSpec) -> i32 {
                 }
                 None => break,
             },
-            _ = term.recv() => { let _ = stop_tx.send(true); }
-            _ = int.recv() => { let _ = stop_tx.send(true); }
+            _ = term.recv() => { stop_tx.send_replace(true); }
+            _ = int.recv() => { stop_tx.send_replace(true); }
         }
     }
+
+    // Daemon-managed: keep reporting final state until told to stop.
+    if presence.is_some() {
+        let mut stopped = stop_rx.clone();
+        while !*stopped.borrow_and_update() {
+            tokio::select! {
+                changed = stopped.changed() => if changed.is_err() { break },
+                _ = term.recv() => { stop_tx.send_replace(true); }
+                _ = int.recv() => { stop_tx.send_replace(true); }
+            }
+        }
+    }
+
     reaper.abort();
     if spec.treekill {
         orphan::stop_all(&managed, spec.policy.to_policy().kill_timeout).await;
+    }
+    if let Some((lock, server, paths)) = presence {
+        server.abort();
+        let _ = std::fs::remove_file(&paths.socket);
+        let _ = std::fs::remove_file(&paths.pids);
+        drop(lock);
     }
     if states.contains(&State::Errored) {
         exit::ERRORED
@@ -149,8 +236,32 @@ pub async fn run(spec: AppSpec) -> i32 {
     }
 }
 
+enum Claim {
+    Taken,
+    Ours {
+        lock: std::fs::File,
+        listener: tokio::net::UnixListener,
+        paths: control::Paths,
+    },
+}
+
+fn claim(home: &Path, app: &str) -> std::io::Result<Claim> {
+    control::private_dir(home)?;
+    control::private_dir(&control::shims_dir(home))?;
+    let paths = control::Paths::new(home, app);
+    let Some(lock) = control::try_lock(&paths.lock)? else {
+        return Ok(Claim::Taken);
+    };
+    let listener = control::bind(&paths.socket)?;
+    Ok(Claim::Ours {
+        lock,
+        listener,
+        paths,
+    })
+}
+
 /// Reap adopted orphans as they exit, and report each new live one once.
-async fn watch_orphans(app: String, managed: orphan::Managed) {
+async fn watch_orphans(app: String, managed: orphan::Managed, out: output::Output) {
     let mut sigchld = signal(SignalKind::child()).ok();
     // SIGCHLD can coalesce; a slow periodic sweep catches anything missed.
     let mut sweep = tokio::time::interval(std::time::Duration::from_secs(1));
@@ -171,7 +282,7 @@ async fn watch_orphans(app: String, managed: orphan::Managed) {
         seen.retain(|id| alive.contains(id));
         for id in alive {
             if seen.insert(id) {
-                output::Output.emit(&output::ShimEvent::Orphan {
+                out.emit(&output::ShimEvent::Orphan {
                     app: &app,
                     pid: id.pid,
                     start: id.start,
@@ -195,7 +306,10 @@ mod tests {
     #[test]
     fn validation() {
         assert!(validate(&spec()).is_ok());
-        let cases: [fn(&mut AppSpec); 5] = [
+        let cases: [fn(&mut AppSpec); 8] = [
+            |s| s.name = "../etc".into(),
+            |s| s.name = ".hidden".into(),
+            |s| s.name = "x".repeat(65),
             |s| s.exec = "true".into(),
             |s| s.cwd = "rel".into(),
             |s| s.instances = 0,

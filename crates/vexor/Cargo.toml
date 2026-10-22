@@ -8,6 +8,7 @@ publish.workspace = true
 
 [dependencies]
 clap = { version = "4.6.7", features = ["derive"] }
+vexor-daemon = { version = "0.0.0", path = "../vexor-daemon" }
 vexor-shim = { version = "0.0.0", path = "../vexor-shim" }
 
 [lints]

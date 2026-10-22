@@ -149,11 +149,11 @@ impl Runner {
         match effect {
             Effect::Spawn => match process::spawn(&self.spec, self.index) {
                 Ok(s) => {
-                    self.managed.insert(s.pid);
                     self.pid = Some(s.pid);
                     // The process may already have exited; identity is then
                     // unknown, which only matters for recovery.
                     self.identity = Identity::of(s.pid).ok();
+                    self.managed.insert(s.pid, self.identity);
                     self.child = Some(s.child);
                     self.ipc = s.ipc;
                     self.log_tasks.retain(|t| !t.is_finished());

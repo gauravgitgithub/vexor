@@ -19,6 +19,12 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Run the supervisor daemon in the foreground.
+    Daemon {
+        /// Vexor home directory (state, sockets, logs).
+        #[arg(long)]
+        home: PathBuf,
+    },
     /// Supervise one app in the foreground from a resolved spec file.
     /// Internal: normally started by the daemon.
     #[command(hide = true)]
@@ -26,13 +32,20 @@ enum Command {
         /// Path to the app spec (JSON).
         #[arg(long)]
         spec: PathBuf,
+        /// Vexor home directory. When set, run daemon-managed: take the
+        /// per-app lock and serve the control socket.
+        #[arg(long)]
+        home: Option<PathBuf>,
     },
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
-        Some(Command::Shim { spec }) => exit_code(vexor_shim::run_from_file(&spec)),
+        Some(Command::Daemon { home }) => exit_code(vexor_daemon::run(&home)),
+        Some(Command::Shim { spec, home }) => {
+            exit_code(vexor_shim::run_from_file(&spec, home.as_deref()))
+        }
         None => ExitCode::SUCCESS,
     }
 }

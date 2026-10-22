@@ -10,11 +10,12 @@ use std::process::Stdio;
 
 use command_fds::{CommandFdExt, FdMapping};
 use rustix::process::{Pid, Signal, kill_process, kill_process_group, test_kill_process_group};
-use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
+use tokio::io::{AsyncRead, BufReader};
 use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
 use tokio::task::JoinHandle;
 use vexor_core::AppSpec;
+use vexor_proto::{LineRead, read_bounded_line};
 
 /// File descriptor number Node expects its IPC channel on.
 const NODE_CHANNEL_FD: i32 = 3;
@@ -188,48 +189,6 @@ fn parse_ipc(line: &[u8]) -> IpcMessage {
     }
 }
 
-enum LineRead {
-    Line,
-    TooLong,
-    Eof,
-}
-
-/// Read one `\n`-terminated line into `buf` without letting it grow past
-/// `max`. An overlong line is consumed and reported as `TooLong`.
-async fn read_bounded_line<R: AsyncBufReadExt + Unpin>(
-    r: &mut R,
-    buf: &mut Vec<u8>,
-    max: usize,
-) -> io::Result<LineRead> {
-    let mut too_long = false;
-    loop {
-        let chunk = r.fill_buf().await?;
-        if chunk.is_empty() {
-            return Ok(LineRead::Eof);
-        }
-        let (take, done) = match chunk.iter().position(|&b| b == b'\n') {
-            Some(i) => (i + 1, true),
-            None => (chunk.len(), false),
-        };
-        if !too_long {
-            if buf.len() + take > max + 1 {
-                too_long = true;
-                buf.clear();
-            } else {
-                buf.extend_from_slice(&chunk[..take]);
-            }
-        }
-        r.consume(take);
-        if done {
-            return Ok(if too_long {
-                LineRead::TooLong
-            } else {
-                LineRead::Line
-            });
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -243,29 +202,5 @@ mod tests {
         );
         assert_eq!(parse_ipc(b"\"ready!\"\n"), IpcMessage::Other);
         assert_eq!(parse_ipc(b"not json\n"), IpcMessage::Other);
-    }
-
-    #[tokio::test]
-    async fn overlong_lines_are_skipped_without_buffering_them() {
-        let mut input = vec![b'x'; 200];
-        input.extend_from_slice(b"\n\"ready\"\n");
-        let mut r = BufReader::with_capacity(16, &input[..]);
-        let mut buf = Vec::new();
-        assert!(matches!(
-            read_bounded_line(&mut r, &mut buf, 64).await,
-            Ok(LineRead::TooLong)
-        ));
-        assert!(buf.len() <= 65);
-        buf.clear();
-        assert!(matches!(
-            read_bounded_line(&mut r, &mut buf, 64).await,
-            Ok(LineRead::Line)
-        ));
-        assert_eq!(buf, b"\"ready\"\n");
-        buf.clear();
-        assert!(matches!(
-            read_bounded_line(&mut r, &mut buf, 64).await,
-            Ok(LineRead::Eof)
-        ));
     }
 }

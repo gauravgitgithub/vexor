@@ -9,7 +9,9 @@ Three separate questions, always answered separately:
 Status values: `planned` (spec only), `tested` (green in CI), `qualified` (works with stated limits), `unsupported`.
 Every row below is `planned` until CI says otherwise.
 
-Manual spot checks so far (2026-10-22, not yet CI): the static linux-arm64 musl binary on Alpine with Node 8.17, 12.22, 16.20 and 24.22 handled `process.send('ready')`, natural exit, and graceful SIGTERM correctly. The full shim suite passed on Linux arm64 (Debian bookworm, Node 18.20) and macOS arm64 (Node 24.22).
+CI (`legacy-node` job, every push): static linux-x64 musl binary on `node:<v>-alpine` for Node 8, 10, 12, 14, 16, 18, 20, 22 and 24, six checks each: ready via `process.send('ready')`, natural exit with the IPC channel open, graceful SIGTERM, crash restart with crash-loop limit, args/env/cwd/instance variable, readiness timeout. The same checks pass on linux-arm64 (run locally). The full test suite runs in CI on Linux x64, Linux arm64 and macOS arm64 (with the runner's current Node).
+
+Not covered yet: Node 4, 6 and 0.12 (tier 4), cluster mode (Phase 4), and the npm wrapper's own Node range (Phase 3).
 
 ## 1. Platform matrix (Layer A binary)
 

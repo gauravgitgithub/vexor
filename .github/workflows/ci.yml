@@ -49,3 +49,32 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           command: check all
+
+  # Managed-app runtime compatibility (docs/compatibility.md §2): a static
+  # Linux x64 binary supervising apps on Node 8 through 24.
+  legacy-node:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Install musl C toolchain (for bundled SQLite)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq musl-tools
+      - name: Build static binary
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+        run: |
+          rustup target add x86_64-unknown-linux-musl
+          cargo build --release --locked --target x86_64-unknown-linux-musl
+          mkdir -p dist
+          cp target/x86_64-unknown-linux-musl/release/vexor dist/
+      - name: Node 8, 10, 12, 14, 16, 18, 20, 22, 24
+        run: |
+          failed=""
+          for v in 8 10 12 14 16 18 20 22 24; do
+            docker run --rm -v "$PWD/dist":/v:ro -v "$PWD/tests/legacy":/t:ro \
+              "node:$v-alpine" /t/node-smoke.sh || failed="$failed $v"
+          done
+          if [ -n "$failed" ]; then
+            echo "::error::legacy Node checks failed on:$failed"
+            exit 1
+          fi

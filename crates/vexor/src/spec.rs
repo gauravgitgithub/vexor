@@ -8,7 +8,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use vexor_core::{AppSpec, LogSpec, PolicySpec};
+use vexor_core::{AppSpec, ClusterSpec, LogSpec, PolicySpec};
 use vexor_pm2::{Context, Note, Severity, allowed_env, resolve_exec};
 use vexor_proto::Request;
 
@@ -98,7 +98,7 @@ pub fn start_plan(args: &StartArgs, home: &Path) -> Result<Plan, String> {
 }
 
 fn ecosystem_plan(args: &StartArgs, path: &Path, home: &Path) -> Result<Plan, String> {
-    if args.name.is_some() || args.instances.is_some() || !args.args.is_empty() {
+    if args.name.is_some() || args.instances.is_some() || args.fork || !args.args.is_empty() {
         return Err(
             "--name, -i and app arguments don't apply to ecosystem files; set them in the file"
                 .into(),
@@ -191,14 +191,19 @@ fn build(args: &StartArgs, script: &Path, home: &Path) -> Result<AppSpec, String
         })?),
         (None, false) => None,
     };
+    let is_node = interpreter.as_ref().is_some_and(|i| {
+        i.file_name()
+            .and_then(|f| f.to_str())
+            .is_some_and(|f| f.starts_with("node"))
+    });
+    // PM2: `-i N` on a Node.js script means cluster mode.
+    let cluster = (is_node && args.instances.is_some() && !args.fork).then(|| ClusterSpec {
+        script: script.clone(),
+        node_args: Vec::new(),
+        args: args.args.clone(),
+    });
     let (exec, mut app_args, node_ipc) = match interpreter {
-        Some(i) => {
-            let node = i
-                .file_name()
-                .and_then(|f| f.to_str())
-                .is_some_and(|f| f.starts_with("node"));
-            (i, vec![script.to_string_lossy().into_owned()], node)
-        }
+        Some(i) => (i, vec![script.to_string_lossy().into_owned()], is_node),
         None => (script, Vec::new(), false),
     };
     app_args.extend(args.args.iter().cloned());
@@ -228,6 +233,7 @@ fn build(args: &StartArgs, script: &Path, home: &Path) -> Result<AppSpec, String
         node_ipc,
         treekill: true,
         policy: PolicySpec::default(),
+        cluster,
     })
 }
 

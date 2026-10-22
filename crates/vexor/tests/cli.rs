@@ -669,3 +669,25 @@ fn ecosystem_load_errors_are_reported() {
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("SyntaxError"));
 }
+
+#[test]
+fn instances_on_a_node_script_mean_cluster_mode_unless_fork() {
+    if which("node").is_none() {
+        eprintln!("skipping: node not found");
+        return;
+    }
+    let env = Env::new();
+    env.script("srv.js", "setInterval(function(){}, 1000)\n");
+    env.ok(&["start", "srv.js", "-i", "2", "--name", "c"]);
+    let spec = &env.state()["apps"]["c"]["spec"];
+    assert!(
+        spec["cluster"]["script"]
+            .as_str()
+            .is_some_and(|s| s.ends_with("srv.js")),
+        "{spec}"
+    );
+    assert_eq!(states(&env.app("c")), ["online", "online"]);
+    env.ok(&["start", "srv.js", "-i", "2", "--fork", "--name", "f"]);
+    assert!(env.state()["apps"]["f"]["spec"].get("cluster").is_none());
+    assert_eq!(states(&env.app("f")), ["online", "online"]);
+}

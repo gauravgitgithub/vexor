@@ -12,7 +12,7 @@ use std::process::Command;
 
 use serde::Serialize;
 use serde_json::Value;
-use vexor_core::{AppSpec, LogSpec, PolicySpec};
+use vexor_core::{AppSpec, ClusterSpec, LogSpec, PolicySpec};
 
 const LOADER: &str = include_str!("loader.js");
 
@@ -381,14 +381,7 @@ pub fn translate(app: &Value, ctx: &Context) -> Result<Translated, Vec<Note>> {
     };
     let instances = instances(obj.get("instances"), &mut c);
     // `instances` alone means N fork-mode processes, as in PM2 ecosystem
-    // files. Cluster mode needs the cluster helper (not implemented yet).
-    if mode == ExecMode::Cluster {
-        c.note(
-            "exec_mode",
-            Severity::Fatal,
-            "cluster mode is not implemented yet (plan Phase 4.2); with --allow-unsupported the app runs in fork mode, so instances can't share a port",
-        );
-    }
+    // files; `exec_mode: cluster` runs them under Vexor's cluster primary.
 
     // Environment: caller (allowlist), then env, then env_<name>.
     let mut env = allowed_env(&ctx.caller_env, ctx.inherit_env);
@@ -470,7 +463,7 @@ pub fn translate(app: &Value, ctx: &Context) -> Result<Translated, Vec<Note>> {
                 .file_name()
                 .and_then(|f| f.to_str())
                 .is_some_and(|f| f.starts_with("node"));
-            args.extend(interp_args);
+            args.extend(interp_args.iter().cloned());
             args.push(script_path.to_string_lossy().into_owned());
             (exec, is_node)
         }
@@ -488,20 +481,39 @@ pub fn translate(app: &Value, ctx: &Context) -> Result<Translated, Vec<Note>> {
             // unless it already failed for lack of an interpreter.
             let needs_interpreter = matches!(ext, "ts" | "coffee" | "ls");
             let exec = if needs_interpreter || script.contains('/') || script_path.exists() {
-                script_path
+                script_path.clone()
             } else {
                 match resolve_exec(&script, &env) {
                     Ok(p) => p,
                     Err(e) => {
                         c.note("script", Severity::Fatal, e);
-                        script_path
+                        script_path.clone()
                     }
                 }
             };
             (exec, false)
         }
     };
-    args.extend(app_args);
+    args.extend(app_args.iter().cloned());
+
+    let cluster = if mode == ExecMode::Cluster {
+        if node_ipc {
+            Some(ClusterSpec {
+                script: script_path.clone(),
+                node_args: interp_args,
+                args: app_args,
+            })
+        } else {
+            c.note(
+                "exec_mode",
+                Severity::Fatal,
+                "cluster mode needs a Node.js script (PM2 uses Node's cluster module)",
+            );
+            None
+        }
+    } else {
+        None
+    };
 
     // Restart and readiness policy.
     let mut policy = PolicySpec::default();
@@ -618,6 +630,8 @@ pub fn translate(app: &Value, ctx: &Context) -> Result<Translated, Vec<Note>> {
         treekill: obj.get("treekill").and_then(Value::as_bool).unwrap_or(true),
         logs,
         policy,
+        // Cluster mode always uses the IPC channel to control the primary.
+        cluster,
     };
     let autostart = obj
         .get("autostart")

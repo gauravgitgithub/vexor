@@ -14,5 +14,5 @@ pub use lifecycle::{
     State, Timer,
 };
 pub use restart::{Backoff, Jitter, MIN_RESTART_INTERVAL, RestartPolicy};
-pub use spec::{AppSpec, LogSpec, Overflow, PolicySpec};
+pub use spec::{AppSpec, ClusterSpec, LogSpec, Overflow, PolicySpec};
 pub use time::Millis;

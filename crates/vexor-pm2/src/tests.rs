@@ -294,6 +294,32 @@ fn paths_are_normalized() {
 }
 
 #[test]
+fn cluster_mode_translates_to_a_cluster_spec() {
+    let mut c = ctx(Path::new("/srv"));
+    c.caller_env
+        .insert("PATH".into(), std::env::var("PATH").unwrap_or_default());
+    if resolve_exec("node", &c.caller_env).is_err() {
+        eprintln!("skipping: node not found");
+        return;
+    }
+    let t = translate(
+        &json!({
+            "name": "web", "script": "app.js", "exec_mode": "cluster", "instances": 4,
+            "node_args": "--max-old-space-size=256", "args": "--port 80",
+        }),
+        &c,
+    )
+    .expect("ok");
+    let cluster = t.spec.cluster.expect("cluster spec");
+    assert_eq!(cluster.script, PathBuf::from("/srv/app.js"));
+    assert_eq!(cluster.node_args, ["--max-old-space-size=256"]);
+    assert_eq!(cluster.args, ["--port", "80"]);
+    assert_eq!(t.spec.instances, 4);
+    assert!(t.spec.node_ipc);
+    assert!(fatal(&t.notes).is_empty(), "{:?}", t.notes);
+}
+
+#[test]
 fn durations() {
     assert_eq!(parse_duration_ms("500"), Some(500));
     assert_eq!(parse_duration_ms("500ms"), Some(500));

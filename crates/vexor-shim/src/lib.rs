@@ -10,6 +10,7 @@
 //!   the control socket, records instance identities, and stays up after its
 //!   instances end (so their final state stays visible) until told to stop.
 
+mod cluster;
 mod control;
 mod identity;
 mod instance;
@@ -111,6 +112,14 @@ pub fn validate(spec: &AppSpec) -> Result<(), String> {
     if spec.instances == 0 {
         return Err("`instances` must be at least 1".into());
     }
+    if let Some(c) = &spec.cluster
+        && !c.script.is_absolute()
+    {
+        return Err(format!(
+            "`cluster.script` must be an absolute path, got {}",
+            c.script.display()
+        ));
+    }
     if spec.instance_var.is_empty() || spec.instance_var.contains('=') {
         return Err("`instance_var` must be a non-empty name without '='".into());
     }
@@ -197,6 +206,14 @@ pub async fn run(spec: AppSpec, home: Option<PathBuf>) -> i32 {
     ));
 
     let spec = Arc::new(spec);
+    let cluster = spec.cluster.as_ref().map(|_| {
+        cluster::Cluster::start(
+            spec.clone(),
+            managed.clone(),
+            logs.out.clone(),
+            logs.err.clone(),
+        )
+    });
     let epoch = tokio::time::Instant::now();
     let mut set = tokio::task::JoinSet::new();
     for index in 0..spec.instances {
@@ -207,6 +224,7 @@ pub async fn run(spec: AppSpec, home: Option<PathBuf>) -> i32 {
             epoch,
             managed.clone(),
             (logs.out.clone(), logs.err.clone()),
+            cluster.clone(),
         );
         set.spawn(runner.run(stop_rx.clone(), restart_tx.subscribe(), home.is_none()));
     }
@@ -227,6 +245,10 @@ pub async fn run(spec: AppSpec, home: Option<PathBuf>) -> i32 {
         }
     }
 
+    if let Some(c) = &cluster {
+        c.shutdown().await;
+    }
+    drop(cluster);
     reaper.abort();
     logs.finish(std::time::Duration::from_secs(5)).await;
     if spec.treekill {

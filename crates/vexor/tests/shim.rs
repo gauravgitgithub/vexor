@@ -619,3 +619,186 @@ fn block_mode_rotation_keeps_every_line_in_order() {
         "block mode must not drop"
     );
 }
+
+// ------------------------------------------------------------- cluster mode
+
+fn cluster_port() -> u16 {
+    use std::sync::atomic::{AtomicU16, Ordering};
+    // Outside the ephemeral range (see daemon.rs::free_port).
+    static NEXT: AtomicU16 = AtomicU16::new(0);
+    let base = 20_000 + u16::try_from(std::process::id() % 500).unwrap_or(0) * 20;
+    loop {
+        let offset = NEXT.fetch_add(1, Ordering::Relaxed);
+        let port = 20_000 + (base - 20_000 + offset) % 10_000;
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+        assert!(offset < 10_000, "no free port");
+    }
+}
+
+/// `<pid> <instance>` from a worker, or None if nothing answers.
+fn ask(port: u16) -> Option<(u32, String)> {
+    use std::io::{Read, Write};
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let mut s = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(1)).ok()?;
+    s.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+    s.write_all(b"GET / HTTP/1.0\r\n\r\n").ok()?;
+    let mut resp = String::new();
+    s.read_to_string(&mut resp).ok()?;
+    let body = resp.split("\r\n\r\n").nth(1)?;
+    let mut it = body.split(' ');
+    Some((it.next()?.parse().ok()?, it.next()?.to_owned()))
+}
+
+/// Distinct workers seen over `n` requests: pid -> instance.
+fn workers(port: u16, n: usize) -> std::collections::BTreeMap<u32, String> {
+    (0..n).filter_map(|_| ask(port)).collect()
+}
+
+fn wait_workers(port: u16, count: usize) -> std::collections::BTreeMap<u32, String> {
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let w = workers(port, 40);
+        if w.len() == count {
+            return w;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "expected {count} workers, saw {w:?}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+const CLUSTER_APP: &str = r"
+var port = +process.env.PORT;
+process.on('SIGTERM', function () { console.log('term ' + process.env.NODE_APP_INSTANCE); process.exit(0); });
+require('http').createServer(function (q, r) { r.setHeader('Connection', 'close'); r.end(process.pid + ' ' + process.env.NODE_APP_INSTANCE); })
+  .listen(port, '127.0.0.1', function () { process.send('ready'); });
+";
+
+fn cluster_spec(shim: &Shim, node: &str, port: u16, extra: Value) -> PathBuf {
+    std::fs::write(shim.path("srv.js"), CLUSTER_APP).expect("write app");
+    let mut base = json!({
+        "instances": 3,
+        "node_ipc": true,
+        "env": { "PATH": "/usr/bin:/bin", "PORT": port.to_string() },
+        "policy": { "ready_timeout_ms": 10000 },
+        "cluster": { "script": shim.path("srv.js") },
+    });
+    merge(&mut base, extra);
+    shim.spec(node, &[], base)
+}
+
+#[test]
+fn cluster_workers_share_a_port_and_restart_individually() {
+    let Some(node) = node() else { return };
+    let shim = Shim::new();
+    let port = cluster_port();
+    let child = shim.start(&cluster_spec(&shim, &node, port, json!({})));
+    let started = Instant::now();
+    let before = wait_workers(port, 3);
+    let instances: std::collections::BTreeSet<_> = before.values().cloned().collect();
+    assert_eq!(instances.len(), 3, "instances 0, 1, 2: {before:?}");
+
+    // Kill one worker: only it is replaced, with the same instance number.
+    let (&victim, victim_inst) = before.iter().next().expect("a worker");
+    kill(victim, "KILL");
+    let deadline = Instant::now() + TIMEOUT;
+    let after = loop {
+        let w = workers(port, 40);
+        if w.len() == 3 && !w.contains_key(&victim) {
+            break w;
+        }
+        assert!(Instant::now() < deadline, "worker not replaced: {w:?}");
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    for (pid, inst) in &before {
+        if *pid != victim {
+            assert_eq!(
+                after.get(pid),
+                Some(inst),
+                "other workers must keep running"
+            );
+        }
+    }
+    assert!(after.values().any(|i| i == victim_inst));
+
+    kill(child.id(), "TERM");
+    let done = finish(child, started);
+    assert_eq!(done.code, Some(0), "{}", done.stderr);
+    assert!(ask(port).is_none(), "port must be closed after stop");
+    let out = shim.out_log();
+    for i in 0..3 {
+        assert!(
+            out.contains(&format!("term {i}")),
+            "graceful stop of {i}: {out}"
+        );
+    }
+}
+
+#[test]
+fn cluster_primary_death_restarts_every_worker() {
+    let Some(node) = node() else { return };
+    let shim = Shim::new();
+    let port = cluster_port();
+    let child = shim.start(&cluster_spec(&shim, &node, port, json!({})));
+    let started = Instant::now();
+    let before = wait_workers(port, 3);
+    let worker = *before.keys().next().expect("worker");
+    let ppid = Command::new("ps")
+        .args(["-o", "ppid=", "-p", &worker.to_string()])
+        .output()
+        .expect("ps");
+    let primary: u32 = String::from_utf8_lossy(&ppid.stdout)
+        .trim()
+        .parse()
+        .expect("ppid");
+    kill(primary, "KILL");
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let w = workers(port, 40);
+        if w.len() == 3 && w.keys().all(|p| !before.contains_key(p)) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "workers not restarted: {w:?}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    kill(child.id(), "TERM");
+    let done = finish(child, started);
+    assert_eq!(done.code, Some(0), "{}", done.stderr);
+    for e in done
+        .events
+        .iter()
+        .filter(|e| e["type"] == "state" && e["state"] == "online")
+    {
+        assert!(e["pid"].as_u64().is_some(), "{e}");
+    }
+}
+
+#[test]
+fn cluster_worker_without_ready_fails_readiness() {
+    let Some(node) = node() else { return };
+    let shim = Shim::new();
+    std::fs::write(
+        shim.path("quiet.js"),
+        "setInterval(function () {}, 1000);\n",
+    )
+    .expect("write");
+    let spec = shim.spec(
+        &node,
+        &[],
+        json!({
+            "instances": 2,
+            "node_ipc": true,
+            "policy": { "ready_timeout_ms": 500, "max_restarts": 0, "kill_timeout_ms": 500 },
+            "cluster": { "script": shim.path("quiet.js") },
+        }),
+    );
+    let done = shim.run(&spec);
+    assert_eq!(done.code, Some(1), "{}", done.stderr);
+    for i in 0..2 {
+        assert_eq!(states(&done.events, i), ["starting", "stopping", "errored"]);
+    }
+}

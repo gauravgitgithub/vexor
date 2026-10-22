@@ -7,11 +7,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rustix::process::Signal;
-use tokio::sync::{broadcast, watch};
+use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use vexor_core::{AppSpec, Ctx, Effect, Event, ExitStatus, Instance, Millis, State, Timer};
 
+use crate::cluster::{Cluster, WorkerEvent};
 use crate::identity::Identity;
 use crate::logs::Sink;
 use crate::orphan::{self, Managed};
@@ -35,6 +36,10 @@ pub struct Runner {
     out_log: Sink,
     err_log: Sink,
     child: Option<tokio::process::Child>,
+    /// Cluster mode: the shared primary, and this instance's worker events.
+    cluster: Option<(Cluster, mpsc::UnboundedReceiver<WorkerEvent>)>,
+    /// Cluster mode: a worker is running (between `Spawned` and `Exited`).
+    worker_live: bool,
     identity: Option<Identity>,
     pid: Option<u32>,
     ipc: Option<IpcChannel>,
@@ -53,8 +58,13 @@ impl Runner {
         epoch: Instant,
         managed: Managed,
         (out_log, err_log): (Sink, Sink),
+        cluster: Option<Cluster>,
     ) -> Self {
         let inst = Instance::new(spec.policy.to_policy());
+        let cluster = cluster.map(|c| {
+            let rx = c.subscribe(index);
+            (c, rx)
+        });
         Runner {
             spec,
             index,
@@ -65,6 +75,8 @@ impl Runner {
             out_log,
             err_log,
             child: None,
+            cluster,
+            worker_live: false,
             identity: None,
             pid: None,
             ipc: None,
@@ -92,8 +104,8 @@ impl Runner {
             while let Some(event) = self.queue.pop_front() {
                 self.dispatch(event);
             }
-            let idle = self.child.is_none()
-                && matches!(self.inst.state(), State::Stopped | State::Errored);
+            let idle =
+                !self.alive() && matches!(self.inst.state(), State::Stopped | State::Errored);
             if idle && (exit_when_idle || shutting_down) {
                 break;
             }
@@ -115,6 +127,10 @@ impl Runner {
                         self.queue.push_back(Event::TimerFired { timer, generation });
                     }
                 }
+                ev = recv_worker(&mut self.cluster), if self.cluster.is_some() => match ev {
+                    Some(ev) => self.on_worker(ev),
+                    None => self.cluster = None,
+                },
                 msg = recv_ipc(&mut self.ipc), if self.ipc.is_some() => match msg {
                     Some(IpcMessage::Ready) => self.queue.push_back(Event::Ready),
                     Some(IpcMessage::Other) => {}
@@ -136,6 +152,40 @@ impl Runner {
         }
         self.drain_logs().await;
         self.inst.state()
+    }
+
+    /// A process for this instance is running.
+    fn alive(&self) -> bool {
+        self.child.is_some() || self.worker_live
+    }
+
+    fn on_worker(&mut self, ev: WorkerEvent) {
+        match ev {
+            WorkerEvent::Spawned { pid } => {
+                self.pid = Some(pid);
+                self.identity = Identity::of(pid).ok();
+                self.worker_live = true;
+                self.queue.push_back(Event::Spawned);
+            }
+            WorkerEvent::SpawnFailed(error) => {
+                self.pid = None;
+                self.identity = None;
+                self.out.emit(&ShimEvent::SpawnError {
+                    app: &self.spec.name,
+                    instance: self.index,
+                    exec: &self.spec.exec,
+                    error,
+                });
+                self.queue.push_back(Event::SpawnFailed);
+            }
+            WorkerEvent::Ready => self.queue.push_back(Event::Ready),
+            // Used by readiness-gated reload (plan step 4.3).
+            WorkerEvent::Listening => {}
+            WorkerEvent::Exited(status) => {
+                self.worker_live = false;
+                self.queue.push_back(Event::Exited(status));
+            }
+        }
     }
 
     fn now(&self) -> Millis {
@@ -167,6 +217,12 @@ impl Runner {
 
     fn apply(&mut self, effect: Effect) {
         match effect {
+            Effect::Spawn if self.cluster.is_some() => {
+                // The worker's `Spawned`/`SpawnFailed` arrives as an event.
+                if let Some((c, _)) = &self.cluster {
+                    c.spawn(self.index);
+                }
+            }
             Effect::Spawn => {
                 match process::spawn(&self.spec, self.index, &self.out_log, &self.err_log) {
                     Ok(s) => {
@@ -176,7 +232,7 @@ impl Runner {
                         self.identity = Identity::of(s.pid).ok();
                         self.managed.insert(s.pid, self.identity);
                         self.child = Some(s.child);
-                        self.ipc = s.ipc;
+                        self.ipc = s.ipc.map(IpcChannel::new);
                         self.log_tasks.retain(|t| !t.is_finished());
                         self.log_tasks.extend(s.log_tasks);
                         self.queue.push_back(Event::Spawned);
@@ -207,6 +263,14 @@ impl Runner {
     }
 
     fn signal(&self, sig: Signal) {
+        if let Some((c, _)) = &self.cluster {
+            // Workers share the primary's process group, so a worker is
+            // signalled on its own, through the primary.
+            if self.worker_live {
+                c.signal(self.index, sig);
+            }
+            return;
+        }
         // Only while our child is unreaped: its PID (and group) can't have
         // been reused yet.
         let Some(pid) = self.pid.filter(|_| self.child.is_some()) else {
@@ -226,7 +290,7 @@ impl Runner {
     }
 
     fn emit_state(&self) {
-        let running = self.child.is_some();
+        let running = self.alive();
         self.out.emit(&ShimEvent::State {
             app: &self.spec.name,
             instance: self.index,
@@ -340,6 +404,15 @@ async fn wait_child(child: &mut Option<tokio::process::Child>) -> ExitStatus {
 async fn sleep_until(deadline: Option<Instant>) {
     match deadline {
         Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn recv_worker(
+    cluster: &mut Option<(Cluster, mpsc::UnboundedReceiver<WorkerEvent>)>,
+) -> Option<WorkerEvent> {
+    match cluster {
+        Some((_, rx)) => rx.recv().await,
         None => std::future::pending().await,
     }
 }

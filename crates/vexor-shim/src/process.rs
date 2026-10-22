@@ -24,29 +24,45 @@ const MAX_IPC_LINE: usize = 64 * 1024;
 pub struct Spawned {
     pub child: Child,
     pub pid: u32,
-    pub ipc: Option<IpcChannel>,
+    /// Our end of the Node IPC channel, if one was requested.
+    pub ipc: Option<UnixStream>,
     pub log_tasks: Vec<JoinHandle<()>>,
 }
 
-/// Start instance `index` of `spec`. The process gets exactly `spec.env`
-/// (plus the instance variable and, for Node apps, the IPC channel), its own
-/// process group, `/dev/null` as stdin, and stdout/stderr appended to the
-/// spec's log files.
+/// Start instance `index` of `spec` in fork mode. The process gets exactly
+/// `spec.env` (plus the instance variable and, for Node apps, the IPC
+/// channel), its own process group, `/dev/null` as stdin, and stdout/stderr
+/// appended to the spec's log files.
 pub fn spawn(spec: &AppSpec, index: u32, out: &Sink, err: &Sink) -> io::Result<Spawned> {
+    spawn_with(spec, &spec.args, Some(index), spec.node_ipc, out, err)
+}
+
+/// Like [`spawn`], with explicit arguments, an optional instance variable,
+/// and whether to open a Node IPC channel (the cluster primary uses this).
+pub fn spawn_with(
+    spec: &AppSpec,
+    args: &[String],
+    index: Option<u32>,
+    node_ipc: bool,
+    out: &Sink,
+    err: &Sink,
+) -> io::Result<Spawned> {
     let mut cmd = Command::new(&spec.exec);
-    cmd.args(&spec.args)
+    cmd.args(args)
         .current_dir(&spec.cwd)
         .env_clear()
-        .envs(&spec.env)
-        .env(&spec.instance_var, index.to_string())
-        .stdin(Stdio::null())
+        .envs(&spec.env);
+    if let Some(i) = index {
+        cmd.env(&spec.instance_var, i.to_string());
+    }
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0)
         .kill_on_drop(false);
 
     let mut parent_end = None;
-    if spec.node_ipc {
+    if node_ipc {
         let (ours, theirs) = StdUnixStream::pair()?;
         cmd.env("NODE_CHANNEL_FD", NODE_CHANNEL_FD.to_string())
             .env("NODE_CHANNEL_SERIALIZATION_MODE", "json")
@@ -76,7 +92,7 @@ pub fn spawn(spec: &AppSpec, index: u32, out: &Sink, err: &Sink) -> io::Result<S
     let ipc = match parent_end {
         Some(s) => {
             s.set_nonblocking(true)?;
-            Some(IpcChannel::new(UnixStream::from_std(s)?))
+            Some(UnixStream::from_std(s)?)
         }
         None => None,
     };
@@ -134,7 +150,7 @@ pub enum IpcMessage {
 }
 
 impl IpcChannel {
-    fn new(stream: UnixStream) -> Self {
+    pub fn new(stream: UnixStream) -> Self {
         IpcChannel {
             reader: BufReader::new(stream),
             buf: Vec::new(),

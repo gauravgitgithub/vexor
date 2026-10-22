@@ -85,6 +85,34 @@ spec noready "setInterval(function(){},1000)" '{"ready_timeout_ms":500,"max_rest
 got=$(states "$D/noready.events")
 [ "$got" = "starting stopping errored" ] && pass "readiness timeout" || fail "readiness timeout" "$got"
 
+# 8. Cluster mode: two workers forked by the primary, each reporting ready,
+#    then stopped gracefully.
+cat > "$D/worker.js" <<'WORKER_END'
+process.on('SIGTERM', function () { console.log('bye ' + process.env.NODE_APP_INSTANCE); process.exit(0); });
+console.log('worker ' + process.env.NODE_APP_INSTANCE);
+setTimeout(function () { process.send('ready'); }, 100);
+setInterval(function () {}, 1000);
+WORKER_END
+cat > "$D/cluster.json" <<CLUSTER_END
+{"name":"cl","exec":"$NODE","cwd":"$D","instances":2,"node_ipc":true,
+ "logs":{"out":"$D/cl.out","err":"$D/cl.err"},"policy":{"ready_timeout_ms":5000},
+ "cluster":{"script":"$D/worker.js"}}
+CLUSTER_END
+"$VEXOR" shim --spec "$D/cluster.json" > "$D/cl.events" 2>&1 & pid=$!
+# Event fields are in alphabetical order, so count `online` states rather
+# than matching instance and state together.
+i=0
+while [ "$(grep -c '"state":"online"' "$D/cl.events" 2>/dev/null)" -lt 2 ]; do
+  i=$((i + 1)); [ "$i" -gt 100 ] && break; sleep 0.1
+done
+if [ "$(grep -c '"state":"online"' "$D/cl.events")" -ge 2 ]; then
+  kill -TERM "$pid"; wait "$pid"; code=$?
+  if [ "$code" = 0 ] && grep -q 'bye 0' "$D/cl.out" && grep -q 'bye 1' "$D/cl.out"; then
+    pass "cluster mode"; else fail "cluster mode" "exit=$code out=$(tr '\n' ';' < "$D/cl.out")"; fi
+else
+  fail "cluster mode" "$(states "$D/cl.events") $(cat "$D/cl.err" 2>/dev/null)"; kill "$pid" 2>/dev/null
+fi
+
 # 7. An ES5 ecosystem file loads with this Node (vexor check, no daemon).
 cat > "$D/ecosystem.config.js" <<'ECOSYSTEM_END'
 var base = { name: 'eco', script: 'app.js', instances: 2, merge_logs: true };

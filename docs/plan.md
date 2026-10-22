@@ -37,6 +37,8 @@ Open:
 
 4.1 ✅ Ecosystem files (`crates/vexor-pm2`): ES5 loader run on the app's own Node (`.js/.cjs/.mjs`; `.json` without Node), every PM2 field classified (supported / partial / ignored / fatal; unknown fields reported), `vexor start <ecosystem> [--only] [--env NAME] [--allow-unsupported]`, `vexor check`, `autostart: false`. Tested: 21 translator/loader unit tests, 4 CLI tests, loading an ES5 config on Node 8–24.
 
+4.2 ✅ Cluster mode: ES5 cluster primary (`crates/vexor-shim/src/cluster.js`) on the app's Node holds the shared listening sockets; the shim keeps one state machine per worker and drives workers through it (spawn / signal / events). Primary death → its group is killed and every worker restarts under its own policy. `exec_mode: cluster` in ecosystem files; `vexor start app.js -i N` is cluster mode (as in PM2), `--fork` opts out. Tested: workers share a port and are replaced individually (others keep serving), primary death restarts all, readiness per worker, graceful stop; cluster check on Node 8–24.
+
 Remaining: 
 ## Phase 5: migration
 dry-run, backup, journaled apply, rollback (docs/migration.md).

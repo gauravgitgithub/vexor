@@ -98,9 +98,13 @@ pub struct StartArgs {
     /// App name [default: script file name without extension]
     #[arg(long)]
     pub name: Option<String>,
-    /// Number of instances.
+    /// Number of instances. For a Node.js script this means cluster mode,
+    /// as in PM2: the instances share listening ports.
     #[arg(short = 'i', long)]
     pub instances: Option<u32>,
+    /// With -i: run independent processes instead of cluster mode.
+    #[arg(long)]
+    pub fork: bool,
     /// Interpreter to run the script with (name on PATH or a path).
     /// Default: `node` for .js/.cjs/.mjs, none otherwise.
     #[arg(long)]
@@ -341,6 +345,7 @@ fn check(
         target: Some(file.to_string_lossy().into_owned()),
         name: None,
         instances: None,
+        fork: false,
         interpreter,
         cwd: None,
         env: env.into_iter().collect(),

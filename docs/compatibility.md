@@ -80,7 +80,7 @@ Exit codes: 0 ok, 1 command failed, 2 usage error, 3 daemon unreachable, 4 parti
 
 Implemented in `crates/vexor-pm2` (4.1). `vexor check ecosystem.config.js` prints every finding without starting anything; `vexor start` refuses to start while any `fatal` finding remains, unless `--allow-unsupported`. Current classification (supersedes the table below where they differ):
 
-- **fatal** (until implemented): `exec_mode: cluster`, `watch: true`, `max_memory_restart`, `cron_restart`, `uid`/`gid`/`username`, `increment_var`, `shutdown_with_message`, `.ts`/`.coffee` without `interpreter`, function/RegExp values, `wait_ready` on a non-Node app, malformed values.
+- **fatal** (until implemented): `exec_mode: cluster` on a non-Node script, `watch: true`, `max_memory_restart`, `cron_restart`, `uid`/`gid`/`username`, `increment_var`, `shutdown_with_message`, `.ts`/`.coffee` without `interpreter`, function/RegExp values, `wait_ready` on a non-Node app, malformed values.
 - **partial**: `merge_logs` (instances always share log files), `log_file` (no combined log), `listen_timeout` without `wait_ready`.
 - **ignored** (reported): PM2 Plus/monitoring fields, `namespace`, `pid_file`, `kill_retry_time`, `force`, `log_type`, `time`, `log_date_format`, `filter_env`, `windowsHide`, unknown fields.
 - `instances` without `exec_mode` runs N fork-mode processes (they can't share a port). `args`/`node_args` strings are split shell-style (quotes, backslashes) with no expansion. Environment: caller allowlist (or `--inherit-env`), then `env`, then `env_<NAME>`. Relative `cwd` resolves against the ecosystem file's directory and `script` against `cwd` (to confirm against PM2 in the conformance suite).
@@ -96,7 +96,7 @@ Implemented in `crates/vexor-pm2` (4.1). `vexor check ecosystem.config.js` print
 
 ## 6. Known behavioural differences (to be confirmed by conformance tests)
 
-- Cluster mode runs through `cluster-shim.js` on the app's Node, not inside the daemon. `process.env.NODE_APP_INSTANCE` and `pm_id` are set the same way.
+- Cluster mode runs through Vexor's cluster primary on the app's own Node (not inside a Node daemon). `NODE_APP_INSTANCE` (or `instance_var`) is set per worker; `pm_id` is not set. Workers share the primary's process group, so `treekill` cleans up a worker's own child processes only when the whole app stops, not when one worker restarts. If the primary dies, all workers are restarted.
 - `pm2` programmatic API (`require('pm2')`) is not provided.
 - With `treekill` (default true), processes left in the app's process group after its main process **crashes** get SIGTERM, then SIGKILL after `kill_timeout`, before the restart. PM2 only kills the tree on stop/restart, so leftovers from a crash can keep ports or queue messages. `treekill: false` leaves them alone, as PM2 does.
 - On stop, Vexor waits for the whole group, not just the main process, up to `kill_timeout`, then SIGKILLs what is left.

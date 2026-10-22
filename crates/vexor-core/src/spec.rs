@@ -45,6 +45,24 @@ pub struct AppSpec {
     pub logs: LogSpec,
     #[serde(default)]
     pub policy: PolicySpec,
+    /// PM2 cluster mode: `exec` is Node, which runs Vexor's cluster primary;
+    /// the primary forks `instances` workers running `script`, sharing
+    /// listening sockets. `args` above is not used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cluster: Option<ClusterSpec>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClusterSpec {
+    /// Absolute path of the worker script.
+    pub script: PathBuf,
+    /// Node options for workers (PM2 `node_args`).
+    #[serde(default)]
+    pub node_args: Vec<String>,
+    /// Arguments for workers (PM2 `args`).
+    #[serde(default)]
+    pub args: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

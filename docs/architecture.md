@@ -99,13 +99,30 @@ before identity is checked).
 | unknown | identity verified alive | online (adopted, no log pipes) or stopping (policy) |
 | unknown | identity mismatch / dead | backoff or stopped (per desired state) |
 
-Every transition is a pure function `(state, event, policy, now) -> (state,
-[effects])`. The daemon runs the effects. Tests drive the function directly.
+Implemented in `crates/vexor-core` (`Instance::handle(event, ctx) -> Vec<Effect>`).
+The shim runs the effects. Timers carry a generation number, so a timer that
+fires after it was replaced or cancelled is ignored. Every `(state, event)`
+pair is handled; events that make no sense in a state are ignored with no
+effects.
 
-Restart policy: exponential backoff (base `restart_delay`, cap configurable,
-full jitter). PM2 `exp_backoff_restart_delay` maps directly. Crash-loop budget
-is `max_restarts` within a window. A restart counts against the budget only
-when uptime < `min_uptime`, which matches PM2 semantics.
+Restart policy:
+- Delay: `restart_delay` (fixed) or `exp_backoff_restart_delay` (×1.5 per
+  attempt, capped, reset after a run of ≥ 30 s). Optional equal jitter: uniform
+  in `[delay/2, delay]`.
+- **Rate floor:** automatic spawns of one instance are at least 1 s apart,
+  spawn to spawn, whatever the config (`MIN_RESTART_INTERVAL`). Operator
+  commands aren't limited.
+- **Crash budget:** a run shorter than `min_uptime`, or one that never became
+  ready, is *unstable*. After `max_restarts` consecutive unstable runs have
+  been restarted, the next unstable exit marks the instance `errored`. A stable
+  run resets the count; so do operator `start`/`restart`.
+- `autorestart: false` or an exit code in `stop_exit_codes` → `stopped`.
+
+Verified by tests: every event in every state keeps the invariants; arbitrary
+event sequences (property-tested) never break them; automatic spawns never
+violate the 1 s floor; a crash loop always ends in `errored` after exactly
+`max_restarts` restarts. Mutation checks confirmed the tests fail when the
+floor or the budget is broken.
 
 ## 5. Process identity
 

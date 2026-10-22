@@ -9,7 +9,7 @@ Goal: `vexor start app.js --name api -i 1`, `stop`, `restart`, `delete`, `list -
 | Step | Deliverable | Acceptance |
 |---|---|---|
 | 2.1 ✅ | Workspace skeleton (`crates/vexor` bin only; other crates are added in the step that first needs them), `rust-toolchain.toml` (1.99.1), CI: fmt, clippy -D warnings, test on linux x64/arm64 + macOS, cargo-deny; actions pinned by commit SHA | all checks green locally; CI not yet run (no GitHub remote) |
-| 2.2 | `vexor-core`: state machine + restart policy (pure) | property tests: no transition sequence yields unbounded restarts within the budget window; every event in every state is handled |
+| 2.2 ✅ | `vexor-core`: state machine + restart policy (pure) | property tests: no transition sequence yields unbounded restarts within the budget window; every event in every state is handled |
 | 2.3 | `vexor shim`: spawn (argv exec, setsid, env/cwd), pipes, NODE_CHANNEL_FD, identity capture, restart loop | integration: env/args/cwd round-trip; metachar args not shell-split |
 | 2.4 | Stop: SIGTERM → kill_timeout → SIGKILL on pgid; shim subreaper orphan reap | test app ignoring SIGTERM is killed at timeout; grandchild cleaned up |
 | 2.4b | Shim ↔ daemon protocol, buffered events, reconnect, daemon reconcile | **zero-downtime proof**: HTTP app under constant load (`wrk2`), kill -9 daemon × 100 in a loop → 0 failed requests, 0 app restarts, log lines contiguous; app crash while daemon is down → still restarted by shim |

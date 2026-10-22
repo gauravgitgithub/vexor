@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 2195f347c683f7173d86b12bfdfb8fbf9c315ffc1804fca10edbc14a5a0784cc # shrinks to policy = InstancePolicy { restart: RestartPolicy { autorestart: true, backoff: Fixed(0ns), jitter: None, min_uptime: 0ns, max_restarts: 1, backoff_reset_after: 30s, stop_exit_codes: [] }, ready_timeout: Some(1ms), kill_timeout: 1.6s, health: Some(HealthPolicy { unhealthy_after: 1, restart_after: 3 }) }, runs = [(0, false, 0)]
+cc 034a289caa2ccc166a92c22f1dffafb60734f1f93554c8e645a224a3f886f992 # shrinks to policy = InstancePolicy { restart: RestartPolicy { autorestart: true, backoff: Exponential { initial: 0ns, max: 0ns }, jitter: None, min_uptime: 0ns, max_restarts: 1, backoff_reset_after: 30s, stop_exit_codes: [] }, ready_timeout: None, kill_timeout: 1.6s, health: Some(HealthPolicy { unhealthy_after: 1, restart_after: 3 }) }, runs = [(0, false, 0)]
+cc e3c9f71e525a8bffe135e551dbd267edd0afe36df1289b2fc9d55b5b98844137 # shrinks to policy = InstancePolicy { restart: RestartPolicy { autorestart: true, backoff: Fixed(0ns), jitter: None, min_uptime: 0ns, max_restarts: 0, backoff_reset_after: 30s, stop_exit_codes: [] }, ready_timeout: Some(1ms), kill_timeout: 1.6s, health: Some(HealthPolicy { unhealthy_after: 1, restart_after: 3 }) }, runs = [(0, false, 0)]

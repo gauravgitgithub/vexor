@@ -82,6 +82,9 @@ Exit codes: 0 ok, 1 command failed, 2 usage error, 3 daemon unreachable, 4 parti
 
 - Cluster mode runs through `cluster-shim.js` on the app's Node, not inside the daemon. `process.env.NODE_APP_INSTANCE` and `pm_id` are set the same way.
 - `pm2` programmatic API (`require('pm2')`) is not provided.
+- Automatic restarts are limited to one per second per instance (spawn to spawn). PM2 restarts immediately with `restart_delay: 0`.
+- `listen_timeout` expiry without a ready signal is a failed start (stopped, counted as unstable, restarted with backoff). PM2 marks the app online anyway.
+- `max_restarts: N` allows N automatic restarts of consecutive unstable runs; the (N+1)th unstable exit marks the app errored. Exact PM2 off-by-one to be confirmed in conformance tests.
 - `@pm2/io` metrics/actions are not collected.
 - Log rotation is built in and on by default (PM2 needs `pm2-logrotate`).
 - `describe` redacts env values.

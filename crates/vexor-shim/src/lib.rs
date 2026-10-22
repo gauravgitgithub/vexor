@@ -7,6 +7,7 @@
 
 mod identity;
 mod instance;
+mod orphan;
 mod output;
 mod process;
 
@@ -105,11 +106,20 @@ pub async fn run(spec: AppSpec) -> i32 {
         }
     };
 
+    if let Err(e) = orphan::become_subreaper() {
+        eprintln!(
+            "vexor shim: cannot become child subreaper, escaped descendants won't be tracked: {e}"
+        );
+    }
+    let managed = orphan::Managed::default();
+    let reaper = tokio::spawn(watch_orphans(spec.name.clone(), managed.clone()));
+
     let spec = Arc::new(spec);
     let epoch = tokio::time::Instant::now();
     let mut set = tokio::task::JoinSet::new();
     for index in 0..spec.instances {
-        let runner = instance::Runner::new(spec.clone(), index, output::Output, epoch);
+        let runner =
+            instance::Runner::new(spec.clone(), index, output::Output, epoch, managed.clone());
         set.spawn(runner.run(stop_rx.clone()));
     }
 
@@ -128,10 +138,46 @@ pub async fn run(spec: AppSpec) -> i32 {
             _ = int.recv() => { let _ = stop_tx.send(true); }
         }
     }
+    reaper.abort();
+    if spec.treekill {
+        orphan::stop_all(&managed, spec.policy.to_policy().kill_timeout).await;
+    }
     if states.contains(&State::Errored) {
         exit::ERRORED
     } else {
         exit::STOPPED
+    }
+}
+
+/// Reap adopted orphans as they exit, and report each new live one once.
+async fn watch_orphans(app: String, managed: orphan::Managed) {
+    let mut sigchld = signal(SignalKind::child()).ok();
+    // SIGCHLD can coalesce; a slow periodic sweep catches anything missed.
+    let mut sweep = tokio::time::interval(std::time::Duration::from_secs(1));
+    let mut seen = std::collections::HashSet::new();
+    loop {
+        match sigchld.as_mut() {
+            Some(sig) => {
+                tokio::select! {
+                    _ = sig.recv() => {}
+                    _ = sweep.tick() => {}
+                }
+            }
+            None => {
+                sweep.tick().await;
+            }
+        }
+        let alive = orphan::reap(&managed);
+        seen.retain(|id| alive.contains(id));
+        for id in alive {
+            if seen.insert(id) {
+                output::Output.emit(&output::ShimEvent::Orphan {
+                    app: &app,
+                    pid: id.pid,
+                    start: id.start,
+                });
+            }
+        }
     }
 }
 

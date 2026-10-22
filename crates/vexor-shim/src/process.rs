@@ -9,7 +9,7 @@ use std::path::Path;
 use std::process::Stdio;
 
 use command_fds::{CommandFdExt, FdMapping};
-use rustix::process::{Pid, Signal, kill_process_group};
+use rustix::process::{Pid, Signal, kill_process, kill_process_group, test_kill_process_group};
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
@@ -118,12 +118,33 @@ async fn copy_to_log(mut from: impl AsyncRead + Unpin, mut to: tokio::fs::File) 
 /// Send `sig` to the whole process group led by `pid`. A group that is
 /// already gone is not an error.
 pub fn signal_group(pid: u32, sig: Signal) -> io::Result<()> {
-    let raw = i32::try_from(pid).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
-    let pgid = Pid::from_raw(raw).ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
-    match kill_process_group(pgid, sig) {
+    match kill_process_group(to_pid(pid)?, sig) {
         Ok(()) | Err(rustix::io::Errno::SRCH) => Ok(()),
         Err(e) => Err(e.into()),
     }
+}
+
+/// Send `sig` to `pid` only. A process that is already gone is not an error.
+pub fn signal_process(pid: u32, sig: Signal) -> io::Result<()> {
+    match kill_process(to_pid(pid)?, sig) {
+        Ok(()) | Err(rustix::io::Errno::SRCH) => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// True while any process (including zombies) is in the group `pid` led.
+pub fn group_alive(pid: u32) -> bool {
+    match to_pid(pid) {
+        Ok(p) => !matches!(test_kill_process_group(p), Err(rustix::io::Errno::SRCH)),
+        Err(_) => false,
+    }
+}
+
+fn to_pid(pid: u32) -> io::Result<Pid> {
+    i32::try_from(pid)
+        .ok()
+        .and_then(Pid::from_raw)
+        .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))
 }
 
 /// Parent end of a Node IPC channel (newline-delimited JSON).

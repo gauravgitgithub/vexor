@@ -37,6 +37,11 @@ pub struct AppSpec {
     /// `process.send('ready')` works.
     #[serde(default)]
     pub node_ipc: bool,
+    /// PM2 `treekill`: signal the instance's whole process group, and clean
+    /// up processes left in it after the main process exits. When false,
+    /// only the main process is signalled.
+    #[serde(default = "yes")]
+    pub treekill: bool,
     pub logs: LogSpec,
     #[serde(default)]
     pub policy: PolicySpec,
@@ -131,6 +136,10 @@ impl PolicySpec {
     }
 }
 
+fn yes() -> bool {
+    true
+}
+
 fn one() -> u32 {
     1
 }
@@ -166,6 +175,7 @@ mod tests {
         let spec: AppSpec = serde_json::from_str(json).expect("valid");
         assert_eq!(spec.instances, 1);
         assert_eq!(spec.instance_var, "NODE_APP_INSTANCE");
+        assert!(spec.treekill);
         assert!(spec.env.is_empty());
         assert_eq!(spec.policy, PolicySpec::default());
     }

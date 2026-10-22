@@ -351,3 +351,153 @@ fn node_with_ipc_still_exits_when_its_work_is_done() {
     assert_eq!(shim.out_log(), "done\n");
     assert!(done.elapsed < Duration::from_secs(5), "{:?}", done.elapsed);
 }
+
+// -------------------------------------------------------- leftover processes
+
+fn read_pid(shim: &Shim, file: &str) -> u32 {
+    let path = shim.path(file);
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        if let Some(pid) = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+        {
+            return pid;
+        }
+        assert!(Instant::now() < deadline, "no pid in {file}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn alive(pid: u32) -> bool {
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// A killed process may linger briefly as a zombie until its new parent
+/// reaps it.
+fn assert_dies(pid: u32) {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while alive(pid) {
+        assert!(Instant::now() < deadline, "process {pid} is still alive");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn cleanup_signals(events: &[Value]) -> Vec<String> {
+    events
+        .iter()
+        .filter(|e| e["type"] == "group_cleanup")
+        .map(|e| e["signal"].as_str().unwrap_or_default().to_owned())
+        .collect()
+}
+
+#[test]
+fn crash_cleans_up_processes_left_in_the_group() {
+    let shim = Shim::new();
+    let script = "sleep 300 & echo $! > bg.pid; exit 1";
+    let done = shim.run(&shim.spec("/bin/sh", &["-c", script], ONCE()));
+    assert_eq!(done.code, Some(0), "{}", done.stderr);
+    assert_dies(read_pid(&shim, "bg.pid"));
+    assert_eq!(cleanup_signals(&done.events), ["SIGTERM"]);
+}
+
+#[test]
+fn stop_kills_group_members_that_ignore_sigterm() {
+    let shim = Shim::new();
+    let script = r#"sh -c 'trap "" TERM; echo $$ > bg.pid; while :; do sleep 0.05; done' & echo started; wait"#;
+    let extra = json!({ "policy": { "kill_timeout_ms": 300 } });
+    let child = shim.start(&shim.spec("/bin/sh", &["-c", script], extra));
+    let started = Instant::now();
+    shim.wait_for_output("started");
+    let bg = read_pid(&shim, "bg.pid");
+    kill(child.id(), "TERM");
+    let done = finish(child, started);
+    assert_eq!(done.code, Some(0), "{}", done.stderr);
+    assert_dies(bg);
+    assert_eq!(cleanup_signals(&done.events), ["SIGKILL"]);
+}
+
+#[test]
+fn treekill_false_leaves_group_members_alone() {
+    let shim = Shim::new();
+    let script = "sleep 300 & echo $! > bg.pid; exit 1";
+    let extra = json!({ "treekill": false, "policy": { "autorestart": false } });
+    let done = shim.run(&shim.spec("/bin/sh", &["-c", script], extra));
+    assert_eq!(done.code, Some(0), "{}", done.stderr);
+    let bg = read_pid(&shim, "bg.pid");
+    let survived = alive(bg);
+    kill(bg, "KILL");
+    assert!(survived, "treekill: false must not touch other processes");
+    assert!(cleanup_signals(&done.events).is_empty());
+}
+
+#[cfg(target_os = "linux")]
+mod linux {
+    use super::*;
+
+    fn zombie_children(parent: u32) -> Vec<u32> {
+        let mut out = vec![];
+        for entry in std::fs::read_dir("/proc").expect("/proc").flatten() {
+            let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+                continue;
+            };
+            let Some(close) = stat.rfind(')') else {
+                continue;
+            };
+            let mut f = stat[close + 1..].split_whitespace();
+            let (Some(state), Some(ppid)) = (f.next(), f.next()) else {
+                continue;
+            };
+            if state == "Z" && ppid == parent.to_string() {
+                out.push(entry.file_name().to_string_lossy().parse().unwrap_or(0));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn escaped_descendants_are_adopted_reported_and_stopped() {
+        if which("setsid").is_none() {
+            eprintln!("skipping: setsid not found");
+            return;
+        }
+        let shim = Shim::new();
+        let script = r#"(setsid sh -c 'echo $$ > esc.pid; exec sleep 300' &); echo started; while :; do sleep 0.05; done"#;
+        let child = shim.start(&shim.spec("/bin/sh", &["-c", script], json!({})));
+        let started = Instant::now();
+        shim.wait_for_output("started");
+        let esc = read_pid(&shim, "esc.pid");
+        // The orphan sweep runs at least once a second.
+        std::thread::sleep(Duration::from_millis(1500));
+        kill(child.id(), "TERM");
+        let done = finish(child, started);
+        assert_eq!(done.code, Some(0), "{}", done.stderr);
+        assert_dies(esc);
+        assert!(
+            done.events
+                .iter()
+                .any(|e| e["type"] == "orphan" && e["pid"] == esc),
+            "orphan event for {esc}: {:?}",
+            done.events
+        );
+    }
+
+    #[test]
+    fn exited_orphans_are_reaped() {
+        let shim = Shim::new();
+        let script = "(sleep 0.2 &); (sleep 0.2 &); echo started; while :; do sleep 0.05; done";
+        let child = shim.start(&shim.spec("/bin/sh", &["-c", script], json!({})));
+        let started = Instant::now();
+        shim.wait_for_output("started");
+        std::thread::sleep(Duration::from_millis(1500));
+        let zombies = zombie_children(child.id());
+        kill(child.id(), "TERM");
+        let done = finish(child, started);
+        assert_eq!(done.code, Some(0), "{}", done.stderr);
+        assert!(zombies.is_empty(), "unreaped zombies: {zombies:?}");
+    }
+}

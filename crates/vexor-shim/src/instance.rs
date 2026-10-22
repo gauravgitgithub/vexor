@@ -13,12 +13,16 @@ use tokio::time::Instant;
 use vexor_core::{AppSpec, Ctx, Effect, Event, ExitStatus, Instance, Millis, State, Timer};
 
 use crate::identity::Identity;
+use crate::orphan::{self, Managed};
 use crate::output::{Output, ShimEvent};
 use crate::process::{self, IpcChannel, IpcMessage};
 
 /// How long to wait for log pipes to drain after the instance has finished.
 /// A grandchild that inherited stdout can hold a pipe open indefinitely.
 const LOG_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+/// After SIGKILL, how long to wait for the group to disappear.
+const KILL_CONFIRM_TIMEOUT: Duration = Duration::from_secs(2);
+const POLL: Duration = Duration::from_millis(25);
 
 pub struct Runner {
     spec: Arc<AppSpec>,
@@ -26,6 +30,7 @@ pub struct Runner {
     inst: Instance,
     out: Output,
     epoch: Instant,
+    managed: Managed,
     child: Option<tokio::process::Child>,
     identity: Option<Identity>,
     pid: Option<u32>,
@@ -38,7 +43,13 @@ pub struct Runner {
 }
 
 impl Runner {
-    pub fn new(spec: Arc<AppSpec>, index: u32, out: Output, epoch: Instant) -> Self {
+    pub fn new(
+        spec: Arc<AppSpec>,
+        index: u32,
+        out: Output,
+        epoch: Instant,
+        managed: Managed,
+    ) -> Self {
         let inst = Instance::new(spec.policy.to_policy());
         Runner {
             spec,
@@ -46,6 +57,7 @@ impl Runner {
             inst,
             out,
             epoch,
+            managed,
             child: None,
             identity: None,
             pid: None,
@@ -76,6 +88,12 @@ impl Runner {
                 status = wait_child(&mut self.child), if self.child.is_some() => {
                     self.child = None;
                     self.ipc = None;
+                    if let Some(pid) = self.pid {
+                        self.managed.remove(pid);
+                        if self.spec.treekill {
+                            self.clean_group(pid).await;
+                        }
+                    }
                     self.queue.push_back(Event::Exited(status));
                 }
                 () = sleep_until(deadline), if deadline.is_some() => {
@@ -119,6 +137,9 @@ impl Runner {
         for effect in effects {
             self.apply(effect);
         }
+        if self.inst.armed_timer().is_none() {
+            self.timer = None;
+        }
         if self.inst.state() != before {
             self.emit_state();
         }
@@ -128,6 +149,7 @@ impl Runner {
         match effect {
             Effect::Spawn => match process::spawn(&self.spec, self.index) {
                 Ok(s) => {
+                    self.managed.insert(s.pid);
                     self.pid = Some(s.pid);
                     // The process may already have exited; identity is then
                     // unknown, which only matters for recovery.
@@ -165,9 +187,15 @@ impl Runner {
     fn signal(&self, sig: Signal) {
         // Only while our child is unreaped: its PID (and group) can't have
         // been reused yet.
-        if let (Some(pid), Some(_)) = (self.pid, &self.child)
-            && let Err(e) = process::signal_group(pid, sig)
-        {
+        let Some(pid) = self.pid.filter(|_| self.child.is_some()) else {
+            return;
+        };
+        let sent = if self.spec.treekill {
+            process::signal_group(pid, sig)
+        } else {
+            process::signal_process(pid, sig)
+        };
+        if let Err(e) = sent {
             eprintln!(
                 "vexor shim: {}[{}]: signal {sig:?} to group {pid} failed: {e}",
                 self.spec.name, self.index
@@ -186,6 +214,65 @@ impl Runner {
             restarts: self.inst.restarts(),
             exit: self.inst.last_exit().filter(|_| !running),
             error: self.inst.error(),
+        });
+    }
+
+    /// The main process has exited. Make sure nothing is left in its process
+    /// group before the exit is reported, so a restart never runs next to
+    /// leftovers (holding ports, files, or queue messages).
+    ///
+    /// When stopping, the group already got SIGTERM and has until the stop
+    /// deadline. After a crash, the group gets SIGTERM now and `kill_timeout`.
+    /// Then SIGKILL.
+    async fn clean_group(&mut self, pid: u32) {
+        orphan::reap(&self.managed);
+        if !process::group_alive(pid) {
+            return;
+        }
+        let stopping = self.inst.state() == State::Stopping;
+        let deadline = match self.timer {
+            Some((Timer::Stop, _, at)) if stopping => at,
+            _ if stopping => Instant::now(),
+            _ => {
+                self.emit_cleanup("SIGTERM");
+                let _ = process::signal_group(pid, Signal::TERM);
+                Instant::now() + self.inst.policy().kill_timeout
+            }
+        };
+        if self.wait_group_gone(pid, deadline).await {
+            return;
+        }
+        self.emit_cleanup("SIGKILL");
+        let _ = process::signal_group(pid, Signal::KILL);
+        if !self
+            .wait_group_gone(pid, Instant::now() + KILL_CONFIRM_TIMEOUT)
+            .await
+        {
+            eprintln!(
+                "vexor shim: {}[{}]: processes in group {pid} survived SIGKILL",
+                self.spec.name, self.index
+            );
+        }
+    }
+
+    async fn wait_group_gone(&self, pid: u32, deadline: Instant) -> bool {
+        loop {
+            orphan::reap(&self.managed);
+            if !process::group_alive(pid) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(POLL).await;
+        }
+    }
+
+    fn emit_cleanup(&self, signal: &'static str) {
+        self.out.emit(&ShimEvent::GroupCleanup {
+            app: &self.spec.name,
+            instance: self.index,
+            signal,
         });
     }
 

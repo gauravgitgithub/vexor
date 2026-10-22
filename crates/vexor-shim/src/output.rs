@@ -26,6 +26,16 @@ pub enum ShimEvent<'a> {
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<ErrorReason>,
     },
+    /// Processes were still in the instance's group after its main process
+    /// exited, and were sent `signal`.
+    GroupCleanup {
+        app: &'a str,
+        instance: u32,
+        signal: &'static str,
+    },
+    /// A descendant escaped its process group and was adopted by the shim
+    /// (Linux). It is stopped when the shim shuts down.
+    Orphan { app: &'a str, pid: u32, start: u64 },
     SpawnError {
         app: &'a str,
         instance: u32,

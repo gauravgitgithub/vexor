@@ -84,6 +84,9 @@ Exit codes: 0 ok, 1 command failed, 2 usage error, 3 daemon unreachable, 4 parti
 
 - Cluster mode runs through `cluster-shim.js` on the app's Node, not inside the daemon. `process.env.NODE_APP_INSTANCE` and `pm_id` are set the same way.
 - `pm2` programmatic API (`require('pm2')`) is not provided.
+- With `treekill` (default true), processes left in the app's process group after its main process **crashes** get SIGTERM, then SIGKILL after `kill_timeout`, before the restart. PM2 only kills the tree on stop/restart, so leftovers from a crash can keep ports or queue messages. `treekill: false` leaves them alone, as PM2 does.
+- On stop, Vexor waits for the whole group, not just the main process, up to `kill_timeout`, then SIGKILLs what is left.
+- Linux only: descendants that escape the group (`setsid`, double fork) are adopted by the shim (child subreaper), reaped when they exit, reported as `orphan` events, and stopped when the shim shuts down. **macOS:** such processes re-parent to launchd and Vexor can't track them.
 - Automatic restarts are limited to one per second per instance (spawn to spawn). PM2 restarts immediately with `restart_delay: 0`.
 - `listen_timeout` expiry without a ready signal is a failed start (stopped, counted as unstable, restarted with backoff). PM2 marks the app online anyway.
 - `max_restarts: N` allows N automatic restarts of consecutive unstable runs; the (N+1)th unstable exit marks the app errored. Exact PM2 off-by-one to be confirmed in conformance tests.

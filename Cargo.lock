@@ -732,7 +732,9 @@ dependencies = [
  "clap",
  "serde_json",
  "tempfile",
+ "vexor-core",
  "vexor-daemon",
+ "vexor-proto",
  "vexor-shim",
 ]
 
@@ -751,8 +753,11 @@ version = "0.0.0"
 dependencies = [
  "libc",
  "rustix",
+ "serde",
  "serde_json",
+ "tempfile",
  "tokio",
+ "vexor-core",
  "vexor-proto",
  "vexor-shim",
 ]
@@ -764,6 +769,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "vexor-core",
 ]
 
 [[package]]

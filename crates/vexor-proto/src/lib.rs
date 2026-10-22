@@ -28,6 +28,8 @@ pub enum ToShim {
     },
     /// Stop every instance gracefully, then exit.
     Stop,
+    /// Restart every instance (also revives stopped or errored ones).
+    Restart,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -65,6 +67,87 @@ pub enum FromShim {
     Refused {
         reason: String,
     },
+}
+
+// ----------------------------------------------------------- CLI ↔ daemon
+
+/// One request per connection, from the CLI to the daemon.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClientRequest {
+    pub protocol: u32,
+    pub request: Request,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Request {
+    /// Add an app and start it. Idempotent for an identical spec that is
+    /// already running.
+    Start {
+        spec: Box<vexor_core::AppSpec>,
+    },
+    /// Start apps that already exist.
+    StartExisting {
+        target: Target,
+    },
+    Stop {
+        target: Target,
+    },
+    Restart {
+        target: Target,
+    },
+    /// Stop and forget.
+    Delete {
+        target: Target,
+    },
+    List,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Target {
+    All,
+    Name(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Response {
+    Ok { apps: Vec<AppStatus> },
+    Error { code: ErrorCode, message: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorCode {
+    NotFound,
+    /// An app with this name exists with a different spec.
+    Conflict,
+    InvalidSpec,
+    /// Some targets succeeded, some failed (the message says which).
+    Partial,
+    Protocol,
+    Internal,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppStatus {
+    pub name: String,
+    pub desired: Desired,
+    /// Present while the daemon is connected to the app's shim.
+    pub shim_pid: Option<u32>,
+    pub instances: u32,
+    /// Latest `state` event per instance, as reported by the shim.
+    pub snapshot: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Desired {
+    Running,
+    Stopped,
 }
 
 /// Write one message as a JSON line.

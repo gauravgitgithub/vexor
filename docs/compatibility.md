@@ -67,6 +67,11 @@ The wrapper is a zero-dependency ES5 script with no `postinstall` and no network
 
 Install: `npm i -g vexord` (provides the `vexor` command).
 
+Implemented so far (Phase 2.5): `start` (script, existing name, `all`, or `--spec`), `stop`, `restart`, `delete`/`del`, `list`/`ls`/`status` (`--json`). Differences from PM2 so far:
+- `start` passes only an environment allowlist (PATH, HOME, USER, LOGNAME, SHELL, LANG, LC_*, TZ, TMPDIR, NODE_ENV) plus `--env KEY=VALUE`; `--inherit-env` passes the whole shell environment like PM2.
+- `start` of a name that exists with a different configuration is an error instead of silently keeping the old one.
+- `.js/.cjs/.mjs` run with the `node` found on the caller's PATH, resolved to an absolute path at start time.
+
 Exit codes: 0 ok, 1 command failed, 2 usage error, 3 daemon unreachable, 4 partial success (some targets failed).
 
 ## 5. Ecosystem field classification (PM2 7.0.4 `lib/API/schema.json`, 65 fields)

@@ -317,12 +317,15 @@ Cost accepted: about 1 MB more binary and a C toolchain in the cross-build
 - Unix socket `$VEXOR_HOME/daemon.sock`. `$VEXOR_HOME` (default
   `~/.vexor`) is created 0700; the socket is 0600. The peer UID is checked via
   `SO_PEERCRED` / `getpeereid` and must equal the daemon UID (root is allowed).
-- Framing: u32 length prefix + JSON, max 4 MiB per frame. A `hello` handshake
-  carries protocol version; a mismatch gives an actionable error
-  ("daemon is vX, CLI is vY: run `vexor update`").
-- Every lifecycle command takes a per-app lock inside the daemon. Conflicting
-  commands queue; duplicate `start` on a running app returns the existing state
-  (idempotent).
+- Framing: JSON lines (same codec as daemon ↔ shim), max 1 MiB per line,
+  one request per connection. Each request carries the protocol version; a
+  mismatch gives an actionable error.
+- Mutating commands are serialized by one lock around the desired state
+  (simple and sufficient for now; per-app locks later if needed). A `start`
+  with a spec identical to a running app's is idempotent; a different spec
+  under the same name is refused (`Conflict`).
+- A starting daemon or shim retries its lock for 500 ms, because other
+  processes briefly take the lock to check whether its owner is alive.
 - Single daemon per `$VEXOR_HOME`: `flock` on `daemon.lock`, held for the
   daemon's lifetime.
 - No network listener by default. Optional metrics HTTP endpoint binds

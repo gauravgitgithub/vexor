@@ -20,20 +20,28 @@ const TIMEOUT: Duration = Duration::from_secs(15);
 struct Home {
     dir: TempDir,
     daemon: Option<Child>,
+    /// Specs added before the first daemon start, submitted once it is up.
+    pending: Vec<PathBuf>,
 }
 
 impl Home {
     fn new() -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::create_dir_all(dir.path().join("apps")).expect("apps dir");
-        Home { dir, daemon: None }
+        std::fs::create_dir_all(dir.path().join("specs")).expect("specs dir");
+        Home {
+            dir,
+            daemon: None,
+            pending: Vec::new(),
+        }
     }
 
     fn path(&self, name: &str) -> PathBuf {
         self.dir.path().join(name)
     }
 
-    fn add_app(&self, name: &str, exec: &str, args: &[&str], extra: Value) {
+    /// Write an app spec; it is submitted with `vexor start --spec` when the
+    /// daemon starts.
+    fn add_app(&mut self, name: &str, exec: &str, args: &[&str], extra: Value) {
         let mut spec = json!({
             "name": name,
             "exec": exec,
@@ -48,15 +56,25 @@ impl Home {
         if let (Value::Object(b), Value::Object(e)) = (&mut spec, extra) {
             b.extend(e);
         }
-        std::fs::write(self.path(&format!("apps/{name}.json")), spec.to_string())
-            .expect("write spec");
+        let path = self.path(&format!("specs/{name}.json"));
+        std::fs::write(&path, spec.to_string()).expect("write spec");
+        self.pending.push(path);
+    }
+
+    fn cli(&self, args: &[&str]) -> std::process::Output {
+        Command::new(env!("CARGO_BIN_EXE_vexor"))
+            .arg("--home")
+            .arg(self.dir.path())
+            .args(args)
+            .output()
+            .expect("run vexor")
     }
 
     fn spawn_daemon(&self) -> Child {
         Command::new(env!("CARGO_BIN_EXE_vexor"))
-            .arg("daemon")
             .arg("--home")
             .arg(self.dir.path())
+            .arg("daemon")
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
@@ -65,7 +83,19 @@ impl Home {
 
     fn start_daemon(&mut self) {
         assert!(self.daemon.is_none(), "daemon already running");
+        let started = self.count("daemon_started");
         self.daemon = Some(self.spawn_daemon());
+        // Use the CLI only once this daemon is serving; otherwise the CLI
+        // would start a daemon of its own.
+        self.wait_count("daemon_started", started + 1);
+        for spec in std::mem::take(&mut self.pending) {
+            let out = self.cli(&["start", "--spec", &spec.to_string_lossy()]);
+            assert!(
+                out.status.success(),
+                "vexor start --spec failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
     }
 
     fn kill_daemon(&mut self) {
@@ -407,10 +437,10 @@ fn only_one_shim_per_app() {
     home.start_daemon();
     home.wait_count("shim_connected", 1);
     let out = Command::new(env!("CARGO_BIN_EXE_vexor"))
-        .args(["shim", "--spec"])
-        .arg(home.path("apps/solo.json"))
         .arg("--home")
         .arg(home.dir.path())
+        .args(["shim", "--managed", "--spec"])
+        .arg(home.path("apps/solo.json"))
         .output()
         .expect("second shim");
     assert_eq!(
@@ -442,6 +472,8 @@ fn control_files_are_private() {
         "shims/p.lock",
         "shims/p.pids.json",
         "daemon.log",
+        "daemon.sock",
+        "state.json",
     ] {
         assert_eq!(mode(f), 0o600, "{f}");
     }

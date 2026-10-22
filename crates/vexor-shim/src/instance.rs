@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rustix::process::Signal;
-use tokio::sync::watch;
+use tokio::sync::{broadcast, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use vexor_core::{AppSpec, Ctx, Effect, Event, ExitStatus, Instance, Millis, State, Timer};
@@ -70,17 +70,25 @@ impl Runner {
         }
     }
 
-    /// Start the instance and supervise it until it is stopped (by `stop`
-    /// turning true, or by policy) or errored. Returns the final state.
-    pub async fn run(mut self, mut stop: watch::Receiver<bool>) -> State {
+    /// Start the instance and supervise it. Ends once `shutdown` turns true
+    /// and the instance has stopped, or, when `exit_when_idle`, as soon as it
+    /// is stopped or errored. `restart` delivers operator restarts.
+    pub async fn run(
+        mut self,
+        mut shutdown: watch::Receiver<bool>,
+        mut restart: broadcast::Receiver<()>,
+        exit_when_idle: bool,
+    ) -> State {
         self.queue.push_back(Event::Start);
-        let mut stop_requested = false;
+        let mut shutting_down = false;
+        let mut restarts_open = true;
         loop {
             while let Some(event) = self.queue.pop_front() {
                 self.dispatch(event);
             }
-            if self.child.is_none() && matches!(self.inst.state(), State::Stopped | State::Errored)
-            {
+            let idle = self.child.is_none()
+                && matches!(self.inst.state(), State::Stopped | State::Errored);
+            if idle && (exit_when_idle || shutting_down) {
                 break;
             }
             let deadline = self.timer.map(|(_, _, at)| at);
@@ -106,12 +114,18 @@ impl Runner {
                     Some(IpcMessage::Other) => {}
                     None => self.ipc = None,
                 },
-                changed = stop.changed(), if !stop_requested => {
-                    stop_requested = true;
-                    if changed.is_ok() && *stop.borrow() {
+                changed = shutdown.changed(), if !shutting_down => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        shutting_down = true;
                         self.queue.push_back(Event::Stop);
                     }
                 }
+                r = restart.recv(), if restarts_open && !shutting_down => match r {
+                    Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) => {
+                        self.queue.push_back(Event::Restart);
+                    }
+                    Err(broadcast::error::RecvError::Closed) => restarts_open = false,
+                },
             }
         }
         self.drain_logs().await;

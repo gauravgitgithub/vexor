@@ -17,7 +17,7 @@ use std::time::Duration;
 use rustix::fs::{FlockOperation, flock};
 use tokio::io::BufReader;
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{broadcast, mpsc, watch};
 use vexor_proto::{FromShim, PROTOCOL, ToShim};
 
 use crate::identity::Identity;
@@ -71,6 +71,25 @@ pub fn try_lock(path: &Path) -> io::Result<Option<File>> {
     }
 }
 
+/// Like [`try_lock`], but keeps trying for `wait`. Others briefly take the
+/// lock just to check whether its owner is alive; a process starting up must
+/// not mistake such a check for a running owner.
+pub fn lock_with_retry(path: &Path, wait: Duration) -> io::Result<Option<File>> {
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        if let Some(f) = try_lock(path)? {
+            return Ok(Some(f));
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(None);
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// How long a starting daemon or shim retries its lock.
+pub const LOCK_WAIT: Duration = Duration::from_millis(500);
+
 /// Bind the control socket. Any file already at `path` is stale: the caller
 /// holds the lock, so no other shim for this app can be using it.
 pub fn bind(path: &Path) -> io::Result<UnixListener> {
@@ -97,7 +116,12 @@ pub fn write_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
         .open(&tmp)?;
     f.write_all(contents)?;
     f.sync_all()?;
-    std::fs::rename(&tmp, path)
+    std::fs::rename(&tmp, path)?;
+    // Make the rename itself durable.
+    if let Some(dir) = path.parent() {
+        File::open(dir)?.sync_all()?;
+    }
+    Ok(())
 }
 
 /// Accept daemon connections until the task is aborted.
@@ -107,6 +131,7 @@ pub async fn serve(
     me: Identity,
     app: Arc<str>,
     stop: Arc<watch::Sender<bool>>,
+    restart: broadcast::Sender<()>,
 ) {
     let mut current: Option<tokio::task::JoinHandle<()>> = None;
     loop {
@@ -130,6 +155,7 @@ pub async fn serve(
             me,
             app.clone(),
             stop.clone(),
+            restart.clone(),
         )));
     }
 }
@@ -149,6 +175,7 @@ async fn session(
     me: Identity,
     app: Arc<str>,
     stop: Arc<watch::Sender<bool>>,
+    restart: broadcast::Sender<()>,
 ) {
     let (read, mut write) = stream.into_split();
 
@@ -223,6 +250,7 @@ async fn session(
             () = &mut changed => {}
             msg = rx.recv() => match msg {
                 Some(ToShim::Stop) => { stop.send_replace(true); }
+                Some(ToShim::Restart) => { let _ = restart.send(()); }
                 Some(ToShim::Hello { .. }) => {}
                 None => return,
             },
@@ -248,8 +276,25 @@ mod tests {
         let path = dir.path().join("a.lock");
         let held = try_lock(&path).expect("lock").expect("free");
         assert!(try_lock(&path).expect("lock").is_none());
+        assert!(
+            lock_with_retry(&path, Duration::from_millis(50))
+                .expect("lock")
+                .is_none()
+        );
         drop(held);
         assert!(try_lock(&path).expect("lock").is_some());
+    }
+
+    #[test]
+    fn retry_outlasts_a_brief_probe() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("a.lock");
+        let probe = try_lock(&path).expect("lock").expect("free");
+        let p = path.clone();
+        let t = std::thread::spawn(move || lock_with_retry(&p, LOCK_WAIT).expect("lock"));
+        std::thread::sleep(Duration::from_millis(30));
+        drop(probe);
+        assert!(t.join().expect("join").is_some());
     }
 
     #[test]

@@ -24,7 +24,10 @@ use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::watch;
 use vexor_core::{AppSpec, State};
 
-pub use control::{Paths, private_dir, shims_dir, try_lock};
+pub use control::{
+    LOCK_WAIT, Paths, bind as bind_socket, lock_with_retry, private_dir, shims_dir, try_lock,
+    write_atomic,
+};
 pub use identity::Identity;
 
 /// Exit codes of `vexor shim`.
@@ -73,7 +76,8 @@ fn load_spec(path: &Path) -> Result<AppSpec, String> {
     Ok(spec)
 }
 
-fn validate(spec: &AppSpec) -> Result<(), String> {
+/// Check a spec before it is accepted (also used by the daemon).
+pub fn validate(spec: &AppSpec) -> Result<(), String> {
     // The name becomes part of file names under $VEXOR_HOME (security.md T5).
     let name_ok = !spec.name.is_empty()
         && spec.name.len() <= 64
@@ -117,6 +121,7 @@ fn validate(spec: &AppSpec) -> Result<(), String> {
 pub async fn run(spec: AppSpec, home: Option<PathBuf>) -> i32 {
     let (stop_tx, stop_rx) = watch::channel(false);
     let stop_tx = Arc::new(stop_tx);
+    let (restart_tx, _) = tokio::sync::broadcast::channel::<()>(16);
     let (mut term, mut int) = match (
         signal(SignalKind::terminate()),
         signal(SignalKind::interrupt()),
@@ -165,6 +170,7 @@ pub async fn run(spec: AppSpec, home: Option<PathBuf>) -> i32 {
                     me,
                     Arc::from(spec.name.as_str()),
                     stop_tx.clone(),
+                    restart_tx.clone(),
                 ));
                 let managed = orphan::Managed::persisted(paths.pids.clone());
                 presence = Some((lock, server, paths));
@@ -188,7 +194,7 @@ pub async fn run(spec: AppSpec, home: Option<PathBuf>) -> i32 {
     for index in 0..spec.instances {
         let runner =
             instance::Runner::new(spec.clone(), index, out.clone(), epoch, managed.clone());
-        set.spawn(runner.run(stop_rx.clone()));
+        set.spawn(runner.run(stop_rx.clone(), restart_tx.subscribe(), home.is_none()));
     }
 
     let mut states = Vec::with_capacity(set.len());
@@ -204,18 +210,6 @@ pub async fn run(spec: AppSpec, home: Option<PathBuf>) -> i32 {
             },
             _ = term.recv() => { stop_tx.send_replace(true); }
             _ = int.recv() => { stop_tx.send_replace(true); }
-        }
-    }
-
-    // Daemon-managed: keep reporting final state until told to stop.
-    if presence.is_some() {
-        let mut stopped = stop_rx.clone();
-        while !*stopped.borrow_and_update() {
-            tokio::select! {
-                changed = stopped.changed() => if changed.is_err() { break },
-                _ = term.recv() => { stop_tx.send_replace(true); }
-                _ = int.recv() => { stop_tx.send_replace(true); }
-            }
         }
     }
 
@@ -249,7 +243,7 @@ fn claim(home: &Path, app: &str) -> std::io::Result<Claim> {
     control::private_dir(home)?;
     control::private_dir(&control::shims_dir(home))?;
     let paths = control::Paths::new(home, app);
-    let Some(lock) = control::try_lock(&paths.lock)? else {
+    let Some(lock) = control::lock_with_retry(&paths.lock, control::LOCK_WAIT)? else {
         return Ok(Claim::Taken);
     };
     let listener = control::bind(&paths.socket)?;

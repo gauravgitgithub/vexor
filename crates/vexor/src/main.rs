@@ -41,6 +41,20 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Show stored lifecycle history (newest last).
+    Events {
+        /// Only this app.
+        app: Option<String>,
+        /// Only events newer than this, e.g. 30s, 10m, 2h, 7d.
+        #[arg(long, value_parser = parse_duration)]
+        since: Option<std::time::Duration>,
+        /// At most this many events.
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
+        /// Machine-readable output.
+        #[arg(long)]
+        json: bool,
+    },
     /// Run the supervisor daemon in the foreground. Other commands start it
     /// in the background automatically.
     Daemon,
@@ -135,6 +149,28 @@ fn main() -> ExitCode {
             false,
         ),
         Command::List { json } => send(&home, Request::List, json),
+        Command::Events {
+            app,
+            since,
+            limit,
+            json,
+        } => {
+            let since_ms = since.map(|d| {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default();
+                u64::try_from(now.saturating_sub(d).as_millis()).unwrap_or(0)
+            });
+            send(
+                &home,
+                Request::Events {
+                    app,
+                    since_ms,
+                    limit,
+                },
+                json,
+            )
+        }
     }
 }
 
@@ -165,7 +201,20 @@ fn send(home: &std::path::Path, req: Request, json: bool) -> ExitCode {
         }
     };
     match response {
-        Response::Ok { apps } => {
+        Response::Events { events, warnings } => {
+            print_warnings(&warnings);
+            if json {
+                match serde_json::to_string_pretty(&events) {
+                    Ok(s) => println!("{s}"),
+                    Err(e) => return fail(&e.to_string()),
+                }
+            } else {
+                print_events(&events);
+            }
+            ExitCode::SUCCESS
+        }
+        Response::Ok { apps, warnings } => {
+            print_warnings(&warnings);
             if json {
                 match serde_json::to_string_pretty(&apps) {
                     Ok(s) => println!("{s}"),
@@ -189,6 +238,117 @@ fn send(home: &std::path::Path, req: Request, json: bool) -> ExitCode {
                 code::FAILED
             })
         }
+    }
+}
+
+fn print_warnings(warnings: &[String]) {
+    for w in warnings {
+        eprintln!("vexor: warning: {w}");
+    }
+}
+
+fn print_events(events: &[serde_json::Value]) {
+    let mut rows = vec![[
+        "TIME (UTC)".to_owned(),
+        "APP".to_owned(),
+        "INST".to_owned(),
+        "EVENT".to_owned(),
+        "DETAIL".to_owned(),
+    ]];
+    for e in events {
+        let kind = e["type"].as_str().unwrap_or("?");
+        let event = if kind == "state" {
+            e["state"].as_str().unwrap_or("?").to_owned()
+        } else {
+            kind.to_owned()
+        };
+        let mut detail = Vec::new();
+        if let Some(p) = e["pid"].as_u64() {
+            detail.push(format!("pid={p}"));
+        }
+        if let Some(c) = e["exit"]["code"].as_i64() {
+            detail.push(format!("exit={c}"));
+        }
+        if let Some(s) = e["exit"]["signal"].as_i64() {
+            detail.push(format!("signal={s}"));
+        }
+        if let Some(r) = e["restarts"].as_u64().filter(|r| *r > 0) {
+            detail.push(format!("restarts={r}"));
+        }
+        if let Some(r) = e["error"]["reason"].as_str() {
+            detail.push(format!("error={r}"));
+        }
+        if let Some(s) = e["signal"].as_str() {
+            detail.push(format!("signal={s}"));
+        }
+        if let Some(err) = e["error"].as_str() {
+            detail.push(err.to_owned());
+        }
+        rows.push([
+            e["ts_ms"]
+                .as_u64()
+                .map_or_else(|| "-".to_owned(), format_utc),
+            e["app"].as_str().unwrap_or("-").to_owned(),
+            e["instance"]
+                .as_u64()
+                .map_or_else(|| "-".to_owned(), |i| i.to_string()),
+            event,
+            detail.join(" "),
+        ]);
+    }
+    print_rows(&rows);
+}
+
+/// `YYYY-MM-DD HH:MM:SS.mmm` in UTC, without a date library.
+fn format_utc(ms: u64) -> String {
+    let secs = ms / 1000;
+    let days = i64::try_from(secs / 86_400).unwrap_or(0);
+    let rem = secs % 86_400;
+    // Howard Hinnant's civil_from_days.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02}:{:02}.{:03}",
+        rem / 3600,
+        rem % 3600 / 60,
+        rem % 60,
+        ms % 1000
+    )
+}
+
+fn parse_duration(s: &str) -> Result<std::time::Duration, String> {
+    let (num, unit) = s.split_at(s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len()));
+    let n: u64 = num
+        .parse()
+        .map_err(|_| format!("expected a number with s/m/h/d, got {s:?}"))?;
+    let mult = match unit {
+        "s" | "" => 1,
+        "m" => 60,
+        "h" => 3600,
+        "d" => 86_400,
+        _ => return Err(format!("unknown unit {unit:?}; use s, m, h or d")),
+    };
+    Ok(std::time::Duration::from_secs(n.saturating_mul(mult)))
+}
+
+fn print_rows<const N: usize>(rows: &[[String; N]]) {
+    let widths: Vec<usize> = (0..N)
+        .map(|c| rows.iter().map(|r| r[c].len()).max().unwrap_or(0))
+        .collect();
+    for r in rows {
+        let line: Vec<String> = r
+            .iter()
+            .zip(&widths)
+            .map(|(cell, w)| format!("{cell:<w$}"))
+            .collect();
+        println!("{}", line.join("  ").trim_end());
     }
 }
 
@@ -233,17 +393,7 @@ fn print_table(apps: &[AppStatus]) {
             ]);
         }
     }
-    let widths: Vec<usize> = (0..5)
-        .map(|c| rows.iter().map(|r| r[c].len()).max().unwrap_or(0))
-        .collect();
-    for r in rows {
-        let line: Vec<String> = r
-            .iter()
-            .zip(&widths)
-            .map(|(cell, w)| format!("{cell:<w$}"))
-            .collect();
-        println!("{}", line.join("  ").trim_end());
-    }
+    print_rows(&rows);
 }
 
 fn fail(msg: &str) -> ExitCode {
@@ -253,4 +403,34 @@ fn fail(msg: &str) -> ExitCode {
 
 fn exit_code(code: i32) -> ExitCode {
     ExitCode::from(u8::try_from(code).unwrap_or(1))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn utc_formatting() {
+        assert_eq!(format_utc(0), "1970-01-01 00:00:00.000");
+        assert_eq!(format_utc(951_782_400_123), "2000-02-29 00:00:00.123");
+        assert_eq!(format_utc(1_792_655_356_357), "2026-10-22 07:49:16.357");
+    }
+
+    #[test]
+    fn durations() {
+        assert_eq!(
+            parse_duration("90").ok(),
+            Some(std::time::Duration::from_secs(90))
+        );
+        assert_eq!(
+            parse_duration("10m").ok(),
+            Some(std::time::Duration::from_secs(600))
+        );
+        assert_eq!(
+            parse_duration("7d").ok(),
+            Some(std::time::Duration::from_secs(604_800))
+        );
+        assert!(parse_duration("3w").is_err());
+        assert!(parse_duration("h").is_err());
+    }
 }

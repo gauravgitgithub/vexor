@@ -206,10 +206,9 @@ async fn session(
     let next_seq = out.next_seq();
     let mut cursor = match resume {
         Some(r) if r.shim_start == me.start && r.last_seq < next_seq => r.last_seq + 1,
-        // Fresh daemon: current snapshot, then new events only.
-        None => next_seq,
-        // The daemon followed an earlier shim: replay everything buffered.
-        Some(_) => 0,
+        // No position, or one from an earlier shim: replay everything
+        // still buffered (the daemon ignores events it already stored).
+        _ => 0,
     };
     let welcome = FromShim::Welcome {
         protocol: PROTOCOL,

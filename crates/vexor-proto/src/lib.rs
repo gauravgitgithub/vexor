@@ -21,7 +21,8 @@ pub const MAX_LINE: usize = 1024 * 1024;
 pub enum ToShim {
     /// First message on every connection. With `resume`, the shim replays
     /// buffered events after `last_seq`, provided it is the same shim
-    /// incarnation (`shim_start`); otherwise it replays everything it has.
+    /// incarnation (`shim_start`). Otherwise, or without `resume`, it
+    /// replays everything it still has buffered.
     Hello {
         protocol: u32,
         resume: Option<Resume>,
@@ -102,6 +103,12 @@ pub enum Request {
         target: Target,
     },
     List,
+    /// Stored event history, newest `limit` events, oldest first.
+    Events {
+        app: Option<String>,
+        since_ms: Option<u64>,
+        limit: u32,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -114,8 +121,21 @@ pub enum Target {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Response {
-    Ok { apps: Vec<AppStatus> },
-    Error { code: ErrorCode, message: String },
+    Ok {
+        apps: Vec<AppStatus>,
+        /// Problems the operator should know about (e.g. history reset).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        warnings: Vec<String>,
+    },
+    Events {
+        events: Vec<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        warnings: Vec<String>,
+    },
+    Error {
+        code: ErrorCode,
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

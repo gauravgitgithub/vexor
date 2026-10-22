@@ -91,9 +91,17 @@ impl Output {
     }
 
     pub fn emit(&self, event: &ShimEvent<'_>) {
-        let Ok(value) = serde_json::to_value(event) else {
+        let Ok(mut value) = serde_json::to_value(event) else {
             return;
         };
+        // When it happened, not when the daemon got it (it may be replayed
+        // after a daemon restart).
+        if let serde_json::Value::Object(m) = &mut value {
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis());
+            m.insert("ts_ms".into(), serde_json::json!(ts));
+        }
         if self.0.echo_stdout {
             // A closed stdout must not stop supervision.
             let mut out = std::io::stdout().lock();

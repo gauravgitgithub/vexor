@@ -17,6 +17,7 @@ use tokio::sync::{mpsc, watch};
 use vexor_proto::{Desired, FromShim, PROTOCOL, Resume, ToShim};
 use vexor_shim::{Identity, Paths};
 
+use crate::events::Events;
 use crate::log::Log;
 
 /// How long to wait for a newly launched shim's socket.
@@ -75,6 +76,9 @@ pub struct Follower {
     pub spec: PathBuf,
     pub paths: Paths,
     pub log: Log,
+    pub events: Events,
+    /// Last stored position in this app's shim event stream.
+    pub resume: Option<Resume>,
     pub live: Live,
     pub desired: watch::Receiver<Desired>,
     pub commands: mpsc::Receiver<ToShim>,
@@ -82,7 +86,7 @@ pub struct Follower {
 
 impl Follower {
     pub async fn run(mut self) {
-        let mut resume: Option<Resume> = None;
+        let mut resume = self.resume.take();
         let mut unreachable_reported = false;
         let mut last_error: Option<String> = None;
         loop {
@@ -312,6 +316,11 @@ impl Follower {
                     });
                 }
                 self.live.connected(shim_pid, snapshot.clone());
+                self.events.record_daemon(
+                    Some(&self.name),
+                    "shim_connected",
+                    json!({ "shim_pid": shim_pid }),
+                );
                 self.log.write(json!({
                     "type": "shim_connected",
                     "app": self.name,
@@ -323,6 +332,8 @@ impl Follower {
             FromShim::Event { seq, event } => {
                 if let Some(r) = resume.as_mut() {
                     r.last_seq = seq;
+                    self.events
+                        .record_shim(&self.name, r.shim_start, seq, event.clone());
                 }
                 self.live.state_event(&event);
                 self.log.write(json!({
@@ -333,6 +344,11 @@ impl Follower {
                 }));
             }
             FromShim::Gap { from, to } => {
+                self.events.record_daemon(
+                    Some(&self.name),
+                    "event_gap",
+                    json!({ "from": from, "to": to }),
+                );
                 self.log.write(json!({
                     "type": "event_gap",
                     "app": self.name,

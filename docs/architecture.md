@@ -292,20 +292,24 @@ schema version is refused rather than downgraded.
 - Owned by one dedicated writer thread fed by a bounded channel. Lifecycle code
   never waits on SQLite. If the channel is full, events are counted as dropped
   and the count is reported, not hidden.
-- Restart budgets come from the restart events inside the window, so crash-loop
-  protection survives a daemon crash or restart. That was the reason to bring
-  SQLite in.
+- Crash-loop budgets are enforced by the shim, which survives daemon
+  restarts (§7), so they don't depend on this database. Its jobs are
+  history, resuming the shim event stream, and later metrics (Phase 6b).
+- Every shim event is stored together with the app's resume cursor
+  (`shim_start`, `last_seq`) in one transaction. A restarted daemon resumes
+  from the cursor; without one it asks for the whole shim buffer, and
+  `UNIQUE (app, shim_start, seq)` drops anything already stored.
 - Retention: prune by age (default 30 days) and row cap (default 1M) on a timer.
-- `vexor events [app] [--since] [--json]` queries it. `doctor` runs
-  `PRAGMA quick_check`.
+- `vexor events [app] [--since 2h] [--limit N] [--json]` queries it.
+  `PRAGMA quick_check` runs at every daemon start.
 
 Failure rules:
 - Corrupt or newer-schema `state.json` → the daemon refuses to start, keeps the
   file, and prints a recovery hint (`vexor doctor`). It never truncates.
-- `events.db` unavailable or corrupt → supervision continues in degraded mode
-  (restart budgets fall back to in-memory counters), and `status`/`doctor`/metrics
-  flag it. The bad file is renamed `events.db.corrupt-<ts>`, never deleted, and
-  a fresh one is created.
+- `events.db` corrupt → renamed `events.db.corrupt-<ts>` (never deleted), a
+  fresh one is created, and CLI responses carry a warning for the rest of the
+  daemon's life. If no database can be opened at all, supervision continues
+  without history and the warning says so.
 - `doctor` warns when `$VEXOR_HOME` is on a network filesystem, because SQLite
   WAL is unsafe there.
 

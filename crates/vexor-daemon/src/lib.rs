@@ -5,6 +5,7 @@
 //! shim in line with its desired state. Killing or restarting the daemon
 //! leaves shims and apps untouched; a new daemon reconnects.
 
+mod events;
 mod follower;
 mod log;
 mod state;
@@ -25,6 +26,7 @@ use vexor_proto::{
 };
 use vexor_shim::Paths;
 
+use events::Events;
 use follower::{Follower, Live};
 use log::Log;
 use state::{AppEntry, Store};
@@ -125,9 +127,14 @@ async fn run_async(home: PathBuf) -> i32 {
         .iter()
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
+    let events = Events::open(&home);
+    for w in events.warnings() {
+        log.write(json!({ "type": "warning", "message": w }));
+    }
     let daemon = Arc::new(Daemon {
         home: home.clone(),
         log: log.clone(),
+        events: events.clone(),
         store: Mutex::new(store),
         apps: StdMutex::new(BTreeMap::new()),
     });
@@ -137,6 +144,7 @@ async fn run_async(home: PathBuf) -> i32 {
         }
     }
     log.write(json!({ "type": "daemon_started", "pid": std::process::id() }));
+    events.record_daemon(None, "daemon_started", json!({ "pid": std::process::id() }));
 
     let server = tokio::spawn(serve(listener, daemon.clone()));
     // Stopping the daemon leaves shims and apps running.
@@ -153,6 +161,7 @@ async fn run_async(home: PathBuf) -> i32 {
 struct Daemon {
     home: PathBuf,
     log: Log,
+    events: Events,
     /// Desired state. Held for the whole of every mutating request, which
     /// serializes them (docs/architecture.md §9).
     store: Mutex<Store>,
@@ -190,6 +199,8 @@ impl Daemon {
             spec: spec_path,
             paths: Paths::new(&self.home, name),
             log: self.log.clone(),
+            events: self.events.clone(),
+            resume: self.events.resume(name),
             live: live.clone(),
             desired: desired_rx,
             commands: cmd_rx,
@@ -208,6 +219,17 @@ impl Daemon {
             old.task.abort();
         }
         Ok(())
+    }
+
+    fn ok(&self, apps: Vec<AppStatus>) -> Response {
+        Response::Ok {
+            apps,
+            warnings: self.events.warnings(),
+        }
+    }
+
+    fn ok_one(&self, status: Option<AppStatus>) -> Response {
+        self.ok(status.into_iter().collect())
     }
 
     fn spec_path(&self, name: &str) -> PathBuf {
@@ -247,7 +269,26 @@ impl Daemon {
                     .keys()
                     .filter_map(|n| self.status(&store, n))
                     .collect();
-                Response::Ok { apps }
+                self.ok(apps)
+            }
+            Request::Events {
+                app,
+                since_ms,
+                limit,
+            } => {
+                let events = self.events.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    events.query(app.as_deref(), since_ms, limit)
+                })
+                .await;
+                match result {
+                    Ok(Ok(events)) => Response::Events {
+                        events,
+                        warnings: self.events.warnings(),
+                    },
+                    Ok(Err(e)) => error(ErrorCode::Internal, e),
+                    Err(e) => error(ErrorCode::Internal, e.to_string()),
+                }
             }
             Request::Start { spec } => self.start_new(*spec).await,
             Request::StartExisting { target } => self.for_each(target, Op::StartExisting).await,
@@ -286,7 +327,7 @@ impl Daemon {
             .filter_map(|n| self.status(&store, n))
             .collect();
         match failed.len() {
-            0 => Response::Ok { apps },
+            0 => self.ok(apps),
             n if n == names.len() => error(ErrorCode::Internal, failed.join("; ")),
             _ => error(ErrorCode::Partial, failed.join("; ")),
         }
@@ -309,7 +350,7 @@ impl Daemon {
                 );
             }
             return match self.start_existing(&mut store, &name).await {
-                Ok(()) => ok_one(self.status(&store, &name)),
+                Ok(()) => self.ok_one(self.status(&store, &name)),
                 Err(e) => error(ErrorCode::Internal, e),
             };
         }
@@ -326,12 +367,14 @@ impl Daemon {
             return error(ErrorCode::Internal, e);
         }
         self.log.write(json!({ "type": "app_added", "app": name }));
+        self.events
+            .record_daemon(Some(&name), "app_added", json!({}));
         if let Err(e) = self.wait_connected(&name).await {
             return error(ErrorCode::Internal, e);
         }
         self.wait_settled(&name, entry.spec.instances, None, START_WAIT)
             .await;
-        ok_one(self.status(&store, &name))
+        self.ok_one(self.status(&store, &name))
     }
 
     async fn start_existing(&self, store: &mut Store, name: &str) -> Result<(), String> {
@@ -399,6 +442,8 @@ impl Daemon {
         let _ = std::fs::remove_file(self.spec_path(name));
         self.log
             .write(json!({ "type": "app_deleted", "app": name }));
+        self.events
+            .record_daemon(Some(name), "app_deleted", json!({}));
         Ok(())
     }
 
@@ -510,12 +555,6 @@ fn error(code: ErrorCode, message: impl Into<String>) -> Response {
     Response::Error {
         code,
         message: message.into(),
-    }
-}
-
-fn ok_one(status: Option<AppStatus>) -> Response {
-    Response::Ok {
-        apps: status.into_iter().collect(),
     }
 }
 

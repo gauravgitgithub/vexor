@@ -355,3 +355,153 @@ fn corrupt_state_stops_the_daemon_and_is_kept() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("untouched"));
     assert_eq!(std::fs::read(&state).expect("read"), b"{oops");
 }
+
+// ------------------------------------------------------------ event history
+
+fn now_ms() -> u64 {
+    u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_millis(),
+    )
+    .expect("fits")
+}
+
+fn kill_daemon(env: &Env) {
+    let pid = env.daemon_pid().expect("daemon pid");
+    let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+    wait_dead(pid);
+}
+
+fn events(env: &Env, app: &str) -> Vec<Value> {
+    serde_json::from_str(&env.ok(&["events", app, "--json", "--limit", "1000"])).expect("json")
+}
+
+#[test]
+fn crash_budget_and_history_survive_a_daemon_kill() {
+    let env = Env::new();
+    let script = env.script("crash.sh", "#!/bin/sh\necho run\nexit 1\n");
+    let spec = env.work.path().join("crash.json");
+    let json = serde_json::json!({
+        "name": "crash",
+        "exec": script,
+        "cwd": env.work.path(),
+        "env": { "PATH": "/usr/bin:/bin" },
+        "logs": { "out": env.work.path().join("crash.out"), "err": env.work.path().join("crash.err") },
+        "policy": { "max_restarts": 3 },
+    });
+    std::fs::write(&spec, json.to_string()).expect("spec");
+    env.ok(&["start", "--spec", &spec.to_string_lossy()]);
+
+    // Kill the daemon mid-loop; the shim keeps counting.
+    std::thread::sleep(Duration::from_millis(1500));
+    let killed_at = now_ms();
+    kill_daemon(&env);
+    std::thread::sleep(Duration::from_millis(1500));
+    let back_at = now_ms();
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let app = loop {
+        let app = env.app("crash"); // restarts the daemon
+        if states(&app) == ["errored"] {
+            break app;
+        }
+        assert!(Instant::now() < deadline, "never errored: {app}");
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert_eq!(app["snapshot"][0]["restarts"], 3, "{app}");
+    let runs = std::fs::read_to_string(env.work.path().join("crash.out")).expect("out");
+    assert_eq!(runs.lines().count(), 4, "1 start + 3 restarts");
+
+    // History: every shim event exactly once, in order, including the ones
+    // that happened while no daemon was running.
+    let history: Vec<Value> = events(&env, "crash")
+        .into_iter()
+        .filter(|e| e["type"] == "state")
+        .collect();
+    let starts = history.iter().filter(|e| e["state"] == "starting").count();
+    assert_eq!(starts, 4, "{history:#?}");
+    assert_eq!(
+        history.last().map(|e| e["state"].clone()),
+        Some("errored".into())
+    );
+    let during_outage = history
+        .iter()
+        .filter_map(|e| e["ts_ms"].as_u64())
+        .filter(|t| (killed_at..back_at).contains(t))
+        .count();
+    assert!(during_outage > 0, "no events recorded from the outage");
+    // All from one shim: sequence numbers of every stored shim event are
+    // contiguous from 0, so nothing is missing or duplicated.
+    let all = events(&env, "crash");
+    let shim_events: Vec<&Value> = all.iter().filter(|e| e["seq"].is_u64()).collect();
+    let starts: std::collections::BTreeSet<u64> = shim_events
+        .iter()
+        .filter_map(|e| e["shim_start"].as_u64())
+        .collect();
+    assert_eq!(starts.len(), 1, "one shim");
+    let seqs: Vec<u64> = shim_events
+        .iter()
+        .filter_map(|e| e["seq"].as_u64())
+        .collect();
+    let expected: Vec<u64> = (0..u64::try_from(seqs.len()).expect("fits")).collect();
+    assert_eq!(seqs, expected, "gaps or duplicates in stored history");
+}
+
+#[test]
+fn corrupt_event_history_is_kept_and_supervision_continues() {
+    let env = Env::new();
+    env.ok(&["start", "loop.sh"]);
+    let pid = pids(&env.app("loop"))[0];
+    kill_daemon(&env);
+    let db = env.home.path().join("events.db");
+    for side in ["events.db-wal", "events.db-shm"] {
+        let _ = std::fs::remove_file(env.home.path().join(side));
+    }
+    std::fs::write(&db, vec![0x42; 8192]).expect("corrupt");
+
+    let out = env.run(&["list", "--json"]);
+    assert!(out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("event history was unreadable"), "{stderr}");
+    let app = env.app("loop");
+    assert_eq!(pids(&app), [pid], "the app must not be restarted");
+    let kept: Vec<_> = std::fs::read_dir(env.home.path())
+        .expect("home")
+        .flatten()
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with("events.db.corrupt-")
+        })
+        .collect();
+    assert_eq!(kept.len(), 1);
+    assert_eq!(
+        std::fs::read(kept[0].path()).expect("kept"),
+        vec![0x42; 8192]
+    );
+    // New history is recorded in the fresh file.
+    env.ok(&["restart", "loop"]);
+    assert!(events(&env, "loop").iter().any(|e| e["state"] == "online"));
+}
+
+#[test]
+fn events_command_table_and_filters() {
+    let env = Env::new();
+    env.ok(&["start", "loop.sh", "--name", "one"]);
+    env.ok(&["start", "loop.sh", "--name", "two"]);
+    let table = env.ok(&["events", "one"]);
+    assert!(table.starts_with("TIME (UTC)"), "{table}");
+    assert!(table.contains("online"), "{table}");
+    assert!(!table.contains("two"), "{table}");
+    std::thread::sleep(Duration::from_millis(1500));
+    env.ok(&["restart", "two"]);
+    let recent = env.ok(&["events", "--since", "1s", "--json"]);
+    let recent: Vec<Value> = serde_json::from_str(&recent).expect("json");
+    assert!(!recent.is_empty());
+    assert!(recent.iter().all(|e| e["app"] == "two"), "{recent:#?}");
+    let limited: Vec<Value> =
+        serde_json::from_str(&env.ok(&["events", "--limit", "2", "--json"])).expect("json");
+    assert_eq!(limited.len(), 2);
+}

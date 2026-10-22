@@ -10,11 +10,11 @@ publish.workspace = true
 clap = { version = "4.6.7", features = ["derive"] }
 rustix = { version = "1.1.5", features = ["process"] }
 serde_json = "1.0.154"
-vexor-core = { version = "0.0.0", path = "../vexor-core" }
-vexor-daemon = { version = "0.0.0", path = "../vexor-daemon" }
-vexor-pm2 = { version = "0.0.0", path = "../vexor-pm2" }
-vexor-proto = { version = "0.0.0", path = "../vexor-proto" }
-vexor-shim = { version = "0.0.0", path = "../vexor-shim" }
+vexor-core = { path = "../vexor-core" }
+vexor-daemon = { path = "../vexor-daemon" }
+vexor-pm2 = { path = "../vexor-pm2" }
+vexor-proto = { path = "../vexor-proto" }
+vexor-shim = { path = "../vexor-shim" }
 
 [lints]
 workspace = true

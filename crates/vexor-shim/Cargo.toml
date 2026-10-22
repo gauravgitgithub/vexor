@@ -13,8 +13,8 @@ rustix = { version = "1.1.5", features = ["fs", "process"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 tokio = { version = "1.54.1", features = ["rt", "macros", "process", "time", "signal", "io-util", "sync", "net", "fs"] }
-vexor-core = { version = "0.0.0", path = "../vexor-core" }
-vexor-proto = { version = "0.0.0", path = "../vexor-proto" }
+vexor-core = { path = "../vexor-core" }
+vexor-proto = { path = "../vexor-proto" }
 
 [lints]
 workspace = true

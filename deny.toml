@@ -24,6 +24,9 @@ confidence-threshold = 0.9
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# Internal crates refer to each other by path only; they are never published
+# (publish = false). Registry wildcards are still denied.
+allow-wildcard-paths = true
 
 [sources]
 unknown-registry = "deny"

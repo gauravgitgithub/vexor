@@ -30,3 +30,4 @@ Vexor defaults address each row. These are design targets until tests verify the
 | T9 | Tampered binary / supply chain | no postinstall, binaries ship inside npm platform packages (npm provenance); release tarballs with SHA-256 + GitHub artifact attestations; `cargo-deny`/`cargo-audit` + `npm audit` in CI; SBOM (CycloneDX) per release | release workflow checks |
 | T10 | Resource exhaustion (restart storm, log flood, IPC flood) | crash-loop budget, bounded log buffers + disk caps, IPC frame limit 4 MiB, per-connection rate limit | fault-injection suite |
 | T11 | Optional metrics endpoint exposed | binds 127.0.0.1 by default; non-loopback requires explicit config + warning | bind test |
+| T12 | Alert channel credentials (SMTP password, webhook secrets) leak via config, logs or dashboard | stored in a 0600 file or read from an env var/file reference; redacted everywhere; webhooks HMAC-signed so receivers can verify them | canary-secret golden tests (plan 6b.4) |

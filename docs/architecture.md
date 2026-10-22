@@ -279,7 +279,7 @@ so each gets its own store.
 | Store | Holds | Write pattern | Authority |
 |---|---|---|---|
 | `state.json` | app definitions, resolved config, identity records | rare (user commands), whole-document rewrite | **authoritative** for what should run |
-| `events.db` (SQLite, rusqlite bundled, WAL) | lifecycle events (start/exit/restart with code, signal, uptime), restart-budget window, operation log, migration journal | frequent, small appends | history only |
+| `events.db` (SQLite, rusqlite bundled, WAL) | lifecycle events (start/exit/restart with code, signal, uptime), restart-budget window, operation log, migration journal, process metrics with rollups (plan Phase 6b) | frequent, small appends | history only |
 
 `state.json`: written via temp file + `fsync` + `rename` + dir `fsync`, mode
 0600, with a schema version and checksum. It stays human-readable and

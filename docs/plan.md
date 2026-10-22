@@ -31,6 +31,39 @@ dry-run, backup, journaled apply, rollback (docs/migration.md).
 ## Phase 6: hardening
 HTTP/TCP health checks, readiness-gated reload, max_memory_restart, watch, cron_restart, metrics endpoint, `doctor`, fault-injection suite, uid/gid review, Windows feasibility study.
 
+## Phase 6b: observability and alerting
+
+Goal: an advanced, self-hosted `pm2 monit`. Admins get warning, danger, and
+recovered ("green") alerts, plus a timeline that helps with root-cause
+analysis. PM2 offers alerting only in the paid PM2 Plus. Everything runs
+locally; no SaaS.
+
+| Step | Deliverable | Acceptance |
+|---|---|---|
+| 6b.1 | Per-process metrics: CPU, RSS, open FDs, restarts, uptime, health results. Sampled by the shim (default every 5 s), stored by the daemon | Sampling 100 processes adds < 1% of one core; counted as supervisor overhead in benchmark B3 |
+| 6b.2 | Time-series storage in `events.db` (SQLite) with rollups: raw 5 s for 24 h, 1 min for 7 days, 1 h for 90 days; size cap | 100 processes × 30 days stays under a documented size; a 24 h chart query for one process returns in < 100 ms |
+| 6b.3 | Alert rules (`vexor.alerts.yaml`): thresholds with `warning` / `danger` levels and a `for:` duration; built-in rules for crash loop, restart rate, memory, CPU, unhealthy, log disk usage | Fires once per incident, sends "recovered" when it clears; dedup, cooldown and flap damping covered by tests |
+| 6b.4 | Channels: email (SMTP with STARTTLS) and webhook (JSON, HMAC-signed); Slack after that | Channel credentials are never logged or shown in `describe`/`doctor` (security.md T3); a failed delivery is retried with backoff and reported |
+| 6b.5 | Per-route attribution from the app's existing structured JSON logs (pino/winston: route, status, duration). Field mapping is configurable; apps need no code changes | Error rate and p95 latency per route on the timeline; logs that aren't JSON are reported as "no route data", never guessed |
+| 6b.6 | Local dashboard: one timeline per process (CPU/memory, restarts, deploys/reloads, health, error bursts per route, alerts) | Binds 127.0.0.1 by default and requires login; non-loopback needs explicit config (security.md T11) |
+| 6b.7 | Export: Prometheus `/metrics`, and OpenTelemetry (OTLP) ingestion for apps that already emit traces | Works with an existing Grafana/Prometheus setup |
+
+Decisions and limits:
+- **Storage: SQLite, not DuckDB, inside the supervisor.** The workload is
+  frequent small, crash-safe writes, plus range queries per process.
+  DuckDB would add tens of MB of C++ to the binary, defaults to using up to
+  80% of RAM, and complicates the static builds. Heavy analytics go through
+  export (Parquet, Prometheus, OTLP), or an optional separate tool that
+  queries the data with DuckDB.
+- **Vexor sees processes, not requests.** Without the app's structured logs
+  or OpenTelemetry data, it can't say which API endpoint is slow or failing,
+  and it says so instead of guessing.
+- **"Root cause" means a correlated timeline** (for example: deploy at 14:02 →
+  memory climb → crash loop → errors on `/api/orders`). Vexor does not claim
+  automatic root-cause detection.
+- Alerting and the dashboard run in the daemon, not the shims, so app
+  supervision never depends on them. Both can be turned off.
+
 ## Phase 7: benchmarks (docs/benchmarks.md) · Phase 8: release readiness
 
 ## Decisions needed before Phase 2

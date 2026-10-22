@@ -27,7 +27,8 @@ Gaps Vexor can defend:
 2. **Live PM2 migration with rollback.** No `dump.pm2` migration was found in OxMgr (based on code search, so likely but not certain). Dry-run, backup, journaled cutover and rollback are unoccupied.
 3. **Faithful PM2 semantics instead of a new config dialect.** OxMgr cluster mode rejects `node_args`, and its TOML is the primary format. Vexor keeps ecosystem files as the first-class format and runs a conformance suite against PM2.
 4. **Install without scripts.** Platform `optionalDependencies` (esbuild/biome pattern) work under `--ignore-scripts` and locked-down CI. OxMgr uses `postinstall`.
-5. **Secure defaults vs PM2**: 0600 state, no shell-env capture, redaction (see security.md). PID-identity hardening only becomes a claim once tested.
+5. **Self-hosted alerting and an incident timeline.** PM2's free `monit` is a live terminal view with no history and no alerts; alerting is in the paid PM2 Plus. Vexor plans local alerts (warning/danger/recovered over email and webhook) and a per-process timeline, with per-route attribution from the app's existing JSON logs (plan Phase 6b). Whether OxMgr or Super already cover this hasn't been checked yet; to verify before the claim goes public.
+6. **Secure defaults vs PM2**: 0600 state, no shell-env capture, redaction (see security.md). PID-identity hardening only becomes a claim once tested.
 
 Not building: SaaS/APM, AI features, git/webhook deploy, remote multi-host control plane, a cgroup/journald replacement (generate systemd units instead), `pm2 serve`, a module marketplace, benchmark-led marketing.
 

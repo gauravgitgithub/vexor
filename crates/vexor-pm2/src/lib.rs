@@ -482,6 +482,8 @@ pub fn translate(app: &Value, ctx: &Context) -> Result<Translated, Vec<Note>> {
                     "no interpreter, so interpreter arguments are not used",
                 );
             }
+            // A script path is used as written (not resolved through
+            // symlinks, so `current -> releases/N` deploys keep working).
             // A bare command name (`script: "npm"`) is looked up on PATH,
             // unless it already failed for lack of an interpreter.
             let needs_interpreter = matches!(ext, "ts" | "coffee" | "ls");

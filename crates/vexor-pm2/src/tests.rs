@@ -49,10 +49,9 @@ fn basic_fork_app() {
     .expect("ok");
     let s = &t.spec;
     assert_eq!(s.name, "api");
-    assert_eq!(
-        s.exec,
-        PathBuf::from("/bin/sleep").canonicalize().expect("sleep")
-    );
+    // A script path is kept as written, not resolved through symlinks:
+    // deploys often point at a `current -> releases/N` symlink.
+    assert_eq!(s.exec, PathBuf::from("/bin/sleep"));
     assert_eq!(s.args, ["10", "two words"]);
     assert_eq!(s.cwd, dir.path().join("sub"));
     assert_eq!(s.env["PORT"], "3000");

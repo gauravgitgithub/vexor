@@ -55,8 +55,10 @@ vexor (CLI) ──unix socket (0600, peer-cred)──▶ vexor daemon  (control 
 - **NODE_CHANNEL_FD**: for Node apps the shim creates a socketpair and sets
   `NODE_CHANNEL_FD` (JSON serialization). Node then gives the app a working
   `process.send`. That makes PM2's `wait_ready` (`process.send('ready')`) and
-  `shutdown_with_message` work without a Node master process. Node has
-  supported this mechanism since 0.x. To verify in the Phase 2 legacy matrix.
+  `shutdown_with_message` work without a Node master process. Verified
+  manually on Node 8, 12, 16 and 24 (`tests/legacy/node-smoke.sh`). An
+  open channel does not keep the app alive unless the app listens for
+  messages, same as under PM2.
 
 ## 3. Crate layout (minimal; split only when a boundary pays for itself)
 

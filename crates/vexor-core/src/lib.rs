@@ -6,6 +6,7 @@
 
 pub mod lifecycle;
 pub mod restart;
+pub mod spec;
 pub mod time;
 
 pub use lifecycle::{
@@ -13,4 +14,5 @@ pub use lifecycle::{
     State, Timer,
 };
 pub use restart::{Backoff, Jitter, MIN_RESTART_INTERVAL, RestartPolicy};
+pub use spec::{AppSpec, LogSpec, PolicySpec};
 pub use time::Millis;

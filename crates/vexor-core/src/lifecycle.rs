@@ -8,10 +8,13 @@
 
 use std::time::Duration;
 
+use serde::Serialize;
+
 use crate::restart::RestartPolicy;
 use crate::time::Millis;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum State {
     Stopped,
     /// Spawn requested; waiting for the process to start and, if readiness is
@@ -38,7 +41,7 @@ pub enum Desired {
 }
 
 /// How a process ended. Both fields are `None` when it never started.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
 pub struct ExitStatus {
     pub code: Option<i32>,
     pub signal: Option<i32>,
@@ -102,7 +105,8 @@ pub enum Effect {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(tag = "reason", rename_all = "snake_case")]
 pub enum ErrorReason {
     /// `unstable_runs` consecutive runs were shorter than `min_uptime` (or
     /// never became ready).

@@ -9,6 +9,8 @@ Three separate questions, always answered separately:
 Status values: `planned` (spec only), `tested` (green in CI), `qualified` (works with stated limits), `unsupported`.
 Every row below is `planned` until CI says otherwise.
 
+Manual spot checks so far (2026-10-22, not yet CI): the static linux-arm64 musl binary on Alpine with Node 8.17, 12.22, 16.20 and 24.22 handled `process.send('ready')`, natural exit, and graceful SIGTERM correctly. The full shim suite passed on Linux arm64 (Debian bookworm, Node 18.20) and macOS arm64 (Node 24.22).
+
 ## 1. Platform matrix (Layer A binary)
 
 | Target | Build | Tier | Notes |

@@ -60,8 +60,8 @@ The wrapper is a zero-dependency ES5 script with no `postinstall` and no network
 | list / ls / status | same | `--json` stable schema |
 | logs | same | Implemented: `--lines`, `--follow`, `--raw`, `--err/--out`; all apps when no name. Output is prefixed `app|out` / `app|err` (PM2 uses `id|app`) |
 | describe / show | same | Implemented: env values hidden unless `--show-env`; `--json` |
-| save / resurrect | same | |
-| startup / unstartup | same | systemd/launchd only |
+| save / resurrect | same | Implemented. Vexor already restores apps from its own state whenever the daemon starts; `save` writes an explicit snapshot (`dump.json`, 0600) and `resurrect` restores from it (adds missing apps, starts those saved running, leaves differently configured apps alone) |
+| startup / unstartup | same | Implemented for systemd (system unit, needs root: prints the `sudo` command otherwise) and launchd (per-user LaunchAgent). Stopping the service stops only the daemon, never the apps. OpenRC/upstart/SysV: not supported |
 | scale | same | cluster mode |
 | flush / reloadLogs | same | |
 | monit | `vexor top` | simple TUI later |

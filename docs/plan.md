@@ -43,6 +43,8 @@ Open:
 
 4.4 ✅ `vexor logs [name] [--lines N] [--follow] [--out|--err] [--raw]` (tail reads backwards in chunks; rotated `.1` fills in short files; follow survives rotation and truncation) and `vexor describe <name> [--json] [--show-env]` (config, live status with uptime, policy in words, log settings, recent events; env values hidden by default). `vexor list` gains an UPTIME column; event history is ordered by event time. Tested: unit tests for tail/follow/rotation/truncation; CLI tests for describe redaction and JSON, per-stream tails, and following 1,500+ lines across 3+ rotations with no gap or duplicate. A mutant follower that ignores rotation fails both.
 
+4.5 ✅ `vexor save` / `resurrect` (explicit `dump.json` snapshot, 0600; the daemon already restores apps from its own state at every start), `vexor startup [systemd|launchd]` / `unstartup` (systemd system unit `vexor-<user>.service` with `KillMode=process`, so stopping the service never stops apps; per-user LaunchAgent with `AbandonProcessGroup`; non-root on systemd prints the exact `sudo` command). Tested: unit tests for the generated files (quoting, escaping, `plutil -lint` on macOS); CLI tests for save/resurrect (desired state kept, idempotent) and `startup --print`; a real systemd run in a container: verify, install, stop keeps the app, start reconnects to the same app, killed daemon restarted, unstartup leaves apps running. launchd install not run live (it would add a login item on the dev machine).
+
 Remaining: 
 ## Phase 5: migration
 dry-run, backup, journaled apply, rollback (docs/migration.md).

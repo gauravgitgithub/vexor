@@ -45,6 +45,8 @@ pub mod exit {
 pub const SOCKET: &str = "daemon.sock";
 /// Name of the daemon lock inside the home directory.
 pub const LOCK: &str = "daemon.lock";
+/// `vexor save` snapshot inside the home directory.
+pub const DUMP: &str = "dump.json";
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long `start` waits for the shim to come up.
@@ -272,6 +274,8 @@ impl Daemon {
                     .collect();
                 self.ok(apps)
             }
+            Request::Save => self.save().await,
+            Request::Resurrect => self.resurrect().await,
             Request::Describe { name } => {
                 let (status, spec) = {
                     let store = self.store.lock().await;
@@ -463,6 +467,88 @@ impl Daemon {
             self.wait_settled(name, instances, None, START_WAIT).await;
         }
         Ok(())
+    }
+
+    fn dump_path(&self) -> PathBuf {
+        self.home.join(DUMP)
+    }
+
+    async fn save(&self) -> Response {
+        let store = self.store.lock().await;
+        let dump = state::Dump::of(store.apps());
+        if let Err(e) = dump.write(&self.dump_path()) {
+            return error(ErrorCode::Internal, format!("cannot write {DUMP}: {e}"));
+        }
+        self.log
+            .write(json!({ "type": "saved", "apps": store.apps().len() }));
+        let apps = store
+            .apps()
+            .keys()
+            .filter_map(|n| self.status(&store, n))
+            .collect();
+        self.ok(apps)
+    }
+
+    async fn resurrect(&self) -> Response {
+        let dump = match state::Dump::read(&self.dump_path()) {
+            Ok(Some(d)) => d,
+            Ok(None) => {
+                return error(
+                    ErrorCode::NotFound,
+                    format!("nothing saved yet ({DUMP} not found); run `vexor save` first"),
+                );
+            }
+            Err(e) => return error(ErrorCode::Internal, e),
+        };
+        let mut store = self.store.lock().await;
+        let mut problems = Vec::new();
+        let mut names = Vec::new();
+        for (name, saved) in dump.apps {
+            names.push(name.clone());
+            match store.get(&name).cloned() {
+                Some(current) if current.spec != saved.spec => problems.push(format!(
+                    "{name}: an app with this name exists with a different configuration; left as is"
+                )),
+                Some(_) => {
+                    if saved.desired == Desired::Running
+                        && let Err(e) = self.start_existing(&mut store, &name).await
+                    {
+                        problems.push(format!("{name}: {e}"));
+                    }
+                }
+                None => {
+                    if let Err(e) = store.update(|apps| {
+                        apps.insert(name.clone(), saved.clone());
+                    }) {
+                        problems.push(format!("{name}: cannot save state: {e}"));
+                        continue;
+                    }
+                    if let Err(e) = self.follow(&name, &saved) {
+                        problems.push(format!("{name}: {e}"));
+                        continue;
+                    }
+                    if saved.desired == Desired::Running {
+                        if let Err(e) = self.wait_connected(&name).await {
+                            problems.push(format!("{name}: {e}"));
+                        } else {
+                            self.wait_settled(&name, saved.spec.instances, None, START_WAIT)
+                                .await;
+                        }
+                    }
+                }
+            }
+        }
+        let apps = names
+            .iter()
+            .filter_map(|n| self.status(&store, n))
+            .collect();
+        if problems.is_empty() {
+            self.ok(apps)
+        } else if problems.len() == names.len() {
+            error(ErrorCode::Internal, problems.join("; "))
+        } else {
+            error(ErrorCode::Partial, problems.join("; "))
+        }
     }
 
     /// Replace each instance's process; start-first where the app's policy

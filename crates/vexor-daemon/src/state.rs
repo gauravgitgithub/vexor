@@ -89,6 +89,52 @@ impl Store {
     }
 }
 
+/// `vexor save` snapshot: every app and its desired state.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Dump {
+    version: u32,
+    saved_ms: u64,
+    pub apps: BTreeMap<String, AppEntry>,
+}
+
+impl Dump {
+    pub fn of(apps: &BTreeMap<String, AppEntry>) -> Dump {
+        Dump {
+            version: VERSION,
+            saved_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(0)),
+            apps: apps.clone(),
+        }
+    }
+
+    pub fn write(&self, path: &Path) -> io::Result<()> {
+        let json = serde_json::to_vec_pretty(self).map_err(io::Error::other)?;
+        vexor_shim::write_atomic(path, &json)
+    }
+
+    /// `Ok(None)` if nothing was saved.
+    pub fn read(path: &Path) -> Result<Option<Dump>, String> {
+        match std::fs::read(path) {
+            Ok(bytes) => {
+                let d: Dump = serde_json::from_slice(&bytes)
+                    .map_err(|e| format!("{} is unreadable: {e}", path.display()))?;
+                if d.version != VERSION {
+                    return Err(format!(
+                        "{} has version {}, this vexor supports {VERSION}",
+                        path.display(),
+                        d.version
+                    ));
+                }
+                Ok(Some(d))
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(format!("cannot read {}: {e}", path.display())),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

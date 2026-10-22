@@ -4,6 +4,7 @@ mod client;
 mod describe;
 mod logs;
 mod spec;
+mod startup;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -66,6 +67,33 @@ enum Command {
         /// Machine-readable output.
         #[arg(long)]
         json: bool,
+    },
+    /// Write every app and its desired state to a snapshot (PM2 `save`).
+    /// Vexor also keeps its state on every change; the snapshot is for
+    /// restoring later with `resurrect`.
+    Save,
+    /// Restore apps from the `save` snapshot: add missing ones and start
+    /// those saved as running.
+    Resurrect,
+    /// Start the daemon at boot (systemd) or login (launchd). Prints the
+    /// `sudo` command when root is needed.
+    Startup {
+        /// systemd or launchd [default: detected].
+        init: Option<String>,
+        /// User the daemon runs as [default: you, or SUDO_USER under sudo].
+        #[arg(long)]
+        user: Option<String>,
+        /// Print the service file instead of installing it.
+        #[arg(long)]
+        print: bool,
+    },
+    /// Remove the boot/login service. Running apps are not stopped.
+    Unstartup {
+        /// systemd or launchd [default: detected].
+        init: Option<String>,
+        /// User the service was installed for.
+        #[arg(long)]
+        user: Option<String>,
     },
     /// Show stored lifecycle history (newest last).
     Events {
@@ -233,6 +261,10 @@ fn main() -> ExitCode {
             false,
         ),
         Command::List { json } => send(&home, Request::List, json),
+        Command::Save => send(&home, Request::Save, false),
+        Command::Resurrect => send(&home, Request::Resurrect, false),
+        Command::Startup { init, user, print } => startup_cmd(&home, init, user, Some(print)),
+        Command::Unstartup { init, user } => startup_cmd(&home, init, user, None),
         Command::Describe {
             name,
             json,
@@ -585,6 +617,55 @@ fn logs_cmd(
         return fail(&e.to_string());
     }
     ExitCode::SUCCESS
+}
+
+/// `print`: Some(print_only) for startup, None for unstartup.
+fn startup_cmd(
+    home: &std::path::Path,
+    init: Option<String>,
+    user: Option<String>,
+    print: Option<bool>,
+) -> ExitCode {
+    let init = match init
+        .as_deref()
+        .map_or_else(startup::Init::detect, startup::Init::parse)
+    {
+        Ok(i) => i,
+        Err(e) => return fail(&e),
+    };
+    let user = user
+        .or_else(|| std::env::var("SUDO_USER").ok())
+        .or_else(|| std::env::var("USER").ok());
+    let Some(user) = user else {
+        return fail("cannot tell which user to run as; pass --user");
+    };
+    let exe = match std::env::current_exe().and_then(|e| e.canonicalize()) {
+        Ok(e) => e,
+        Err(e) => return fail(&format!("cannot locate the vexor binary: {e}")),
+    };
+    let home = match std::path::absolute(home) {
+        Ok(h) => h,
+        Err(e) => return fail(&format!("cannot resolve {}: {e}", home.display())),
+    };
+    let target = startup::Target {
+        user,
+        home,
+        exe,
+        user_home: std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_default(),
+    };
+    let result = match print {
+        Some(print_only) => startup::install(init, &target, print_only),
+        None => startup::uninstall(init, &target),
+    };
+    match result {
+        Ok(msg) => {
+            println!("{}", msg.trim_end());
+            ExitCode::SUCCESS
+        }
+        Err(e) => fail(&e),
+    }
 }
 
 fn print_warnings(warnings: &[String]) {

@@ -112,6 +112,12 @@ pub enum Request {
         target: Target,
     },
     List,
+    /// Write every app's configuration and desired state to
+    /// `$VEXOR_HOME/dump.json` (PM2 `save`).
+    Save,
+    /// Restore apps from `dump.json` (PM2 `resurrect`): add missing apps and
+    /// start those saved as running.
+    Resurrect,
     /// One app's configuration, live status and recent events.
     Describe {
         name: String,

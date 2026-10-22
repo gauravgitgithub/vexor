@@ -879,6 +879,7 @@ version = "0.0.0"
 dependencies = [
  "assert_cmd",
  "clap",
+ "rustix",
  "serde_json",
  "tempfile",
  "vexor-core",

@@ -831,3 +831,68 @@ fn logs_follow_keeps_every_line_across_rotation() {
         "gap or duplicate while following across rotation"
     );
 }
+
+// ------------------------------------------- save / resurrect / startup
+
+#[test]
+fn save_and_resurrect_restore_apps_and_their_desired_state() {
+    let env = Env::new();
+    env.ok(&["start", "loop.sh", "--name", "up"]);
+    env.ok(&["start", "loop.sh", "--name", "down"]);
+    env.ok(&["stop", "down"]);
+    let out = env.run(&["resurrect"]);
+    assert_eq!(out.status.code(), Some(1), "nothing saved yet");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("vexor save"));
+
+    env.ok(&["save"]);
+    let dump: Value = serde_json::from_str(
+        &std::fs::read_to_string(env.home.path().join("dump.json")).expect("dump"),
+    )
+    .expect("json");
+    assert_eq!(dump["apps"]["up"]["desired"], "running");
+    assert_eq!(dump["apps"]["down"]["desired"], "stopped");
+    let mode = std::fs::metadata(env.home.path().join("dump.json"))
+        .expect("meta")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600, "the snapshot holds environment values");
+
+    env.ok(&["delete", "all"]);
+    assert!(env.list().is_empty());
+    env.ok(&["resurrect"]);
+    let up = env.app("up");
+    assert_eq!(states(&up), ["online"]);
+    assert_eq!(env.app("down")["desired"], "stopped");
+    // Idempotent: a second resurrect changes nothing.
+    let pid = pids(&up);
+    env.ok(&["resurrect"]);
+    assert_eq!(pids(&env.app("up")), pid);
+}
+
+#[test]
+fn startup_print_generates_a_service_for_this_platform() {
+    let env = Env::new();
+    let init = if cfg!(target_os = "macos") {
+        "launchd"
+    } else {
+        "systemd"
+    };
+    let out = env.ok(&["startup", init, "--print", "--user", "deploy"]);
+    let home = env.home.path().to_string_lossy().into_owned();
+    assert!(out.contains(&home), "{out}");
+    assert!(out.contains("daemon"), "{out}");
+    if init == "systemd" {
+        assert!(
+            out.contains("User=deploy") && out.contains("KillMode=process"),
+            "{out}"
+        );
+    } else {
+        assert!(
+            out.contains("dev.vexor.daemon.deploy") && out.contains("AbandonProcessGroup"),
+            "{out}"
+        );
+    }
+    let bad = env.run(&["startup", "openrc", "--print"]);
+    assert_eq!(bad.status.code(), Some(1));
+}

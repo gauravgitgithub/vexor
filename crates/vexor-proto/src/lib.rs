@@ -112,6 +112,10 @@ pub enum Request {
         target: Target,
     },
     List,
+    /// One app's configuration, live status and recent events.
+    Describe {
+        name: String,
+    },
     /// Stored event history, newest `limit` events, oldest first.
     Events {
         app: Option<String>,
@@ -137,6 +141,14 @@ pub enum Response {
         warnings: Vec<String>,
     },
     Events {
+        events: Vec<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        warnings: Vec<String>,
+    },
+    Describe {
+        status: AppStatus,
+        spec: Box<vexor_core::AppSpec>,
+        /// Most recent events, oldest first.
         events: Vec<serde_json::Value>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         warnings: Vec<String>,

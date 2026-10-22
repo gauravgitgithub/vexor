@@ -41,6 +41,8 @@ Open:
 
 4.3 ✅ Health-gated `vexor reload`: reload is a phase of the core state machine (replacement spawned next to the current process; promoted when healthy; abandoned, keeping the current process, on exit, spawn failure or timeout; interrupted by stop/restart/crash). Cluster mode is start-first (healthy = `ready` with `wait_ready`, else `listening`); fork mode is stop-first unless `reload_strategy: start_first` (healthy = `ready`, else up for `min_uptime`). Old cluster workers retire gracefully (`worker.disconnect()`, then SIGTERM, SIGKILL after `kill_timeout`). Tested: 3 reloads of a 1-instance cluster app under load with 0 failed requests and exactly one worker left; failed reload keeps the old process with 0 failed requests and is reported within a second; fork default = restart; fork start-first on a fixed port fails safely (EADDRINUSE); 6 core unit tests + property tests; cluster reload on Node 8–24.
 
+4.4 ✅ `vexor logs [name] [--lines N] [--follow] [--out|--err] [--raw]` (tail reads backwards in chunks; rotated `.1` fills in short files; follow survives rotation and truncation) and `vexor describe <name> [--json] [--show-env]` (config, live status with uptime, policy in words, log settings, recent events; env values hidden by default). `vexor list` gains an UPTIME column; event history is ordered by event time. Tested: unit tests for tail/follow/rotation/truncation; CLI tests for describe redaction and JSON, per-stream tails, and following 1,500+ lines across 3+ rotations with no gap or duplicate. A mutant follower that ignores rotation fails both.
+
 Remaining: 
 ## Phase 5: migration
 dry-run, backup, journaled apply, rollback (docs/migration.md).

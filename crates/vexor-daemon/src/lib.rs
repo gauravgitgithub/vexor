@@ -272,6 +272,29 @@ impl Daemon {
                     .collect();
                 self.ok(apps)
             }
+            Request::Describe { name } => {
+                let (status, spec) = {
+                    let store = self.store.lock().await;
+                    match (self.status(&store, &name), store.get(&name)) {
+                        (Some(status), Some(entry)) => (status, entry.spec.clone()),
+                        _ => return error(ErrorCode::NotFound, format!("no app named {name:?}")),
+                    }
+                };
+                let events = self.events.clone();
+                let app = name.clone();
+                let recent =
+                    tokio::task::spawn_blocking(move || events.query(Some(&app), None, 10))
+                        .await
+                        .ok()
+                        .and_then(Result::ok)
+                        .unwrap_or_default();
+                Response::Describe {
+                    status,
+                    spec: Box::new(spec),
+                    events: recent,
+                    warnings: self.events.warnings(),
+                }
+            }
             Request::Events {
                 app,
                 since_ms,

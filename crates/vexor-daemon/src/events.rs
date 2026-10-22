@@ -211,10 +211,10 @@ impl Events {
         let mut stmt = conn
             .prepare(
                 "SELECT data, shim_start, seq FROM (
-                   SELECT id, data, shim_start, seq FROM events
+                   SELECT id, ts_ms, data, shim_start, seq FROM events
                    WHERE (?1 IS NULL OR app = ?1) AND ts_ms >= ?2
                    ORDER BY ts_ms DESC, id DESC LIMIT ?3
-                 ) ORDER BY id ASC",
+                 ) ORDER BY ts_ms ASC, id ASC",
             )
             .map_err(|e| e.to_string())?;
         let rows = stmt

@@ -1,6 +1,8 @@
 //! `vexor`: process manager CLI.
 
 mod client;
+mod describe;
+mod logs;
 mod spec;
 
 use std::path::PathBuf;
@@ -78,6 +80,38 @@ enum Command {
         /// Machine-readable output.
         #[arg(long)]
         json: bool,
+    },
+    /// Show an app's configuration, status and recent events.
+    #[command(visible_alias = "show")]
+    Describe {
+        name: String,
+        /// Machine-readable output.
+        #[arg(long)]
+        json: bool,
+        /// Show environment variable values (hidden by default).
+        #[arg(long)]
+        show_env: bool,
+    },
+    /// Show app logs: the last lines of each app's log files, or with
+    /// --follow, new lines as they are written.
+    Logs {
+        /// Only this app [default: all apps].
+        name: Option<String>,
+        /// Lines to show from each log file.
+        #[arg(long, default_value_t = 15)]
+        lines: usize,
+        /// Keep printing new lines (Ctrl-C to stop).
+        #[arg(short, long)]
+        follow: bool,
+        /// Only standard output.
+        #[arg(long, conflicts_with = "err")]
+        out: bool,
+        /// Only standard error.
+        #[arg(long)]
+        err: bool,
+        /// No "app|stream |" prefix or headers.
+        #[arg(long)]
+        raw: bool,
     },
     /// Run the supervisor daemon in the foreground. Other commands start it
     /// in the background automatically.
@@ -199,6 +233,19 @@ fn main() -> ExitCode {
             false,
         ),
         Command::List { json } => send(&home, Request::List, json),
+        Command::Describe {
+            name,
+            json,
+            show_env,
+        } => describe_cmd(&home, name, json, show_env),
+        Command::Logs {
+            name,
+            lines,
+            follow,
+            out,
+            err,
+            raw,
+        } => logs_cmd(&home, name, lines, follow, (!err, !out), raw),
         Command::Events {
             app,
             since,
@@ -251,6 +298,16 @@ fn send(home: &std::path::Path, req: Request, json: bool) -> ExitCode {
         }
     };
     match response {
+        Response::Describe {
+            status,
+            spec,
+            events,
+            warnings,
+        } => {
+            print_warnings(&warnings);
+            describe::print(&status, &spec, &events, false);
+            ExitCode::SUCCESS
+        }
         Response::Events { events, warnings } => {
             print_warnings(&warnings);
             if json {
@@ -330,7 +387,7 @@ fn run_plan(home: &std::path::Path, plan: spec::Plan, allow_unsupported: bool) -
                 failed += 1;
                 eprintln!("vexor: {message}");
             }
-            Ok(Response::Events { .. }) => {}
+            Ok(Response::Events { .. } | Response::Describe { .. }) => {}
             Err(e) => {
                 eprintln!("vexor: {e}");
                 return ExitCode::from(code::DAEMON_UNREACHABLE);
@@ -427,13 +484,116 @@ fn check(
     }
 }
 
+/// An app's status, spec and recent events, from `Request::Describe`.
+type Described = (AppStatus, Box<vexor_core::AppSpec>, Vec<serde_json::Value>);
+
+/// On failure: (exit code, message).
+fn describe_app(home: &std::path::Path, name: String) -> Result<Described, (u8, String)> {
+    match client::request(home, &Request::Describe { name }) {
+        Ok(Response::Describe {
+            status,
+            spec,
+            events,
+            warnings,
+        }) => {
+            print_warnings(&warnings);
+            Ok((status, spec, events))
+        }
+        Ok(Response::Error { message, .. }) => Err((code::FAILED, message)),
+        Ok(_) => Err((code::FAILED, "unexpected answer from the daemon".into())),
+        Err(e) => Err((code::DAEMON_UNREACHABLE, e)),
+    }
+}
+
+fn describe_cmd(home: &std::path::Path, name: String, json: bool, show_env: bool) -> ExitCode {
+    let (status, spec, events) = match describe_app(home, name) {
+        Ok(d) => d,
+        Err((c, msg)) => {
+            eprintln!("vexor: {msg}");
+            return ExitCode::from(c);
+        }
+    };
+    if json {
+        let out = serde_json::json!({
+            "status": status,
+            "spec": describe::spec_json(&spec, show_env),
+            "events": events,
+        });
+        println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+    } else {
+        describe::print(&status, &spec, &events, show_env);
+    }
+    ExitCode::SUCCESS
+}
+
+fn logs_cmd(
+    home: &std::path::Path,
+    name: Option<String>,
+    lines: usize,
+    follow: bool,
+    (want_out, want_err): (bool, bool),
+    raw: bool,
+) -> ExitCode {
+    let names = match name {
+        Some(n) => vec![n],
+        None => match client::request(home, &Request::List) {
+            Ok(Response::Ok { apps, .. }) => apps.into_iter().map(|a| a.name).collect(),
+            Ok(Response::Error { message, .. }) => return fail(&message),
+            Ok(_) => return fail("unexpected answer from the daemon"),
+            Err(e) => {
+                eprintln!("vexor: {e}");
+                return ExitCode::from(code::DAEMON_UNREACHABLE);
+            }
+        },
+    };
+    let mut sources = Vec::new();
+    for n in names {
+        let spec = match describe_app(home, n) {
+            Ok((_, spec, _)) => spec,
+            Err((c, msg)) => {
+                eprintln!("vexor: {msg}");
+                return ExitCode::from(c);
+            }
+        };
+        let l = &spec.logs;
+        let merged = l.out == l.err;
+        if want_out || merged {
+            sources.push(logs::Source {
+                label: if merged {
+                    spec.name.clone()
+                } else {
+                    format!("{}|out", spec.name)
+                },
+                path: l.out.clone(),
+            });
+        }
+        if want_err && !merged {
+            sources.push(logs::Source {
+                label: format!("{}|err", spec.name),
+                path: l.err.clone(),
+            });
+        }
+    }
+    sources.retain(|s| s.path != std::path::Path::new("/dev/null"));
+    if sources.is_empty() {
+        return fail("no log files to show");
+    }
+    if let Err(e) = logs::print_tail(&sources, lines, raw) {
+        return fail(&e.to_string());
+    }
+    if follow && let Err(e) = logs::follow(sources, raw) {
+        return fail(&e.to_string());
+    }
+    ExitCode::SUCCESS
+}
+
 fn print_warnings(warnings: &[String]) {
     for w in warnings {
         eprintln!("vexor: warning: {w}");
     }
 }
 
-fn print_events(events: &[serde_json::Value]) {
+pub(crate) fn print_events(events: &[serde_json::Value]) {
     let mut rows = vec![[
         "TIME (UTC)".to_owned(),
         "APP".to_owned(),
@@ -539,11 +699,13 @@ fn print_rows<const N: usize>(rows: &[[String; N]]) {
 }
 
 fn print_table(apps: &[AppStatus]) {
+    let now = describe::now_ms();
     let mut rows = vec![[
         "NAME".to_owned(),
         "INST".to_owned(),
         "STATUS".to_owned(),
         "PID".to_owned(),
+        "UPTIME".to_owned(),
         "RESTARTS".to_owned(),
     ]];
     for app in apps {
@@ -558,12 +720,14 @@ fn print_table(apps: &[AppStatus]) {
                 status.into(),
                 "-".into(),
                 "-".into(),
+                "-".into(),
             ]);
         }
         for s in &app.snapshot {
             // A shim that has gone means its instances are not running,
             // whatever their last reported state.
-            let state = if app.shim_pid.is_none() && app.desired == Desired::Stopped {
+            let stopped = app.shim_pid.is_none() && app.desired == Desired::Stopped;
+            let state = if stopped {
                 "stopped"
             } else {
                 s["state"].as_str().unwrap_or("?")
@@ -574,7 +738,11 @@ fn print_table(apps: &[AppStatus]) {
                 state.to_owned(),
                 s["pid"]
                     .as_u64()
+                    .filter(|_| !stopped)
                     .map_or_else(|| "-".to_owned(), |p| p.to_string()),
+                describe::uptime(s, now)
+                    .filter(|_| !stopped)
+                    .unwrap_or_else(|| "-".into()),
                 s["restarts"].to_string(),
             ]);
         }

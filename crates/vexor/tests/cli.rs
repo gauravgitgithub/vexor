@@ -691,3 +691,143 @@ fn instances_on_a_node_script_mean_cluster_mode_unless_fork() {
     assert!(env.state()["apps"]["f"]["spec"].get("cluster").is_none());
     assert_eq!(states(&env.app("f")), ["online", "online"]);
 }
+
+// ------------------------------------------------------- describe and logs
+
+#[test]
+fn describe_shows_config_and_hides_env_values() {
+    let env = Env::new();
+    env.ok(&["start", "loop.sh", "--env", "API_KEY=hunter2"]);
+    let text = env.ok(&["describe", "loop"]);
+    for want in [
+        "Name",
+        "loop",
+        "online",
+        "fork mode",
+        "API_KEY",
+        "Restart",
+        "Out log",
+    ] {
+        assert!(text.contains(want), "missing {want:?} in:\n{text}");
+    }
+    assert!(!text.contains("hunter2"), "env value leaked:\n{text}");
+    assert!(
+        env.ok(&["describe", "loop", "--show-env"])
+            .contains("API_KEY=hunter2")
+    );
+
+    let json: Value = serde_json::from_str(&env.ok(&["describe", "loop", "--json"])).expect("json");
+    assert_eq!(json["spec"]["env"]["API_KEY"], "<redacted>");
+    assert_eq!(json["status"]["snapshot"][0]["state"], "online");
+    assert!(json["events"].as_array().is_some_and(|e| !e.is_empty()));
+
+    let out = env.run(&["describe", "nope"]);
+    assert_eq!(out.status.code(), Some(1));
+}
+
+#[test]
+fn logs_show_the_last_lines_per_stream() {
+    let env = Env::new();
+    env.script(
+        "talk.sh",
+        "#!/bin/sh\ni=1; while [ $i -le 20 ]; do echo \"out $i\"; echo \"err $i\" >&2; i=$((i+1)); done\nwhile :; do sleep 1; done\n",
+    );
+    env.ok(&["start", "talk.sh"]);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !env
+        .ok(&["logs", "talk", "--raw", "--out", "--lines", "1"])
+        .contains("out 20")
+    {
+        assert!(Instant::now() < deadline, "output never reached the log");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        env.ok(&["logs", "talk", "--raw", "--out", "--lines", "3"]),
+        "out 18\nout 19\nout 20\n"
+    );
+    assert_eq!(
+        env.ok(&["logs", "talk", "--raw", "--err", "--lines", "2"]),
+        "err 19\nerr 20\n"
+    );
+    let both = env.ok(&["logs", "--lines", "1"]);
+    assert!(both.contains("talk|out | out 20"), "{both}");
+    assert!(both.contains("talk|err | err 20"), "{both}");
+    let out = env.run(&["logs", "nope"]);
+    assert_eq!(out.status.code(), Some(1));
+}
+
+#[test]
+fn logs_follow_keeps_every_line_across_rotation() {
+    let env = Env::new();
+    let script = env.script(
+        "count.sh",
+        "#!/bin/sh\ni=1; while :; do echo \"n $i\"; i=$((i+1)); sleep 0.002; done\n",
+    );
+    let spec = env.work.path().join("count.json");
+    let json = serde_json::json!({
+        "name": "count",
+        "exec": script,
+        "cwd": env.work.path(),
+        "env": { "PATH": "/usr/bin:/bin" },
+        "logs": {
+            "out": env.work.path().join("count.out"),
+            "err": env.work.path().join("count.err"),
+            "max_size_bytes": 2048,
+            "retain": 50,
+            "overflow": "block",
+        },
+    });
+    std::fs::write(&spec, json.to_string()).expect("spec");
+    env.ok(&["start", "--spec", &spec.to_string_lossy()]);
+
+    let mut child = env
+        .cmd(&[
+            "logs", "count", "--out", "--raw", "--follow", "--lines", "0",
+        ])
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("follow");
+    let stdout = child.stdout.take().expect("stdout");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(stdout)
+            .lines()
+            .map_while(Result::ok)
+        {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    // Collect until several rotations have happened (2 KiB files, ~6
+    // bytes per line: a rotation every ~350 lines).
+    let mut seen = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while seen.len() < 1500 && Instant::now() < deadline {
+        if let Ok(line) = rx.recv_timeout(Duration::from_secs(1)) {
+            seen.push(line);
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    let numbers: Vec<u64> = seen
+        .iter()
+        .filter_map(|l| l.strip_prefix("n ")?.parse().ok())
+        .collect();
+    assert!(
+        numbers.len() >= 1500,
+        "only {} lines followed",
+        numbers.len()
+    );
+    let rotated = std::fs::read_dir(env.work.path())
+        .expect("dir")
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with("count.out."))
+        .count();
+    assert!(rotated >= 3, "expected rotations, saw {rotated}");
+    assert!(
+        numbers.windows(2).all(|w| w[1] == w[0] + 1),
+        "gap or duplicate while following across rotation"
+    );
+}

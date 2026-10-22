@@ -58,8 +58,8 @@ The wrapper is a zero-dependency ES5 script with no `postinstall` and no network
 | start / stop / restart / delete | same | accepts name, id, `all`, config file |
 | reload | same | Implemented. Cluster mode: start new → wait healthy → retire old gracefully; a failed replacement keeps the old process and `reload` exits 1 naming the instances. Fork mode: restart by default (as PM2); `reload_strategy: start_first` for apps that can run twice (no fixed port, or `reusePort`) |
 | list / ls / status | same | `--json` stable schema |
-| logs | same | `--lines`, `--raw`, `--err/--out` |
-| describe / show | same | env values redacted by default |
+| logs | same | Implemented: `--lines`, `--follow`, `--raw`, `--err/--out`; all apps when no name. Output is prefixed `app|out` / `app|err` (PM2 uses `id|app`) |
+| describe / show | same | Implemented: env values hidden unless `--show-env`; `--json` |
 | save / resurrect | same | |
 | startup / unstartup | same | systemd/launchd only |
 | scale | same | cluster mode |

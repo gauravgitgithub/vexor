@@ -13,6 +13,7 @@ use tokio::time::Instant;
 use vexor_core::{AppSpec, Ctx, Effect, Event, ExitStatus, Instance, Millis, State, Timer};
 
 use crate::identity::Identity;
+use crate::logs::Sink;
 use crate::orphan::{self, Managed};
 use crate::output::{Output, ShimEvent};
 use crate::process::{self, IpcChannel, IpcMessage};
@@ -31,6 +32,8 @@ pub struct Runner {
     out: Output,
     epoch: Instant,
     managed: Managed,
+    out_log: Sink,
+    err_log: Sink,
     child: Option<tokio::process::Child>,
     identity: Option<Identity>,
     pid: Option<u32>,
@@ -49,6 +52,7 @@ impl Runner {
         out: Output,
         epoch: Instant,
         managed: Managed,
+        (out_log, err_log): (Sink, Sink),
     ) -> Self {
         let inst = Instance::new(spec.policy.to_policy());
         Runner {
@@ -58,6 +62,8 @@ impl Runner {
             out,
             epoch,
             managed,
+            out_log,
+            err_log,
             child: None,
             identity: None,
             pid: None,
@@ -161,31 +167,33 @@ impl Runner {
 
     fn apply(&mut self, effect: Effect) {
         match effect {
-            Effect::Spawn => match process::spawn(&self.spec, self.index) {
-                Ok(s) => {
-                    self.pid = Some(s.pid);
-                    // The process may already have exited; identity is then
-                    // unknown, which only matters for recovery.
-                    self.identity = Identity::of(s.pid).ok();
-                    self.managed.insert(s.pid, self.identity);
-                    self.child = Some(s.child);
-                    self.ipc = s.ipc;
-                    self.log_tasks.retain(|t| !t.is_finished());
-                    self.log_tasks.extend(s.log_tasks);
-                    self.queue.push_back(Event::Spawned);
+            Effect::Spawn => {
+                match process::spawn(&self.spec, self.index, &self.out_log, &self.err_log) {
+                    Ok(s) => {
+                        self.pid = Some(s.pid);
+                        // The process may already have exited; identity is then
+                        // unknown, which only matters for recovery.
+                        self.identity = Identity::of(s.pid).ok();
+                        self.managed.insert(s.pid, self.identity);
+                        self.child = Some(s.child);
+                        self.ipc = s.ipc;
+                        self.log_tasks.retain(|t| !t.is_finished());
+                        self.log_tasks.extend(s.log_tasks);
+                        self.queue.push_back(Event::Spawned);
+                    }
+                    Err(e) => {
+                        self.pid = None;
+                        self.identity = None;
+                        self.out.emit(&ShimEvent::SpawnError {
+                            app: &self.spec.name,
+                            instance: self.index,
+                            exec: &self.spec.exec,
+                            error: e.to_string(),
+                        });
+                        self.queue.push_back(Event::SpawnFailed);
+                    }
                 }
-                Err(e) => {
-                    self.pid = None;
-                    self.identity = None;
-                    self.out.emit(&ShimEvent::SpawnError {
-                        app: &self.spec.name,
-                        instance: self.index,
-                        exec: &self.spec.exec,
-                        error: e.to_string(),
-                    });
-                    self.queue.push_back(Event::SpawnFailed);
-                }
-            },
+            }
             Effect::SignalStop => self.signal(Signal::TERM),
             Effect::ForceKill => self.signal(Signal::KILL),
             Effect::ArmTimer {
@@ -290,14 +298,23 @@ impl Runner {
         });
     }
 
+    /// Let output already in the pipes reach the log, then stop reading.
+    /// A leftover process holding a pipe open must not keep the shim's log
+    /// writer alive forever, so readers still running after the timeout are
+    /// cancelled.
     async fn drain_logs(&mut self) {
         let tasks = std::mem::take(&mut self.log_tasks);
+        let aborts: Vec<_> = tasks.iter().map(JoinHandle::abort_handle).collect();
         let all = async {
             for t in tasks {
                 let _ = t.await;
             }
         };
-        let _ = tokio::time::timeout(LOG_DRAIN_TIMEOUT, all).await;
+        if tokio::time::timeout(LOG_DRAIN_TIMEOUT, all).await.is_err() {
+            for a in aborts {
+                a.abort();
+            }
+        }
     }
 }
 

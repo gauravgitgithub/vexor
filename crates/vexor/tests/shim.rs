@@ -501,3 +501,121 @@ mod linux {
         assert!(zombies.is_empty(), "unreaped zombies: {zombies:?}");
     }
 }
+
+// ---------------------------------------------------------------- log files
+
+fn rss_kib(pid: u32) -> Option<u64> {
+    let out = Command::new("ps")
+        .args(["-o", "rss=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    String::from_utf8(out.stdout).ok()?.trim().parse().ok()
+}
+
+fn log_files(shim: &Shim, base: &str) -> Vec<(PathBuf, u64)> {
+    let mut files: Vec<(PathBuf, u64)> = std::fs::read_dir(shim.dir.path())
+        .expect("dir")
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with(base))
+        .map(|e| (e.path(), e.metadata().map(|m| m.len()).unwrap_or(0)))
+        .collect();
+    files.sort();
+    files
+}
+
+#[test]
+fn one_gigabyte_flood_stays_under_the_cap_with_bounded_memory() {
+    let shim = Shim::new();
+    let max: u64 = 1024 * 1024;
+    let extra = json!({
+        "policy": { "autorestart": false },
+        "logs": {
+            "out": shim.path("out.log"),
+            "err": shim.path("err.log"),
+            "max_size_bytes": max,
+            "retain": 2,
+        },
+    });
+    let spec = shim.spec("/bin/sh", &["-c", "head -c 1000000000 /dev/zero"], extra);
+    let child = shim.start(&spec);
+    let pid = child.id();
+    let started = Instant::now();
+    let sampler = std::thread::spawn(move || {
+        let mut peak = 0;
+        while let Some(kib) = rss_kib(pid) {
+            peak = peak.max(kib);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        peak
+    });
+    let done = finish(child, started);
+    let peak_kib = sampler.join().expect("sampler");
+    assert_eq!(done.code, Some(0), "{}", done.stderr);
+
+    let files = log_files(&shim, "out.log");
+    let total: u64 = files.iter().map(|f| f.1).sum();
+    eprintln!(
+        "1 GB flood: {:?}, shim peak RSS {} KiB, {} log files, {} bytes on disk",
+        done.elapsed,
+        peak_kib,
+        files.len(),
+        total
+    );
+    // The app wrote the whole gigabyte: a pipe that stopped being read would
+    // have killed it with SIGPIPE (13) instead of exit code 0.
+    let last = done
+        .events
+        .iter()
+        .rfind(|e| e["type"] == "state")
+        .expect("state");
+    assert_eq!(last["exit"]["code"], 0, "{last}");
+    assert!(files.len() <= 3, "{files:?}");
+    // Each file is capped at `max`, except that one chunk may straddle.
+    assert!(
+        total <= 3 * (max + 8192),
+        "{total} bytes on disk: {files:?}"
+    );
+    assert!(peak_kib < 40 * 1024, "shim peak RSS {peak_kib} KiB");
+}
+
+#[test]
+fn block_mode_rotation_keeps_every_line_in_order() {
+    let shim = Shim::new();
+    let extra = json!({
+        "policy": { "autorestart": false },
+        "logs": {
+            "out": shim.path("out.log"),
+            "err": shim.path("err.log"),
+            "max_size_bytes": 65536,
+            "retain": 1000,
+            "overflow": "block",
+        },
+    });
+    let done = shim.run(&shim.spec("/usr/bin/seq", &["1", "200000"], extra));
+    assert_eq!(done.code, Some(0), "{}", done.stderr);
+    // Oldest is out.log.N with the highest N; newest is out.log.
+    let mut files = log_files(&shim, "out.log");
+    files.sort_by_key(|(p, _)| {
+        std::cmp::Reverse(
+            p.extension()
+                .and_then(|e| e.to_str())
+                .and_then(|e| e.parse::<u32>().ok())
+                .unwrap_or(0),
+        )
+    });
+    assert!(files.len() > 10, "expected rotation: {files:?}");
+    let mut text = String::new();
+    for (p, _) in &files {
+        text.push_str(&std::fs::read_to_string(p).expect("read"));
+    }
+    let numbers: Vec<u32> = text.lines().map(|l| l.parse().expect("number")).collect();
+    let expected: Vec<u32> = (1..=200_000).collect();
+    assert!(
+        numbers == expected,
+        "lines lost, duplicated or out of order"
+    );
+    assert!(
+        !done.events.iter().any(|e| e["type"] == "log_dropped"),
+        "block mode must not drop"
+    );
+}

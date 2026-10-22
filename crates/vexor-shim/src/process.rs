@@ -1,20 +1,19 @@
 //! Starting and signalling one app process.
 
-use std::fs::OpenOptions;
 use std::io;
 use std::os::fd::OwnedFd;
-use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixStream as StdUnixStream;
-use std::path::Path;
 use std::process::Stdio;
 
 use command_fds::{CommandFdExt, FdMapping};
 use rustix::process::{Pid, Signal, kill_process, kill_process_group, test_kill_process_group};
-use tokio::io::{AsyncRead, BufReader};
+use tokio::io::BufReader;
 use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
 use tokio::task::JoinHandle;
 use vexor_core::AppSpec;
+
+use crate::logs::Sink;
 use vexor_proto::{LineRead, read_bounded_line};
 
 /// File descriptor number Node expects its IPC channel on.
@@ -33,7 +32,7 @@ pub struct Spawned {
 /// (plus the instance variable and, for Node apps, the IPC channel), its own
 /// process group, `/dev/null` as stdin, and stdout/stderr appended to the
 /// spec's log files.
-pub fn spawn(spec: &AppSpec, index: u32) -> io::Result<Spawned> {
+pub fn spawn(spec: &AppSpec, index: u32, out: &Sink, err: &Sink) -> io::Result<Spawned> {
     let mut cmd = Command::new(&spec.exec);
     cmd.args(&spec.args)
         .current_dir(&spec.cwd)
@@ -59,8 +58,6 @@ pub fn spawn(spec: &AppSpec, index: u32) -> io::Result<Spawned> {
         parent_end = Some(ours);
     }
 
-    let out = open_log(&spec.logs.out)?;
-    let err = open_log(&spec.logs.err)?;
     let mut child = cmd.spawn()?;
     // Dropping `cmd` closes our copy of the child's end of the IPC socket, so
     // we see EOF once the app exits.
@@ -71,10 +68,10 @@ pub fn spawn(spec: &AppSpec, index: u32) -> io::Result<Spawned> {
         .ok_or_else(|| io::Error::other("child exited before its pid was read"))?;
     let mut log_tasks = Vec::with_capacity(2);
     if let Some(stdout) = child.stdout.take() {
-        log_tasks.push(tokio::spawn(copy_to_log(stdout, out)));
+        log_tasks.push(tokio::spawn(out.clone().pump(stdout)));
     }
     if let Some(stderr) = child.stderr.take() {
-        log_tasks.push(tokio::spawn(copy_to_log(stderr, err)));
+        log_tasks.push(tokio::spawn(err.clone().pump(stderr)));
     }
     let ipc = match parent_end {
         Some(s) => {
@@ -89,31 +86,6 @@ pub fn spawn(spec: &AppSpec, index: u32) -> io::Result<Spawned> {
         ipc,
         log_tasks,
     })
-}
-
-/// Open a log file for appending: owner read/write, group read, and never
-/// through a symlink (docs/security.md T5).
-fn open_log(path: &Path) -> io::Result<tokio::fs::File> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let f = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o640)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path)
-        .map_err(|e| io::Error::new(e.kind(), format!("log file {}: {e}", path.display())))?;
-    Ok(tokio::fs::File::from_std(f))
-}
-
-async fn copy_to_log(mut from: impl AsyncRead + Unpin, mut to: tokio::fs::File) {
-    // Write errors are surfaced properly with log rotation (plan step 2.7).
-    // Until then a failed write ends the copy; the app keeps running, and its
-    // writes fail with EPIPE once the pipe closes.
-    if let Err(e) = tokio::io::copy(&mut from, &mut to).await {
-        eprintln!("vexor shim: log copy stopped: {e}");
-    }
 }
 
 /// Send `sig` to the whole process group led by `pid`. A group that is

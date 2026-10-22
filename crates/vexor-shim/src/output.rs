@@ -45,6 +45,19 @@ pub enum ShimEvent<'a> {
     /// A descendant escaped its process group and was adopted by the shim
     /// (Linux). It is stopped when the shim shuts down.
     Orphan { app: &'a str, pid: u32, start: u64 },
+    /// Output was discarded because it arrived faster than it could be
+    /// written (`overflow: drop`).
+    LogDropped {
+        app: &'a str,
+        path: &'a Path,
+        bytes: u64,
+    },
+    /// Writing a log file failed (reported once until a write succeeds).
+    LogError {
+        app: &'a str,
+        path: &'a Path,
+        error: String,
+    },
     SpawnError {
         app: &'a str,
         instance: u32,

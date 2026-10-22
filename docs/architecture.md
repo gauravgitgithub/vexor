@@ -340,16 +340,25 @@ Cost accepted: about 1 MB more binary and a C toolchain in the cross-build
 - Logs are written by the app's shim, not the daemon. A slow disk for one app
   can't stall other apps or the control plane, and logging continues while the
   daemon is down.
-- The shim reads pipes into a bounded buffer (default 1 MiB per stream). A
-  separate writer thread handles files, so slow disks never block the
-  restart loop.
+- The shim reads pipes in 8 KiB chunks into a bounded queue per log file
+  (`buffer_bytes`, default 1 MiB). One writer thread per file does all disk
+  I/O, so slow disks never block the restart loop. All instances (and
+  stdout + stderr, when they share a path) go through the same writer, so
+  chunks never interleave mid-write.
 - Overflow policy, default `drop`: discarded bytes are counted, a
   `[vexor] dropped N bytes` marker is written when the writer catches up, and
-  a metric is incremented. `block` (back-pressure to the app) is opt-in.
-- Built-in size-based rotation (`max_size`, `retain`) and a per-app disk cap,
-  all on by default. (PM2 core has none; it needs the `pm2-logrotate` module.)
-- Write failures (ENOSPC, EIO) → the app keeps running, the error is surfaced in
-  `vexor status`, `doctor` and metrics. Not silent.
+  a `log_dropped` event is emitted (at most every 10 s per file). `block`
+  (back-pressure: the app blocks on its own writes) is opt-in and loses
+  nothing.
+- A log file moved or deleted by an external tool (logrotate) is noticed
+  within 1 s and reopened at its path.
+- Built-in size-based rotation, on by default: `max_size_bytes` (10 MiB) and
+  `retain` (5 rotated files), so at most ~60 MiB per log file. `retain: 0`
+  truncates instead; `max_size_bytes: 0` disables rotation. (PM2 core has
+  none; it needs the `pm2-logrotate` module.)
+- Write failures (ENOSPC, EIO) → the app keeps running, a `log_error` event
+  is emitted once per failure streak, the lost output is counted as
+  dropped, and writing resumes (reopening the file) when the disk recovers.
 
 ## 11. Config loading
 

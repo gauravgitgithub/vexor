@@ -114,10 +114,10 @@ fn build(args: &StartArgs, script: &Path, home: &Path) -> Result<AppSpec, String
 
     let logs = home.join("logs");
     Ok(AppSpec {
-        logs: LogSpec {
-            out: logs.join(format!("{name}-out.log")),
-            err: logs.join(format!("{name}-error.log")),
-        },
+        logs: LogSpec::new(
+            logs.join(format!("{name}-out.log")),
+            logs.join(format!("{name}-error.log")),
+        ),
         name,
         exec,
         args: app_args,

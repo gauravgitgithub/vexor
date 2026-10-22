@@ -52,6 +52,58 @@ pub struct AppSpec {
 pub struct LogSpec {
     pub out: PathBuf,
     pub err: PathBuf,
+    /// Rotate a log file once it would grow past this size. 0 disables
+    /// rotation (the file grows without bound).
+    #[serde(default = "default_max_size")]
+    pub max_size_bytes: u64,
+    /// Rotated files to keep (`out.log.1` … `out.log.N`). With 0, the file is
+    /// truncated instead of rotated.
+    #[serde(default = "default_retain")]
+    pub retain: u32,
+    /// What to do when output arrives faster than it can be written.
+    #[serde(default)]
+    pub overflow: Overflow,
+    /// Output buffered per log file before `overflow` applies.
+    #[serde(default = "default_buffer")]
+    pub buffer_bytes: u32,
+}
+
+impl LogSpec {
+    /// Log files at `out` and `err` with default rotation and buffering.
+    pub fn new(out: PathBuf, err: PathBuf) -> LogSpec {
+        LogSpec {
+            out,
+            err,
+            max_size_bytes: default_max_size(),
+            retain: default_retain(),
+            overflow: Overflow::default(),
+            buffer_bytes: default_buffer(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Overflow {
+    /// Discard the excess, count it, and say so in the log and in an event.
+    /// The app never waits for the disk.
+    #[default]
+    Drop,
+    /// Stop reading the app's output until there is room: the app blocks on
+    /// writes to stdout/stderr. Nothing is lost.
+    Block,
+}
+
+fn default_max_size() -> u64 {
+    10 * 1024 * 1024
+}
+
+fn default_retain() -> u32 {
+    5
+}
+
+fn default_buffer() -> u32 {
+    1024 * 1024
 }
 
 /// Wire form of [`InstancePolicy`]; durations in milliseconds.
@@ -178,6 +230,9 @@ mod tests {
         assert!(spec.treekill);
         assert!(spec.env.is_empty());
         assert_eq!(spec.policy, PolicySpec::default());
+        assert_eq!(spec.logs.max_size_bytes, 10 * 1024 * 1024);
+        assert_eq!(spec.logs.retain, 5);
+        assert_eq!(spec.logs.overflow, Overflow::Drop);
     }
 
     #[test]

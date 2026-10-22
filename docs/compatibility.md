@@ -96,5 +96,6 @@ Exit codes: 0 ok, 1 command failed, 2 usage error, 3 daemon unreachable, 4 parti
 - `listen_timeout` expiry without a ready signal is a failed start (stopped, counted as unstable, restarted with backoff). PM2 marks the app online anyway.
 - `max_restarts: N` allows N automatic restarts of consecutive unstable runs; the (N+1)th unstable exit marks the app errored. Exact PM2 off-by-one to be confirmed in conformance tests.
 - `@pm2/io` metrics/actions are not collected.
-- Log rotation is built in and on by default (PM2 needs `pm2-logrotate`).
+- Log rotation is built in and on by default: 10 MiB per file, 5 rotated files (PM2 needs `pm2-logrotate`, whose defaults are 10 MB and 30 files).
+- When an app writes output faster than the disk can take it, Vexor discards the excess by default and says so in the log and in a `log_dropped` event, so the app never waits on logging. `logs.overflow: block` makes the app wait instead (nothing lost).
 - `describe` redacts env values.

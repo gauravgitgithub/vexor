@@ -13,6 +13,7 @@
 mod control;
 mod identity;
 mod instance;
+mod logs;
 mod orphan;
 mod output;
 mod process;
@@ -182,6 +183,13 @@ pub async fn run(spec: AppSpec, home: Option<PathBuf>) -> i32 {
             }
         },
     };
+    let logs = match logs::Logs::start(&spec.name, &spec.logs, &out) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("vexor shim: cannot set up log files: {e}");
+            return exit::INTERNAL;
+        }
+    };
     let reaper = tokio::spawn(watch_orphans(
         spec.name.clone(),
         managed.clone(),
@@ -192,8 +200,14 @@ pub async fn run(spec: AppSpec, home: Option<PathBuf>) -> i32 {
     let epoch = tokio::time::Instant::now();
     let mut set = tokio::task::JoinSet::new();
     for index in 0..spec.instances {
-        let runner =
-            instance::Runner::new(spec.clone(), index, out.clone(), epoch, managed.clone());
+        let runner = instance::Runner::new(
+            spec.clone(),
+            index,
+            out.clone(),
+            epoch,
+            managed.clone(),
+            (logs.out.clone(), logs.err.clone()),
+        );
         set.spawn(runner.run(stop_rx.clone(), restart_tx.subscribe(), home.is_none()));
     }
 
@@ -214,6 +228,7 @@ pub async fn run(spec: AppSpec, home: Option<PathBuf>) -> i32 {
     }
 
     reaper.abort();
+    logs.finish(std::time::Duration::from_secs(5)).await;
     if spec.treekill {
         orphan::stop_all(&managed, spec.policy.to_policy().kill_timeout).await;
     }

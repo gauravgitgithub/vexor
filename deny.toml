@@ -1,0 +1,28 @@
+# cargo-deny policy. Run locally with `cargo deny check`.
+
+[graph]
+all-features = true
+
+[advisories]
+# Any RustSec advisory (vulnerability, unmaintained, unsound, yanked) fails CI
+# unless explicitly ignored here with a reason.
+ignore = []
+
+[licenses]
+# Permissive licenses only: everything must be redistributable inside an
+# MIT OR Apache-2.0 binary. Add a license here only when a new dependency needs
+# it, after review.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Unicode-3.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

@@ -3,7 +3,13 @@
 All notable changes to Vexor. Versions follow [Semantic Versioning](https://semver.org/);
 before 1.0, minor versions may include breaking changes, which are listed here.
 
-## Unreleased
+## 0.2.0 (2026-10-23, prerelease)
+
+Moving from PM2: a migration that plans, backs up, moves apps one at a
+time with automatic fallback, and rolls back; and the three PM2 settings
+that used to block apps (memory, cron and watch restarts). Still a
+prerelease: no published benchmarks yet, and `uid`/`gid`,
+`increment_var` and `shutdown_with_message` are not supported.
 
 ### Added
 - `max_memory_restart` (ecosystem files, `vexor start --max-memory-restart

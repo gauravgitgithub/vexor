@@ -428,11 +428,15 @@ impl Daemon {
         if !start {
             return self.ok_one(self.status(&store, &name));
         }
+        // Wait without holding the store, so other apps can start meanwhile
+        // (an ecosystem file's apps start in parallel).
+        drop(store);
         if let Err(e) = self.wait_connected(&name).await {
             return error(ErrorCode::Internal, e);
         }
         self.wait_settled(&name, entry.spec.instances, None, START_WAIT)
             .await;
+        let store = self.store.lock().await;
         self.ok_one(self.status(&store, &name))
     }
 

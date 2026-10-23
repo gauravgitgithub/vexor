@@ -616,8 +616,25 @@ fn run_plan(home: &std::path::Path, plan: spec::Plan, allow_unsupported: bool) -
     let total = plan.requests.len();
     let mut apps = Vec::new();
     let mut failed = 0;
-    for req in plan.requests {
-        match client::request(home, &req) {
+    // Every app starts at once (the daemon waits for each in parallel);
+    // results keep the file's order. The daemon is checked first, once.
+    let _ = client::request(home, &Request::List);
+    let responses: Vec<_> = std::thread::scope(|s| {
+        let handles: Vec<_> = plan
+            .requests
+            .iter()
+            .map(|req| s.spawn(move || client::request(home, req)))
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| {
+                h.join()
+                    .unwrap_or_else(|_| Err("request thread panicked".into()))
+            })
+            .collect()
+    });
+    for response in responses {
+        match response {
             Ok(Response::Ok { apps: a, warnings }) => {
                 print_warnings(&warnings);
                 apps.extend(a);

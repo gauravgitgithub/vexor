@@ -427,7 +427,8 @@ async fn cluster_health(
 /// Reap adopted orphans as they exit, and report each new live one once.
 async fn watch_orphans(app: String, managed: orphan::Managed, out: output::Output) {
     let mut sigchld = signal(SignalKind::child()).ok();
-    // SIGCHLD can coalesce; a slow periodic sweep catches anything missed.
+    // SIGCHLD can coalesce, and adoption sends none: a periodic sweep
+    // catches the rest. Cheap: it reads only this process's children list.
     let mut sweep = tokio::time::interval(std::time::Duration::from_secs(1));
     let mut seen = std::collections::HashSet::new();
     loop {

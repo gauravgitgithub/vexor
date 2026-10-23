@@ -152,25 +152,45 @@ struct Adopted {
     zombie: bool,
 }
 
+/// PIDs of this process's children. Cheap: `/proc/self/task/*/children`
+/// lists them directly. `None` when the kernel doesn't provide those files
+/// (CONFIG_PROC_CHILDREN), in which case all of `/proc` must be scanned.
+#[cfg(target_os = "linux")]
+fn own_children() -> Option<Vec<u32>> {
+    let tasks = std::fs::read_dir("/proc/self/task").ok()?;
+    let mut out = Vec::new();
+    let mut found = false;
+    for t in tasks.flatten() {
+        if let Ok(list) = std::fs::read_to_string(t.path().join("children")) {
+            found = true;
+            out.extend(
+                list.split_whitespace()
+                    .filter_map(|p| p.parse::<u32>().ok()),
+            );
+        }
+    }
+    found.then_some(out)
+}
+
 #[cfg(target_os = "linux")]
 fn adopted_children(managed: &Managed) -> Vec<Adopted> {
     let me = std::process::id();
-    let Ok(dir) = std::fs::read_dir("/proc") else {
-        return Vec::new();
+    let candidates: Vec<u32> = match own_children() {
+        Some(c) => c,
+        None => std::fs::read_dir("/proc")
+            .map(|d| {
+                d.flatten()
+                    .filter_map(|e| e.file_name().to_str().and_then(|s| s.parse::<u32>().ok()))
+                    .collect()
+            })
+            .unwrap_or_default(),
     };
     let mut out = Vec::new();
-    for entry in dir.flatten() {
-        let Some(pid) = entry
-            .file_name()
-            .to_str()
-            .and_then(|s| s.parse::<u32>().ok())
-        else {
-            continue;
-        };
+    for pid in candidates {
         if managed.contains(pid) {
             continue;
         }
-        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
             continue;
         };
         let Some(fields) = crate::identity::proc_stat_fields(&stat) else {

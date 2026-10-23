@@ -896,3 +896,96 @@ fn startup_print_generates_a_service_for_this_platform() {
     let bad = env.run(&["startup", "openrc", "--print"]);
     assert_eq!(bad.status.code(), Some(1));
 }
+
+/// A minimal PM2 dump: `web` (running, 2 fork instances of a shell script
+/// with a secret in its environment) and `idle` (stopped).
+fn pm2_dump(env: &Env) -> PathBuf {
+    let script = env.work.path().join("loop.sh");
+    let user = std::env::var("USER").unwrap_or_default();
+    let entry = |name: &str, status: &str, inst: u32| {
+        serde_json::json!({
+            "name": name, "namespace": "default", "status": status,
+            "pm_exec_path": script, "pm_cwd": env.work.path(),
+            "exec_interpreter": "none", "exec_mode": "fork_mode",
+            "args": ["a b"], "username": user, "_pm2_version": "7.1.0",
+            "pm_out_log_path": env.work.path().join(format!("{name}-out.log")),
+            "pm_err_log_path": env.work.path().join(format!("{name}-err.log")),
+            "pmx": true, "automation": true, "kill_retry_time": 100,
+            "env": {"PATH": "/usr/bin:/bin", "API_KEY": "s3cr3t-value", "PM2_HOME": "/x", name: "{}"},
+            "API_KEY": "s3cr3t-value", "NODE_APP_INSTANCE": inst,
+            "max_restarts": 7
+        })
+    };
+    let dump = serde_json::json!([
+        entry("web", "online", 0),
+        entry("web", "online", 1),
+        entry("idle", "stopped", 0)
+    ]);
+    let path = env.work.path().join("dump.pm2");
+    std::fs::write(&path, dump.to_string()).expect("write dump");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+    path
+}
+
+#[test]
+fn migrate_dry_run_reports_and_changes_nothing() {
+    let env = Env::new();
+    let dump = pm2_dump(&env);
+    let dump = dump.to_str().expect("utf-8");
+    let out = env.ok(&["migrate", "--from-pm2", "--dump", dump]);
+    assert!(out.contains("PM2 7.1.0, 3 processes, 2 apps"), "{out}");
+    assert!(out.contains("brief (stop, then start)"), "{out}");
+    assert!(out.contains("none (not running)"), "{out}");
+    assert!(out.contains("'a b'"), "{out}");
+    assert!(out.contains("API_KEY"), "{out}");
+    assert!(!out.contains("s3cr3t-value"), "env value printed: {out}");
+    assert!(!out.contains("PM2_HOME"), "PM2's own variables kept: {out}");
+    assert!(out.contains("All 2 apps can be migrated"), "{out}");
+    // A dry run doesn't start the daemon or create Vexor state.
+    assert!(!env.home.path().join("daemon.sock").exists());
+    assert!(!env.home.path().join("state.json").exists());
+
+    let json: Value =
+        serde_json::from_str(&env.ok(&["migrate", "--from-pm2", "--dump", dump, "--json"]))
+            .expect("json");
+    let web = &json["apps"][0];
+    assert_eq!(web["name"], "web");
+    assert_eq!(web["instances"], 2);
+    assert_eq!(web["downtime"], "brief");
+    assert_eq!(web["spec"]["policy"]["max_restarts"], 7);
+    assert_eq!(web["spec"]["env"]["API_KEY"], "<redacted>");
+    assert_eq!(json["apps"][1]["downtime"], "none");
+    assert!(!json.to_string().contains("s3cr3t-value"));
+}
+
+#[test]
+fn migrate_blocked_apps_exit_4_and_missing_dump_explains() {
+    let env = Env::new();
+    let dump = pm2_dump(&env);
+    let mut d: Value =
+        serde_json::from_str(&std::fs::read_to_string(&dump).expect("read")).expect("json");
+    d[2]["cron_restart"] = "0 3 * * *".into();
+    std::fs::write(&dump, d.to_string()).expect("write");
+    let out = env.run(&[
+        "migrate",
+        "--from-pm2",
+        "--dump",
+        dump.to_str().expect("utf-8"),
+    ]);
+    assert_eq!(out.status.code(), Some(4));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("cron_restart"), "{stdout}");
+    assert!(stdout.contains("1 of 2 apps can be migrated"), "{stdout}");
+
+    let out = env.run(&[
+        "migrate",
+        "--from-pm2",
+        "--pm2-home",
+        env.work.path().join("nope").to_str().expect("utf-8"),
+    ]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("pm2 save"));
+
+    // --from-pm2 is required.
+    assert_eq!(env.run(&["migrate"]).status.code(), Some(2));
+}

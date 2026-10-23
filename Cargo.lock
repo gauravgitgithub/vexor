@@ -880,6 +880,7 @@ dependencies = [
  "assert_cmd",
  "clap",
  "rustix",
+ "serde",
  "serde_json",
  "tempfile",
  "vexor-core",

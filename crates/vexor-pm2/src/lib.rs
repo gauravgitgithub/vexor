@@ -14,6 +14,8 @@ use serde::Serialize;
 use serde_json::Value;
 use vexor_core::{AppSpec, ClusterSpec, LogSpec, PolicySpec};
 
+pub mod dump;
+
 const LOADER: &str = include_str!("loader.js");
 
 /// PM2 default `listen_timeout` when `wait_ready` is set, in milliseconds.

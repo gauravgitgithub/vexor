@@ -16,13 +16,25 @@ vexor migrate --status [<id>]
 
 ## Dry-run report (per app)
 
-Name, script, interpreter (resolved absolute path + version via `<node> -v`), cwd, exec_mode/instances, the field classification from compatibility.md, env key **names** only (values never printed), log paths, expected downtime class:
+Implemented (plan 5.1): `vexor migrate --from-pm2 [--dry-run] [--pm2-home DIR] [--dump FILE] [--json]`. It reads `dump.pm2` only: no PM2 command is run, no Vexor app is added, and the Vexor daemon is not started. Exit code 0 when every app can be migrated, 4 when some are blocked, 1 when the dump can't be read (the message says to run `pm2 save`).
 
-- `rolling`: cluster with ≥ 2 instances and readiness configured
-- `brief`: single instance; a stop/start gap equal to the app's startup time
-- `blocked`: unsupported-fatal fields, missing interpreter, cwd missing, port conflict
+How the dump is read (checked against dumps written by PM2 7.1.0):
 
-Plus global findings: startup unit present, dump file permissions, env captured from an interactive shell.
+- One entry per instance: entries are grouped by namespace and name, and the instance count is the number of entries. Vexor has no namespaces, so one name in two namespaces is an error.
+- Script, working directory and log files come from `pm_exec_path`, `pm_cwd` and `pm_out_log_path`/`pm_err_log_path`. Apps keep writing to PM2's log files. When PM2 wrote one file per instance (`api-out-0.log`, `api-out-1.log`), Vexor writes all instances to the set's base name (`api-out.log`) and says so.
+- PM2's bookkeeping (`status`, `pm_uptime`, `unique_id`, `axm_*`, …) and settings PM2 writes into every entry with their default value (`pmx`, `automation`, `kill_retry_time: 100`, `namespace: default`, …) are dropped. Everything else goes through the same translator and field classification as `vexor check`.
+- Environment: the dump's `env` holds the shell environment `pm2` was started from as well as the app's own variables, and PM2 can't tell them apart either. All of it is kept (minus PM2's own `PM2_*`, `unique_id`, `PWD`, `SHLVL` and the instance variable), so apps see what they see under PM2. The migrating shell's environment is not added. The report lists variable names only, never values.
+- `username`: PM2 records its own user in every entry. An error only when it differs from the user running the migration.
+
+Per app, the report shows the command line Vexor would run (absolute interpreter path), working directory, log files, environment variable names, every finding (error / warning / note), and the downtime class:
+
+- `none`: not running under PM2 (stopped or errored), so nothing is interrupted.
+- `brief`: running; stopped under PM2 then started under Vexor, so down for about the app's startup time.
+- `blocked`: an unsupported setting that would change behaviour (`max_memory_restart`, `cron_restart`, `watch`, …), a missing working directory, script or interpreter, or another user.
+
+Extra checks: the working directory and script exist; for Node.js apps, the Node.js Vexor would use has the same major version PM2 recorded (`node_version`); PM2 itself runs Node.js apps with its own Node.js, which the report points out.
+
+Global findings: `dump.pm2` readable by other users (it holds every app's environment), a PM2 boot service (`/etc/systemd/system/pm2-<user>.service`, `~/Library/LaunchAgents/pm2.<user>.plist`), shell environment captured in the dump, and the dump's age (it should be saved right before migrating).
 
 ## Apply: cutover per app (sequential by default)
 

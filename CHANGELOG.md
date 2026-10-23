@@ -3,6 +3,13 @@
 All notable changes to Vexor. Versions follow [Semantic Versioning](https://semver.org/);
 before 1.0, minor versions may include breaking changes, which are listed here.
 
+## Unreleased
+
+### Added
+- `vexor migrate --from-pm2 --dry-run`: reads PM2's `dump.pm2` and shows
+  how each app would run under Vexor, every unsupported setting, and the
+  expected downtime. Changes nothing (no PM2 command, no Vexor state).
+
 ## 0.1.1 (2026-10-23, prerelease)
 
 Fixes found by running the same ecosystem files under PM2 7.1.0 and Vexor

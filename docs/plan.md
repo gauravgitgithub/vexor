@@ -50,6 +50,14 @@ Open:
 ## Phase 5: migration
 dry-run, backup, journaled apply, rollback (docs/migration.md).
 
+5.1 ✅ `vexor migrate --from-pm2 --dry-run`: reads `dump.pm2` (no PM2 command, no Vexor state, no daemon), groups per-instance entries into apps, drops PM2 bookkeeping and defaults, keeps PM2's log files and the saved environment, and runs the result through the ecosystem translator. Report per app: command line, cwd, logs, env variable names (never values), findings, downtime class (none / brief / blocked); global warnings for a world-readable dump, a PM2 boot service and captured shell environment. `--json`; exit 4 when some apps are blocked. Tested: 9 unit tests on a real PM2 7.1.0 dump (fixture), 2 CLI tests (redaction, no daemon or state created, exit codes); end to end against PM2 7.1.0 in a container (cluster, fork, `interpreter: none`, stopped app): all apps planned, dump unchanged, PM2's apps still running.
+
+5.2 `--backup`: copy PM2 state to `~/.vexor/migrations/<id>/` (0700).
+
+5.3 `--apply`: journaled cutover per app, with automatic fallback to PM2 when the Vexor start is unhealthy.
+
+5.4 `--rollback <id>` and `--status`.
+
 ## Phase 6: hardening
 HTTP/TCP health checks, readiness-gated reload, max_memory_restart, watch, cron_restart, metrics endpoint, `doctor`, fault-injection suite, uid/gid review, Windows feasibility study.
 

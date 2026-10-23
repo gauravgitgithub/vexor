@@ -3,6 +3,7 @@
 mod client;
 mod describe;
 mod logs;
+mod migrate;
 mod spec;
 mod startup;
 
@@ -141,6 +142,27 @@ enum Command {
         #[arg(long)]
         raw: bool,
     },
+    /// Plan a move from PM2: reads the process list PM2 saved (`pm2 save`)
+    /// and shows how each app would run under Vexor, what can't be moved
+    /// yet, and the expected downtime. Changes nothing.
+    Migrate {
+        /// Migrate from PM2.
+        #[arg(long, required = true)]
+        from_pm2: bool,
+        /// Only report, change nothing (the default; applying comes in a
+        /// later release).
+        #[arg(long)]
+        dry_run: bool,
+        /// PM2 home directory [default: $PM2_HOME, else ~/.pm2]
+        #[arg(long)]
+        pm2_home: Option<PathBuf>,
+        /// PM2 dump file [default: <PM2 home>/dump.pm2]
+        #[arg(long)]
+        dump: Option<PathBuf>,
+        /// Machine-readable output.
+        #[arg(long)]
+        json: bool,
+    },
     /// Run the supervisor daemon in the foreground. Other commands start it
     /// in the background automatically.
     Daemon,
@@ -278,6 +300,13 @@ fn main() -> ExitCode {
             err,
             raw,
         } => logs_cmd(&home, name, lines, follow, (!err, !out), raw),
+        Command::Migrate {
+            from_pm2: _,
+            dry_run: _,
+            pm2_home,
+            dump,
+            json,
+        } => migrate_cmd(pm2_home, dump, json),
         Command::Events {
             app,
             since,
@@ -765,7 +794,7 @@ fn parse_duration(s: &str) -> Result<std::time::Duration, String> {
     Ok(std::time::Duration::from_secs(n.saturating_mul(mult)))
 }
 
-fn print_rows<const N: usize>(rows: &[[String; N]]) {
+pub(crate) fn print_rows<const N: usize>(rows: &[[String; N]]) {
     let widths: Vec<usize> = (0..N)
         .map(|c| rows.iter().map(|r| r[c].len()).max().unwrap_or(0))
         .collect();
@@ -829,6 +858,28 @@ fn print_table(apps: &[AppStatus]) {
         }
     }
     print_rows(&rows);
+}
+
+fn migrate_cmd(pm2_home: Option<PathBuf>, dump: Option<PathBuf>, json: bool) -> ExitCode {
+    let pm2_home = pm2_home.unwrap_or_else(migrate::default_pm2_home);
+    let dump = dump.unwrap_or_else(|| pm2_home.join("dump.pm2"));
+    let report = match migrate::plan(&dump, &pm2_home) {
+        Ok(r) => r,
+        Err(e) => return fail(&e),
+    };
+    if json {
+        match serde_json::to_string_pretty(&report) {
+            Ok(s) => println!("{s}"),
+            Err(e) => return fail(&e.to_string()),
+        }
+    } else {
+        migrate::print(&report);
+    }
+    if report.blocked() > 0 {
+        ExitCode::from(code::PARTIAL)
+    } else {
+        ExitCode::SUCCESS
+    }
 }
 
 fn fail(msg: &str) -> ExitCode {

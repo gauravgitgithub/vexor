@@ -1466,3 +1466,35 @@ fn watch_from_the_command_line() {
     let printed = env.ok(&["events", "loop"]);
     assert!(printed.contains("changed.js"), "{printed}");
 }
+
+#[test]
+fn health_check_from_the_command_line() {
+    let env = Env::new();
+    let out = env.run(&["start", "loop.sh", "--health-check", "http://10.0.0.1:80/"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("only target this machine"));
+
+    // Nothing listens on the port: the app never becomes ready.
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|l| l.local_addr())
+        .expect("bind")
+        .port();
+    env.ok(&[
+        "start",
+        "loop.sh",
+        "--health-check",
+        &format!("127.0.0.1:{port}"),
+    ]);
+    let describe = env.ok(&["describe", "loop"]);
+    assert!(
+        describe.contains(&format!("connect to 127.0.0.1:{port} every 10s")),
+        "{describe}"
+    );
+    std::thread::sleep(Duration::from_millis(1500));
+    let app = env
+        .list()
+        .into_iter()
+        .find(|a| a["name"] == "loop")
+        .expect("app");
+    assert_eq!(states(&app), ["starting"]);
+}

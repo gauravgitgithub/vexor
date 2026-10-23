@@ -74,6 +74,18 @@ pub enum ShimEvent<'a> {
         rss_bytes: u64,
         limit_bytes: u64,
     },
+    /// A health check's result changed (passing ↔ failing), or, in cluster
+    /// mode, failures triggered a reload (`action`).
+    Health {
+        app: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        instance: Option<u32>,
+        ok: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        action: Option<&'static str>,
+    },
     /// A watched file changed: every instance is being restarted.
     WatchRestart { app: &'a str, path: &'a Path },
     /// `cron_restart` fired: every instance is being restarted.

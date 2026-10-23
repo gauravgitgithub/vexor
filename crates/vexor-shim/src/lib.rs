@@ -14,6 +14,7 @@ mod cluster;
 mod control;
 mod cron;
 mod filewatch;
+mod health;
 mod identity;
 mod instance;
 mod logs;
@@ -128,6 +129,9 @@ pub fn validate(spec: &AppSpec) -> Result<(), String> {
     }
     if let Some(c) = &spec.cron_restart {
         cron::parse(c)?;
+    }
+    if let Some(hc) = &spec.health_check {
+        hc.target(spec.cluster.is_none().then_some(0))?;
     }
     if let Some(w) = &spec.watch {
         if w.paths.is_empty() || w.paths.iter().any(|p| !p.is_absolute()) {
@@ -246,6 +250,18 @@ pub async fn run(spec: AppSpec, home: Option<PathBuf>) -> i32 {
             restart_tx.clone(),
         ))
     });
+    let app_health = spec
+        .cluster
+        .as_ref()
+        .and(spec.health_check.as_ref())
+        .map(|_| {
+            tokio::spawn(cluster_health(
+                spec.clone(),
+                out.clone(),
+                restart_tx.clone(),
+                stop_rx.clone(),
+            ))
+        });
     let epoch = tokio::time::Instant::now();
     let mut set = tokio::task::JoinSet::new();
     for index in 0..spec.instances {
@@ -285,6 +301,9 @@ pub async fn run(spec: AppSpec, home: Option<PathBuf>) -> i32 {
     }
     if let Some(w) = watcher {
         w.abort();
+    }
+    if let Some(h) = app_health {
+        h.abort();
     }
     if let Some(c) = &cluster {
         c.shutdown().await;
@@ -330,6 +349,79 @@ fn claim(home: &Path, app: &str) -> std::io::Result<Claim> {
         listener,
         paths,
     })
+}
+
+/// Cluster mode: every worker shares the app's port, so a check can't tell
+/// workers apart. After `health_restart_after` failures in a row the app is
+/// reloaded (new workers first, old ones kept until the new are ready).
+/// Failures count only once the app has passed a check, and again only after
+/// it passes following a reload, so a check that never passes doesn't cause
+/// endless reloads.
+async fn cluster_health(
+    spec: Arc<AppSpec>,
+    out: output::Output,
+    control: tokio::sync::broadcast::Sender<instance::Control>,
+    mut stopping: watch::Receiver<bool>,
+) {
+    let Some(hc) = spec.health_check.clone() else {
+        return;
+    };
+    let Ok(target) = hc.target(None) else {
+        return;
+    };
+    let interval = std::time::Duration::from_millis(hc.interval_ms.max(100));
+    let timeout = std::time::Duration::from_millis(hc.timeout_ms.max(10));
+    let restart_after = spec.policy.health_restart_after.unwrap_or(u32::MAX);
+    let mut armed = false;
+    let mut failures = 0u32;
+    let mut last: Option<bool> = None;
+    loop {
+        let wait = if armed {
+            interval
+        } else {
+            interval.min(std::time::Duration::from_millis(500))
+        };
+        // Checks end when the app is being stopped: its failing checks
+        // then mean nothing.
+        tokio::select! {
+            () = tokio::time::sleep(wait) => {}
+            _ = stopping.wait_for(|s| *s) => return,
+        }
+        let result = health::probe(&target, timeout).await;
+        if *stopping.borrow() {
+            return;
+        }
+        let ok = result.is_ok();
+        if ok {
+            armed = true;
+            failures = 0;
+        } else if armed {
+            failures = failures.saturating_add(1);
+        }
+        if armed && last != Some(ok) {
+            last = Some(ok);
+            out.emit(&output::ShimEvent::Health {
+                app: &spec.name,
+                instance: None,
+                ok,
+                detail: result.as_ref().err().cloned(),
+                action: None,
+            });
+        }
+        if armed && failures >= restart_after {
+            out.emit(&output::ShimEvent::Health {
+                app: &spec.name,
+                instance: None,
+                ok: false,
+                detail: result.err(),
+                action: Some("reload"),
+            });
+            let _ = control.send(instance::Control::Reload);
+            armed = false;
+            failures = 0;
+            last = None;
+        }
+    }
 }
 
 /// Reap adopted orphans as they exit, and report each new live one once.

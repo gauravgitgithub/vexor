@@ -764,14 +764,24 @@ fn cluster_primary_death_restarts_every_worker() {
     let started = Instant::now();
     let before = wait_workers(port, 3);
     let worker = *before.keys().next().expect("worker");
-    let ppid = Command::new("ps")
-        .args(["-o", "ppid=", "-p", &worker.to_string()])
-        .output()
-        .expect("ps");
-    let primary: u32 = String::from_utf8_lossy(&ppid.stdout)
-        .trim()
-        .parse()
-        .expect("ppid");
+    // /proc where there is one (BusyBox `ps` has no -p), else ps.
+    let primary: u32 = match std::fs::read_to_string(format!("/proc/{worker}/stat")) {
+        Ok(stat) => stat[stat.rfind(')').expect("stat") + 2..]
+            .split_whitespace()
+            .nth(1)
+            .and_then(|f| f.parse().ok())
+            .expect("ppid"),
+        Err(_) => {
+            let ppid = Command::new("ps")
+                .args(["-o", "ppid=", "-p", &worker.to_string()])
+                .output()
+                .expect("ps");
+            String::from_utf8_lossy(&ppid.stdout)
+                .trim()
+                .parse()
+                .expect("ppid")
+        }
+    };
     kill(primary, "KILL");
     let deadline = Instant::now() + TIMEOUT;
     loop {
@@ -1084,4 +1094,189 @@ fn watch_delay_postpones_the_restart() {
     );
     kill(child.id(), "TERM");
     let _ = finish(child, started);
+}
+
+// ------------------------------------------------------------ health checks
+
+/// An HTTP server on `BASE + instance` (or `PORT` in cluster mode) whose
+/// /health answers 503 while `<dir>/fail-<instance>` (or `<dir>/fail`)
+/// exists.
+const HEALTH_APP: &str = "
+var fs = require('fs');
+var inst = process.env.NODE_APP_INSTANCE;
+var port = process.env.PORT ? Number(process.env.PORT) : Number(process.env.BASE) + Number(inst);
+require('http').createServer(function (q, s) {
+  var bad = fs.existsSync(process.env.DIR + '/fail-' + inst) || fs.existsSync(process.env.DIR + '/fail');
+  s.statusCode = bad ? 503 : 200;
+  s.end(bad ? 'bad' : 'ok');
+}).listen(port, '127.0.0.1', function () { console.log('listening ' + inst + ' ' + process.pid); });
+";
+
+/// Two adjacent free ports `p`, `p + 1` with `p % 10 == 0`, reserved from
+/// `cluster_port` so no other test is given either.
+fn port_pair() -> u16 {
+    loop {
+        let p = cluster_port();
+        if p.is_multiple_of(10) {
+            let next = cluster_port();
+            if next == p + 1 {
+                return p;
+            }
+        }
+    }
+}
+
+fn state_events(events: &[Value], instance: u64) -> Vec<&Value> {
+    events
+        .iter()
+        .filter(|e| e["type"] == "state" && e["instance"] == instance)
+        .collect()
+}
+
+#[test]
+fn health_check_gates_readiness_and_restarts_a_failing_instance() {
+    let Some(node) = node() else { return };
+    let shim = Shim::new();
+    std::fs::write(shim.path("app.js"), HEALTH_APP).expect("write app");
+    let prefix = port_pair() / 10;
+    let spec = shim.spec(
+        &node,
+        &[shim.path("app.js").to_str().expect("utf-8")],
+        json!({
+            "instances": 2,
+            "env": { "PATH": "/usr/bin:/bin", "BASE": (prefix * 10).to_string(), "DIR": shim.dir.path() },
+            "health_check": {
+                "http": format!("http://127.0.0.1:{prefix}{{instance}}/health"),
+                "interval_ms": 200, "timeout_ms": 1000
+            },
+            "policy": { "ready_timeout_ms": 10000, "health_unhealthy_after": 1, "health_restart_after": 3 },
+        }),
+    );
+    let child = shim.start(&spec);
+    let started = Instant::now();
+    while shim.out_log().matches("listening").count() < 2 {
+        assert!(started.elapsed() < TIMEOUT, "{}", shim.out_log());
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::thread::sleep(Duration::from_millis(800));
+    std::fs::write(shim.path("fail-1"), "").expect("touch");
+    // Instance 1 fails 3 checks, is restarted, comes back: then fix it.
+    while shim.out_log().matches("listening 1").count() < 2 {
+        assert!(started.elapsed() < TIMEOUT, "{}", shim.out_log());
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::fs::remove_file(shim.path("fail-1")).expect("rm");
+    std::thread::sleep(Duration::from_millis(1500));
+    kill(child.id(), "TERM");
+    let done = finish(child, started);
+
+    let s0: Vec<&str> = state_events(&done.events, 0)
+        .iter()
+        .filter_map(|e| e["state"].as_str())
+        .collect();
+    let s1: Vec<&str> = state_events(&done.events, 1)
+        .iter()
+        .filter_map(|e| e["state"].as_str())
+        .collect();
+    // Starting until the first check passes; instance 0 never disturbed.
+    assert_eq!(&s0[..2], ["starting", "online"], "{s0:?}");
+    assert!(
+        !s0.contains(&"unhealthy") && !s0[..s0.len() - 2].contains(&"stopping"),
+        "{s0:?}"
+    );
+    assert!(s1.contains(&"unhealthy"), "{s1:?}");
+    assert!(
+        s1.iter().filter(|s| **s == "starting").count() >= 2,
+        "{s1:?}"
+    );
+    assert_eq!(
+        s1[s1.len() - 3],
+        "online",
+        "back online before the stop: {s1:?}"
+    );
+    let health: Vec<&Value> = done
+        .events
+        .iter()
+        .filter(|e| e["type"] == "health")
+        .collect();
+    assert!(
+        health
+            .iter()
+            .any(|e| e["instance"] == 1 && e["ok"] == false && e["detail"] == "HTTP 503"),
+        "{health:?}"
+    );
+    assert!(
+        health.iter().all(|e| e["instance"] != 0 || e["ok"] == true),
+        "{health:?}"
+    );
+}
+
+#[test]
+fn health_check_that_never_passes_fails_the_start() {
+    let shim = Shim::new();
+    // An ephemeral port nothing listens on.
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|l| l.local_addr())
+        .expect("bind")
+        .port();
+    let spec = shim.spec(
+        "/bin/sh",
+        &["-c", "echo up; while :; do sleep 0.05; done"],
+        json!({
+            "health_check": { "tcp": format!("127.0.0.1:{port}"), "interval_ms": 200, "timeout_ms": 200 },
+            "policy": { "ready_timeout_ms": 1500, "max_restarts": 1, "kill_timeout_ms": 500,
+                        "health_unhealthy_after": 1, "health_restart_after": 2 },
+        }),
+    );
+    let done = shim.run(&spec);
+    assert_eq!(done.code, Some(1), "{}", done.stderr);
+    assert_eq!(states(&done.events, 0), ["starting", "stopping", "errored"]);
+}
+
+#[test]
+fn cluster_health_failures_reload_the_app() {
+    let Some(node) = node() else { return };
+    let shim = Shim::new();
+    std::fs::write(shim.path("app.js"), HEALTH_APP).expect("write app");
+    let port = cluster_port();
+    let spec = shim.spec(
+        &node,
+        &[],
+        json!({
+            "instances": 2,
+            "node_ipc": true,
+            "env": { "PATH": "/usr/bin:/bin", "PORT": port.to_string(), "DIR": shim.dir.path() },
+            "cluster": { "script": shim.path("app.js") },
+            "health_check": { "http": format!("http://127.0.0.1:{port}/health"), "interval_ms": 200, "timeout_ms": 1000 },
+            "policy": { "health_unhealthy_after": 1, "health_restart_after": 2 },
+        }),
+    );
+    let child = shim.start(&spec);
+    let started = Instant::now();
+    while shim.out_log().matches("listening").count() < 2 {
+        assert!(started.elapsed() < TIMEOUT, "{}", shim.out_log());
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::thread::sleep(Duration::from_millis(800));
+    std::fs::write(shim.path("fail"), "").expect("touch");
+    // A reload replaces both workers.
+    while shim.out_log().matches("listening").count() < 4 {
+        assert!(started.elapsed() < TIMEOUT, "{}", shim.out_log());
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::fs::remove_file(shim.path("fail")).expect("rm");
+    std::thread::sleep(Duration::from_millis(1000));
+    kill(child.id(), "TERM");
+    let done = finish(child, started);
+    let reloads = done
+        .events
+        .iter()
+        .filter(|e| e["type"] == "health" && e["action"] == "reload")
+        .count();
+    assert_eq!(reloads, 1, "{:?}", done.events);
+    assert!(
+        done.events.iter().all(|e| e["state"] != "errored"),
+        "{:?}",
+        done.events
+    );
 }

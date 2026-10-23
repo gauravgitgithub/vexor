@@ -259,12 +259,18 @@ pub struct StartArgs {
     /// node_modules ignored), as PM2.
     #[arg(long)]
     pub watch: bool,
+    /// Check the app every 10 s: an http://127.0.0.1:PORT/PATH URL (2xx/3xx
+    /// passes) or a 127.0.0.1:PORT address (a connection passes). `{instance}`
+    /// is replaced by the instance number (not in cluster mode). Restarted
+    /// after 6 failures in a row; ready when it first passes.
+    #[arg(long, value_name = "URL|ADDR")]
+    pub health_check: Option<String>,
     /// Pass this shell's whole environment to the app (PM2 behaviour).
     /// By default only a small allowlist is passed (see docs/security.md T2).
     #[arg(long)]
     pub inherit_env: bool,
     /// Start from a complete app spec file (JSON) instead of a script.
-    #[arg(long, conflicts_with_all = ["target", "name", "instances", "interpreter", "cwd", "env", "inherit_env", "max_memory_restart", "cron_restart", "watch"])]
+    #[arg(long, conflicts_with_all = ["target", "name", "instances", "interpreter", "cwd", "env", "inherit_env", "max_memory_restart", "cron_restart", "watch", "health_check"])]
     pub spec: Option<PathBuf>,
     /// Arguments for the app, after `--`.
     #[arg(last = true)]
@@ -589,6 +595,7 @@ fn check(
         max_memory_restart: None,
         cron_restart: None,
         watch: false,
+        health_check: None,
         only,
         allow_unsupported: false,
     };
@@ -843,6 +850,19 @@ pub(crate) fn print_events(events: &[serde_json::Value]) {
         }
         if let Some(s) = e["signal"].as_str() {
             detail.push(format!("signal={s}"));
+        }
+        if e["type"] == "health" {
+            detail.push(if e["ok"] == true {
+                "passing".into()
+            } else {
+                "failing".into()
+            });
+            if let Some(d) = e["detail"].as_str() {
+                detail.push(d.to_owned());
+            }
+            if let Some(a) = e["action"].as_str() {
+                detail.push(format!("action={a}"));
+            }
         }
         if e["type"] == "watch_restart"
             && let Some(p) = e["path"].as_str()

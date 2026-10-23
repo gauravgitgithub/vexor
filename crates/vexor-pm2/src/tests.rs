@@ -591,3 +591,47 @@ fn watch_settings_translate() {
     let t = tr(base(json!({"watch": 5})));
     assert_eq!(fatal(&t.notes), ["watch"]);
 }
+
+#[test]
+fn health_check_translates() {
+    let dir = tempfile::tempdir().expect("dir");
+    let tr = |v: serde_json::Value| translate(&v, &ctx(dir.path())).expect("translates");
+    let t = tr(json!({
+        "name": "a", "script": "/bin/sh",
+        "health_check": { "http": "http://127.0.0.1:30{instance}0/health", "interval": "5s", "restart_after": 4 }
+    }));
+    assert!(fatal(&t.notes).is_empty(), "{:?}", t.notes);
+    let hc = t.spec.health_check.expect("health");
+    assert_eq!(
+        hc.http.as_deref(),
+        Some("http://127.0.0.1:30{instance}0/health")
+    );
+    assert_eq!((hc.interval_ms, hc.timeout_ms), (5000, 2000));
+    assert_eq!(t.spec.policy.health_unhealthy_after, Some(3));
+    assert_eq!(t.spec.policy.health_restart_after, Some(4));
+    // Ready when the check first passes.
+    assert_eq!(t.spec.policy.ready_timeout_ms, Some(30_000));
+
+    let t = tr(
+        json!({"name": "a", "script": "/bin/sh", "listen_timeout": 8000, "health_check": { "tcp": "127.0.0.1:6000" }}),
+    );
+    assert_eq!(t.spec.policy.ready_timeout_ms, Some(8000));
+    assert!(
+        t.notes.iter().all(|n| n.field != "listen_timeout"),
+        "{:?}",
+        t.notes
+    );
+
+    for bad in [
+        json!({ "http": "http://10.1.2.3:80/" }),
+        json!({ "http": "https://127.0.0.1:443/" }),
+        json!({ "tcp": "127.0.0.1" }),
+        json!({ "http": "http://127.0.0.1:1/", "tcp": "127.0.0.1:1" }),
+        json!({ "http": "http://127.0.0.1:1/", "retries": 3 }),
+        json!("http://127.0.0.1:1/"),
+    ] {
+        let t = tr(json!({"name": "a", "script": "/bin/sh", "health_check": bad}));
+        assert_eq!(fatal(&t.notes), ["health_check"], "{bad}");
+        assert!(t.spec.health_check.is_none());
+    }
+}

@@ -79,6 +79,7 @@ pub fn start_plan(args: &StartArgs, home: &Path) -> Result<Plan, String> {
             || args.max_memory_restart.is_some()
             || args.cron_restart.is_some()
             || args.watch
+            || args.health_check.is_some()
         {
             return Err(format!(
                 "{target:?} is not a file; options like --name/-i/--env/--only only apply when starting a file"
@@ -108,9 +109,10 @@ fn ecosystem_plan(args: &StartArgs, path: &Path, home: &Path) -> Result<Plan, St
         || args.max_memory_restart.is_some()
         || args.cron_restart.is_some()
         || args.watch
+        || args.health_check.is_some()
     {
         return Err(
-            "--name, -i, --max-memory-restart, --cron-restart, --watch and app arguments don't apply to ecosystem files; set them in the file"
+            "--name, -i, --max-memory-restart, --cron-restart, --watch, --health-check and app arguments don't apply to ecosystem files; set them in the file"
                 .into(),
         );
     }
@@ -232,6 +234,46 @@ fn build(args: &StartArgs, script: &Path, home: &Path) -> Result<AppSpec, String
         ignore: vexor_core::WatchSpec::default_ignore(),
         delay_ms: 0,
     });
+    let max_memory_bytes = match &args.max_memory_restart {
+        Some(m) => Some(
+            vexor_pm2::parse_memory(&serde_json::Value::String(m.clone()))
+                .filter(|b| *b > 0)
+                .ok_or_else(|| {
+                    format!("--max-memory-restart: expected bytes or a size like 200M, got {m:?}")
+                })?,
+        ),
+        None => None,
+    };
+    let health_check = match &args.health_check {
+        Some(t) => {
+            let (http, tcp) = if t.starts_with("http") {
+                (Some(t.clone()), None)
+            } else {
+                (None, Some(t.clone()))
+            };
+            let hc = vexor_core::HealthCheckSpec {
+                http,
+                tcp,
+                interval_ms: 10_000,
+                timeout_ms: 2_000,
+            };
+            hc.target(cluster.is_none().then_some(0))
+                .map_err(|e| format!("--health-check: {e}"))?;
+            Some(hc)
+        }
+        None => None,
+    };
+    let mut policy = PolicySpec {
+        max_memory_bytes,
+        ..PolicySpec::default()
+    };
+    if health_check.is_some() {
+        policy.health_unhealthy_after = Some(3);
+        policy.health_restart_after = Some(6);
+        if cluster.is_none() {
+            policy.ready_timeout_ms = Some(30_000);
+        }
+    }
     let logs = home.join("logs");
     Ok(AppSpec {
         logs: LogSpec::new(
@@ -247,19 +289,7 @@ fn build(args: &StartArgs, script: &Path, home: &Path) -> Result<AppSpec, String
         instance_var: "NODE_APP_INSTANCE".to_owned(),
         node_ipc,
         treekill: true,
-        policy: PolicySpec {
-            max_memory_bytes: match &args.max_memory_restart {
-                Some(m) => Some(
-                    vexor_pm2::parse_memory(&serde_json::Value::String(m.clone()))
-                        .filter(|b| *b > 0)
-                        .ok_or_else(|| {
-                            format!("--max-memory-restart: expected bytes or a size like 200M, got {m:?}")
-                        })?,
-                ),
-                None => None,
-            },
-            ..PolicySpec::default()
-        },
+        policy,
         cluster,
         cron_restart: match &args.cron_restart {
             Some(p) => {
@@ -269,6 +299,7 @@ fn build(args: &StartArgs, script: &Path, home: &Path) -> Result<AppSpec, String
             None => None,
         },
         watch,
+        health_check,
     })
 }
 

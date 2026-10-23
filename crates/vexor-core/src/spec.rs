@@ -57,6 +57,105 @@ pub struct AppSpec {
     /// PM2 `watch`: restart every instance when files change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub watch: Option<WatchSpec>,
+    /// Periodic HTTP or TCP check. Failures count towards
+    /// `policy.health_unhealthy_after` / `health_restart_after`; a pass while
+    /// starting counts as ready.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_check: Option<HealthCheckSpec>,
+}
+
+/// A health check against the app. Only loopback addresses are allowed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HealthCheckSpec {
+    /// `http://127.0.0.1:3000/health`: passes on a 2xx or 3xx status.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http: Option<String>,
+    /// `127.0.0.1:3000`: passes when a connection is accepted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tcp: Option<String>,
+    #[serde(default = "default_health_interval")]
+    pub interval_ms: u64,
+    #[serde(default = "default_health_timeout")]
+    pub timeout_ms: u64,
+}
+
+/// Where a health check connects, after `{instance}` substitution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HealthTarget {
+    pub host: String,
+    pub port: u16,
+    /// HTTP request path; `None` for a TCP check.
+    pub path: Option<String>,
+}
+
+impl HealthCheckSpec {
+    /// The target for one instance (`{instance}` is replaced by its index;
+    /// `None`: the template must not use it). Errors describe what's wrong.
+    pub fn target(&self, instance: Option<u32>) -> Result<HealthTarget, String> {
+        let (raw, http) = match (&self.http, &self.tcp) {
+            (Some(u), None) => (u.as_str(), true),
+            (None, Some(a)) => (a.as_str(), false),
+            _ => return Err("health_check needs exactly one of `http` and `tcp`".into()),
+        };
+        let raw = match instance {
+            Some(i) => raw.replace("{instance}", &i.to_string()),
+            None if raw.contains("{instance}") => {
+                return Err(
+                    "{instance} can't be used here: in cluster mode every instance shares the app's port"
+                        .into(),
+                );
+            }
+            None => raw.to_owned(),
+        };
+        let (hostport, path) = if http {
+            let rest = raw.strip_prefix("http://").ok_or_else(|| {
+                format!("health_check.http must start with http:// (https is not supported), got {raw:?}")
+            })?;
+            match rest.find('/') {
+                Some(i) => (rest[..i].to_owned(), Some(rest[i..].to_owned())),
+                None => (rest.to_owned(), Some("/".to_owned())),
+            }
+        } else {
+            (raw.clone(), None)
+        };
+        let (host, port) = hostport
+            .rsplit_once(':')
+            .ok_or_else(|| format!("health check address needs a port: {raw:?}"))?;
+        let port: u16 = port
+            .parse()
+            .ok()
+            .filter(|p| *p > 0)
+            .ok_or_else(|| format!("invalid port in health check address {raw:?}"))?;
+        let host = host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .to_owned();
+        let loopback = host == "localhost"
+            || host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback());
+        if !loopback {
+            return Err(format!(
+                "health checks may only target this machine (127.0.0.1, ::1 or localhost), got {host:?}"
+            ));
+        }
+        if path
+            .as_deref()
+            .is_some_and(|p| p.contains(char::is_whitespace))
+        {
+            return Err(format!("invalid health check path in {raw:?}"));
+        }
+        Ok(HealthTarget { host, port, path })
+    }
+}
+
+fn default_health_interval() -> u64 {
+    10_000
+}
+
+fn default_health_timeout() -> u64 {
+    2_000
 }
 
 /// What `watch` watches.
@@ -402,5 +501,65 @@ mod tests {
                 max: Duration::from_millis(15_000)
             }
         );
+    }
+}
+
+#[cfg(test)]
+mod health_tests {
+    use super::*;
+
+    fn http(u: &str) -> HealthCheckSpec {
+        HealthCheckSpec {
+            http: Some(u.into()),
+            tcp: None,
+            interval_ms: 1000,
+            timeout_ms: 500,
+        }
+    }
+
+    #[test]
+    fn targets_parse_and_substitute() {
+        let t = http("http://127.0.0.1:30{instance}1/health?x=1")
+            .target(Some(2))
+            .expect("ok");
+        assert_eq!(
+            (t.host.as_str(), t.port, t.path.as_deref()),
+            ("127.0.0.1", 3021, Some("/health?x=1"))
+        );
+        let t = http("http://localhost:8080").target(Some(0)).expect("ok");
+        assert_eq!(t.path.as_deref(), Some("/"));
+        let t = http("http://[::1]:9000/h").target(None).expect("ok");
+        assert_eq!(t.host, "::1");
+        let tcp = HealthCheckSpec {
+            http: None,
+            tcp: Some("127.0.0.1:6379".into()),
+            ..http("")
+        };
+        assert_eq!(tcp.target(None).expect("ok").path, None);
+    }
+
+    #[test]
+    fn bad_targets_are_errors() {
+        for u in [
+            "https://127.0.0.1:1/",
+            "http://10.0.0.5:80/",
+            "http://example.com:80/",
+            "http://127.0.0.1/",
+            "http://127.0.0.1:0/",
+            "http://127.0.0.1:99999/",
+            "127.0.0.1:80",
+        ] {
+            assert!(http(u).target(Some(0)).is_err(), "{u}");
+        }
+        assert!(
+            http("http://127.0.0.1:30{instance}0/")
+                .target(None)
+                .is_err()
+        );
+        let both = HealthCheckSpec {
+            tcp: Some("127.0.0.1:1".into()),
+            ..http("http://127.0.0.1:1/")
+        };
+        assert!(both.target(None).is_err());
     }
 }

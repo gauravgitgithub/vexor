@@ -3,6 +3,14 @@
 All notable changes to Vexor. Versions follow [Semantic Versioning](https://semver.org/);
 before 1.0, minor versions may include breaking changes, which are listed here.
 
+## Unreleased
+
+### Added
+- HTTP/TCP health checks (`health_check` in ecosystem files, `vexor start
+  --health-check`): an instance is ready when its first check passes and
+  is restarted after repeated failures; cluster apps are reloaded instead.
+  Loopback targets only.
+
 ## 0.2.0 (2026-10-23, prerelease)
 
 Moving from PM2: a migration that plans, backs up, moves apps one at a

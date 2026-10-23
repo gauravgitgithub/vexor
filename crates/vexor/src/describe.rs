@@ -175,6 +175,25 @@ pub fn print(status: &AppStatus, spec: &AppSpec, events: &[Value], show_env: boo
             }
         ),
     );
+    if let Some(hc) = &spec.health_check {
+        let what = hc
+            .http
+            .as_ref()
+            .map(|u| format!("GET {u}"))
+            .or_else(|| hc.tcp.as_ref().map(|a| format!("connect to {a}")))
+            .unwrap_or_default();
+        row(
+            "Health",
+            format!(
+                "{what} every {} (timeout {}), unhealthy after {} failures, restarted after {}",
+                ms(hc.interval_ms),
+                ms(hc.timeout_ms),
+                p.health_unhealthy_after.unwrap_or(0),
+                p.health_restart_after
+                    .map_or_else(|| "-".to_owned(), |r| r.to_string())
+            ),
+        );
+    }
     if let Some(w) = &spec.watch {
         let paths: Vec<String> = w.paths.iter().map(|p| p.display().to_string()).collect();
         row(

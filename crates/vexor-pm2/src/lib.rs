@@ -21,6 +21,10 @@ const LOADER: &str = include_str!("loader.js");
 /// PM2 default `listen_timeout` when `wait_ready` is set, in milliseconds.
 const PM2_LISTEN_TIMEOUT_MS: u64 = 3000;
 
+/// How long a fork-mode app with a health check (and no `wait_ready`) has
+/// to pass its first check, unless `listen_timeout` says otherwise.
+const HEALTH_READY_TIMEOUT_MS: u64 = 30_000;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Severity {
@@ -282,6 +286,7 @@ const HANDLED: &[&str] = &[
     "name_prefix",
     "max_memory_restart",
     "cron_restart",
+    "health_check",
 ];
 
 /// Translate one PM2 app definition.
@@ -576,6 +581,12 @@ pub fn translate(app: &Value, ctx: &Context) -> Result<Translated, Vec<Note>> {
         }
     };
     let watch = watch_spec(obj, &cwd, &mut c);
+    let health_check = health_check_spec(
+        obj.get("health_check"),
+        mode == ExecMode::Cluster,
+        &mut policy,
+        &mut c,
+    );
     let wait_ready = obj.get("wait_ready").and_then(Value::as_bool) == Some(true);
     let listen_timeout = duration_ms(obj.get("listen_timeout"), "listen_timeout", &mut c);
     if wait_ready {
@@ -587,6 +598,9 @@ pub fn translate(app: &Value, ctx: &Context) -> Result<Translated, Vec<Note>> {
             );
         }
         policy.ready_timeout_ms = Some(listen_timeout.unwrap_or(PM2_LISTEN_TIMEOUT_MS));
+    } else if health_check.is_some() && mode == ExecMode::Fork {
+        // Ready when the health check first passes.
+        policy.ready_timeout_ms = Some(listen_timeout.unwrap_or(HEALTH_READY_TIMEOUT_MS));
     } else if listen_timeout.is_some() {
         c.note(
             "listen_timeout",
@@ -671,6 +685,7 @@ pub fn translate(app: &Value, ctx: &Context) -> Result<Translated, Vec<Note>> {
         cluster,
         cron_restart,
         watch,
+        health_check,
     };
     let autostart = obj
         .get("autostart")
@@ -789,6 +804,62 @@ fn duration_ms(v: Option<&Value>, field: &str, c: &mut Ctx) -> Option<u64> {
         },
         other => number(other, field, c),
     }
+}
+
+/// Vexor's `health_check` extension (PM2 has none outside PM2 Plus):
+/// `{ http: "http://127.0.0.1:3000/health" | tcp: "127.0.0.1:3000",
+///    interval: "10s", timeout: "2s", unhealthy_after: 3, restart_after: 6 }`.
+fn health_check_spec(
+    v: Option<&Value>,
+    cluster: bool,
+    policy: &mut PolicySpec,
+    c: &mut Ctx,
+) -> Option<vexor_core::HealthCheckSpec> {
+    let obj = match v {
+        None | Some(Value::Null) => return None,
+        Some(Value::Object(o)) => o,
+        Some(_) => {
+            c.note(
+                "health_check",
+                Severity::Fatal,
+                "expected an object such as { http: \"http://127.0.0.1:3000/health\" }",
+            );
+            return None;
+        }
+    };
+    for k in obj.keys() {
+        if !matches!(
+            k.as_str(),
+            "http" | "tcp" | "interval" | "timeout" | "unhealthy_after" | "restart_after"
+        ) {
+            c.note(
+                "health_check",
+                Severity::Fatal,
+                format!("unknown setting health_check.{k}"),
+            );
+            return None;
+        }
+    }
+    let text = |k: &str| obj.get(k).and_then(Value::as_str).map(str::to_owned);
+    let spec = vexor_core::HealthCheckSpec {
+        http: text("http"),
+        tcp: text("tcp"),
+        interval_ms: duration_ms(obj.get("interval"), "health_check.interval", c).unwrap_or(10_000),
+        timeout_ms: duration_ms(obj.get("timeout"), "health_check.timeout", c).unwrap_or(2_000),
+    };
+    if let Err(e) = spec.target((!cluster).then_some(0)) {
+        c.note("health_check", Severity::Fatal, e);
+        return None;
+    }
+    let count = |k: &str, default: u32, c: &mut Ctx| {
+        number(obj.get(k), &format!("health_check.{k}"), c)
+            .map_or(default, |n| u32::try_from(n).unwrap_or(u32::MAX).max(1))
+    };
+    let unhealthy_after = count("unhealthy_after", 3, c);
+    let restart_after = count("restart_after", 6, c).max(unhealthy_after);
+    policy.health_unhealthy_after = Some(unhealthy_after);
+    policy.health_restart_after = Some(restart_after);
+    Some(spec)
 }
 
 /// PM2 `watch` / `ignore_watch` / `watch_delay` (docs/compatibility.md).

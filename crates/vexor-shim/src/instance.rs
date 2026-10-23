@@ -89,6 +89,23 @@ pub struct Runner {
     rand_counter: u64,
     /// Periodic memory check, while `max_memory_bytes` is set.
     memory_check: Option<tokio::time::Interval>,
+    /// HTTP/TCP health check (fork mode; cluster mode checks the app as a
+    /// whole, in `lib.rs`).
+    health: Option<HealthRun>,
+}
+
+type ProbeResult = (u32, Result<(), String>);
+
+struct HealthRun {
+    target: vexor_core::HealthTarget,
+    interval: Duration,
+    timeout: Duration,
+    next: Instant,
+    busy: bool,
+    tx: mpsc::UnboundedSender<ProbeResult>,
+    rx: mpsc::UnboundedReceiver<ProbeResult>,
+    /// Last result reported for `pid`.
+    last: Option<(u32, bool)>,
 }
 
 impl Runner {
@@ -132,6 +149,7 @@ impl Runner {
             rand: std::collections::hash_map::RandomState::new(),
             rand_counter: 0,
             memory_check: None,
+            health: None,
         }
     }
 
@@ -151,6 +169,24 @@ impl Runner {
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             self.memory_check = Some(tick);
         }
+        if let (Some(hc), None) = (&self.spec.health_check, &self.cluster) {
+            match hc.target(Some(self.index)) {
+                Ok(target) => {
+                    let (tx, rx) = mpsc::unbounded_channel();
+                    self.health = Some(HealthRun {
+                        target,
+                        interval: Duration::from_millis(hc.interval_ms.max(100)),
+                        timeout: Duration::from_millis(hc.timeout_ms.max(10)),
+                        next: Instant::now(),
+                        busy: false,
+                        tx,
+                        rx,
+                        last: None,
+                    });
+                }
+                Err(e) => eprintln!("vexor shim: health check disabled: {e}"),
+            }
+        }
         let mut shutting_down = false;
         let mut control_open = true;
         loop {
@@ -163,6 +199,7 @@ impl Runner {
                 break;
             }
             let deadline = self.timer.map(|(_, _, at)| at);
+            let health_due = self.health_due();
             tokio::select! {
                 status = wait_child(&mut self.cur_child), if self.cur_child.is_some() => {
                     self.cur_child = None;
@@ -210,6 +247,14 @@ impl Runner {
                         self.queue.push_back(Event::Stop);
                     }
                 }
+                () = sleep_until(health_due), if !shutting_down && health_due.is_some() => {
+                    self.start_probe();
+                }
+                r = recv_probe(&mut self.health), if self.health.is_some() => {
+                    if let Some(r) = r {
+                        self.on_probe(r);
+                    }
+                }
                 () = memory_tick(&mut self.memory_check), if self.memory_check.is_some() && !shutting_down => {
                     self.check_memory();
                 }
@@ -235,6 +280,66 @@ impl Runner {
         self.cur_fork
             .map(|f| f.pid)
             .or_else(|| self.cur_worker.and_then(|w| w.pid))
+    }
+
+    /// When the next health check is due: only while a process is starting
+    /// or running, one check at a time.
+    fn health_due(&self) -> Option<Instant> {
+        let h = self.health.as_ref()?;
+        let running = matches!(
+            self.inst.state(),
+            State::Starting | State::Online | State::Unhealthy
+        );
+        (running && !h.busy && self.cur_fork.is_some()).then_some(h.next)
+    }
+
+    fn start_probe(&mut self) {
+        let (Some(h), Some(f)) = (self.health.as_mut(), self.cur_fork) else {
+            return;
+        };
+        h.busy = true;
+        let (target, timeout, tx, pid) = (h.target.clone(), h.timeout, h.tx.clone(), f.pid);
+        tokio::spawn(async move {
+            let r = crate::health::probe(&target, timeout).await;
+            let _ = tx.send((pid, r));
+        });
+    }
+
+    fn on_probe(&mut self, (pid, result): ProbeResult) {
+        let state = self.inst.state();
+        let current = self.cur_fork.map(|f| f.pid);
+        let Some(h) = self.health.as_mut() else {
+            return;
+        };
+        h.busy = false;
+        let ok = result.is_ok();
+        // While starting, check often so the app is online soon after it
+        // first passes.
+        let wait = if state == State::Starting {
+            h.interval.min(Duration::from_millis(500))
+        } else {
+            h.interval
+        };
+        h.next = Instant::now() + wait;
+        if current != Some(pid) {
+            // A result for a process that's gone.
+            return;
+        }
+        if h.last != Some((pid, ok)) && !(state == State::Starting && !ok) {
+            h.last = Some((pid, ok));
+            self.out.emit(&ShimEvent::Health {
+                app: &self.spec.name,
+                instance: Some(self.index),
+                ok,
+                detail: result.err(),
+                action: None,
+            });
+        }
+        match state {
+            State::Starting if ok => self.queue.push_back(Event::Ready),
+            State::Online | State::Unhealthy => self.queue.push_back(Event::Health { ok }),
+            _ => {}
+        }
     }
 
     /// Restart the instance if its process uses more memory than allowed
@@ -720,6 +825,13 @@ async fn wait_child(child: &mut Option<tokio::process::Child>) -> ExitStatus {
             eprintln!("vexor shim: wait failed: {e}");
             ExitStatus::default()
         }
+    }
+}
+
+async fn recv_probe(health: &mut Option<HealthRun>) -> Option<ProbeResult> {
+    match health {
+        Some(h) => h.rx.recv().await,
+        None => std::future::pending().await,
     }
 }
 

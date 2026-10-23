@@ -15,6 +15,7 @@ pub use lifecycle::{
 };
 pub use restart::{Backoff, Jitter, MIN_RESTART_INTERVAL, RestartPolicy};
 pub use spec::{
-    AppSpec, ClusterSpec, KillSignal, LogSpec, Overflow, PolicySpec, ReloadStrategy, WatchSpec,
+    AppSpec, ClusterSpec, HealthCheckSpec, HealthTarget, KillSignal, LogSpec, Overflow, PolicySpec,
+    ReloadStrategy, WatchSpec,
 };
 pub use time::Millis;

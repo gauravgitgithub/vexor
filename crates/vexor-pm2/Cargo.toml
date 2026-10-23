@@ -7,6 +7,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+croner = "4.0.2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 vexor-core = { path = "../vexor-core" }

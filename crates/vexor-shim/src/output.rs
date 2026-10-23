@@ -74,6 +74,8 @@ pub enum ShimEvent<'a> {
         rss_bytes: u64,
         limit_bytes: u64,
     },
+    /// `cron_restart` fired: every instance is being restarted.
+    CronRestart { app: &'a str, scheduled: String },
     SpawnError {
         app: &'a str,
         instance: u32,

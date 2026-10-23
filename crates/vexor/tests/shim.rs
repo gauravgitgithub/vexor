@@ -928,3 +928,68 @@ setInterval(function () { if (big) { big[0] = big[1]; } }, 100);
         "instance 0 untouched"
     );
 }
+
+#[test]
+fn cron_restart_restarts_on_schedule() {
+    let shim = Shim::new();
+    let extra = json!({ "instances": 2, "cron_restart": "* * * * * *" });
+    let child = shim.start(&shim.spec(
+        "/bin/sh",
+        &["-c", "echo started; while :; do sleep 0.05; done"],
+        extra,
+    ));
+    let started = Instant::now();
+    let deadline = started + TIMEOUT;
+    while shim.out_log().matches("started").count() < 6 {
+        assert!(Instant::now() < deadline, "{}", shim.out_log());
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    kill(child.id(), "TERM");
+    let done = finish(child, started);
+    let fired: Vec<&Value> = done
+        .events
+        .iter()
+        .filter(|e| e["type"] == "cron_restart")
+        .collect();
+    assert!(fired.len() >= 2, "{:?}", done.events);
+    assert!(fired.iter().all(|e| e["scheduled"].is_string()));
+    for i in 0..2 {
+        let last = done
+            .events
+            .iter()
+            .rfind(|e| e["type"] == "state" && e["instance"] == i && e["state"] == "online")
+            .expect("online");
+        assert!(last["restarts"].as_u64().expect("restarts") >= 2, "{last}");
+    }
+    assert!(
+        done.events.iter().all(|e| e["error"].is_null()),
+        "{:?}",
+        done.events
+    );
+}
+
+#[test]
+fn cron_restart_reruns_a_job_that_exited() {
+    let shim = Shim::new();
+    // A job: runs, exits 0, no autorestart. The schedule starts it again,
+    // and the shim keeps running for it.
+    let extra = json!({ "cron_restart": "* * * * * *", "policy": { "autorestart": false } });
+    let child = shim.start(&shim.spec("/bin/sh", &["-c", "echo ran"], extra));
+    let started = Instant::now();
+    let deadline = started + TIMEOUT;
+    while shim.out_log().matches("ran").count() < 3 {
+        assert!(Instant::now() < deadline, "{}", shim.out_log());
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    kill(child.id(), "TERM");
+    let done = finish(child, started);
+    assert_eq!(done.code, Some(0), "{}", done.stderr);
+}
+
+#[test]
+fn invalid_cron_restart_is_rejected() {
+    let shim = Shim::new();
+    let done = shim.run(&shim.spec("/bin/true", &[], json!({ "cron_restart": "61 * * * *" })));
+    assert_eq!(done.code, Some(2));
+    assert!(done.stderr.contains("cron_restart"), "{}", done.stderr);
+}

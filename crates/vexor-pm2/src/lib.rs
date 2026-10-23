@@ -229,10 +229,6 @@ const IGNORED: &[(&str, &str)] = &[
 
 /// Fields whose absence changes behaviour.
 const FATAL: &[(&str, &str)] = &[
-    (
-        "cron_restart",
-        "scheduled restarts are not implemented yet (plan Phase 6)",
-    ),
     ("uid", "running as another user is not supported yet"),
     ("gid", "running as another group is not supported yet"),
     ("username", "running as another user is not supported yet"),
@@ -285,6 +281,7 @@ const HANDLED: &[&str] = &[
     "kill_signal",
     "name_prefix",
     "max_memory_restart",
+    "cron_restart",
 ];
 
 /// Translate one PM2 app definition.
@@ -572,6 +569,24 @@ pub fn translate(app: &Value, ctx: &Context) -> Result<Translated, Vec<Note>> {
             Some(bytes) => policy.max_memory_bytes = Some(bytes),
         },
     }
+    let cron_restart = match obj.get("cron_restart") {
+        None | Some(Value::Null | Value::Bool(false)) => None,
+        Some(Value::String(p)) => match check_cron(p) {
+            Ok(()) => Some(p.trim().to_owned()),
+            Err(e) => {
+                c.note("cron_restart", Severity::Fatal, e);
+                None
+            }
+        },
+        Some(_) => {
+            c.note(
+                "cron_restart",
+                Severity::Fatal,
+                "expected a cron pattern such as \"0 3 * * *\"",
+            );
+            None
+        }
+    };
     let wait_ready = obj.get("wait_ready").and_then(Value::as_bool) == Some(true);
     let listen_timeout = duration_ms(obj.get("listen_timeout"), "listen_timeout", &mut c);
     if wait_ready {
@@ -665,6 +680,7 @@ pub fn translate(app: &Value, ctx: &Context) -> Result<Translated, Vec<Note>> {
         policy,
         // Cluster mode always uses the IPC channel to control the primary.
         cluster,
+        cron_restart,
     };
     let autostart = obj
         .get("autostart")
@@ -783,6 +799,20 @@ fn duration_ms(v: Option<&Value>, field: &str, c: &mut Ctx) -> Option<u64> {
         },
         other => number(other, field, c),
     }
+}
+
+/// Validate a `cron_restart` pattern as PM2 7 reads it (its `croner`
+/// library: 5 fields, or 6 with seconds first). The shim parses it the same
+/// way (`vexor-shim/src/cron.rs`).
+pub fn check_cron(pattern: &str) -> Result<(), String> {
+    use croner::parser::{CronParser, Seconds, Year};
+    CronParser::builder()
+        .seconds(Seconds::Optional)
+        .year(Year::Disallowed)
+        .build()
+        .parse(pattern)
+        .map(|_| ())
+        .map_err(|e| format!("invalid cron pattern {pattern:?}: {e}"))
 }
 
 /// PM2 memory sizes: bytes as a number or string, or a number followed by

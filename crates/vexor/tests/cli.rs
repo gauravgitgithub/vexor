@@ -527,7 +527,7 @@ module.exports = {
   apps: [
     { name: 'a', script: './loop.sh', env: { MODE: 'dev' }, env_production: { MODE: 'prod' } },
     { name: 'b', script: 'loop.sh', instances: 2, merge_logs: true, autostart: false },
-    { name: 'm', script: 'loop.sh', cron_restart: '0 3 * * *' },
+    { name: 'm', script: 'loop.sh', uid: 'www' },
   ],
 };
 ";
@@ -570,7 +570,7 @@ fn ecosystem_check_reports_without_starting() {
             .as_array()
             .expect("notes")
             .iter()
-            .any(|n| n["field"] == "cron_restart" && n["severity"] == "fatal")
+            .any(|n| n["field"] == "uid" && n["severity"] == "fatal")
     );
     assert!(
         !env.home.path().join("daemon.sock").exists(),
@@ -966,7 +966,7 @@ fn migrate_blocked_apps_exit_4_and_missing_dump_explains() {
     let dump = pm2_dump(&env);
     let mut d: Value =
         serde_json::from_str(&std::fs::read_to_string(&dump).expect("read")).expect("json");
-    d[2]["cron_restart"] = "0 3 * * *".into();
+    d[2]["uid"] = "www".into();
     std::fs::write(&dump, d.to_string()).expect("write");
     let out = env.run(&[
         "migrate",
@@ -976,7 +976,7 @@ fn migrate_blocked_apps_exit_4_and_missing_dump_explains() {
     ]);
     assert_eq!(out.status.code(), Some(4));
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("cron_restart"), "{stdout}");
+    assert!(stdout.contains("uid"), "{stdout}");
     assert!(stdout.contains("1 of 2 apps can be migrated"), "{stdout}");
 
     let out = env.run(&[
@@ -1412,5 +1412,34 @@ fn migrate_rollback_and_status() {
     assert_eq!(
         env.run(&["migrate", "--from-pm2", "--yes"]).status.code(),
         Some(2)
+    );
+}
+
+#[test]
+fn cron_restart_from_the_command_line() {
+    let env = Env::new();
+    let out = env.run(&["start", "loop.sh", "--cron-restart", "61 * * * *"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--cron-restart"));
+
+    env.ok(&["start", "loop.sh", "--cron-restart", "* * * * * *"]);
+    let describe = env.ok(&["describe", "loop"]);
+    assert!(
+        describe.contains("restart at \"* * * * * *\""),
+        "{describe}"
+    );
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let ev = events(&env, "loop");
+        if ev.iter().filter(|e| e["type"] == "cron_restart").count() >= 2 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "{ev:?}");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let printed = env.ok(&["events", "loop"]);
+    assert!(
+        printed.contains("cron_restart") && printed.contains("scheduled="),
+        "{printed}"
     );
 }

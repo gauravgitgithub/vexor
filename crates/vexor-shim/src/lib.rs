@@ -12,6 +12,7 @@
 
 mod cluster;
 mod control;
+mod cron;
 mod identity;
 mod instance;
 mod logs;
@@ -124,6 +125,9 @@ pub fn validate(spec: &AppSpec) -> Result<(), String> {
     if spec.instance_var.is_empty() || spec.instance_var.contains('=') {
         return Err("`instance_var` must be a non-empty name without '='".into());
     }
+    if let Some(c) = &spec.cron_restart {
+        cron::parse(c)?;
+    }
     Ok(())
 }
 
@@ -215,6 +219,15 @@ pub async fn run(spec: AppSpec, home: Option<PathBuf>) -> i32 {
             logs.err.clone(),
         )
     });
+    let cron = spec.cron_restart.as_deref().map(|c| {
+        let c = cron::parse(c).expect("validated");
+        tokio::spawn(cron::schedule(
+            c,
+            spec.name.clone(),
+            out.clone(),
+            restart_tx.clone(),
+        ))
+    });
     let epoch = tokio::time::Instant::now();
     let mut set = tokio::task::JoinSet::new();
     for index in 0..spec.instances {
@@ -227,7 +240,10 @@ pub async fn run(spec: AppSpec, home: Option<PathBuf>) -> i32 {
             (logs.out.clone(), logs.err.clone()),
             cluster.clone(),
         );
-        set.spawn(runner.run(stop_rx.clone(), restart_tx.subscribe(), home.is_none()));
+        // Standalone, the shim ends once every instance has stopped, unless
+        // a schedule will start them again.
+        let exit_when_idle = home.is_none() && spec.cron_restart.is_none();
+        set.spawn(runner.run(stop_rx.clone(), restart_tx.subscribe(), exit_when_idle));
     }
 
     let mut states = Vec::with_capacity(set.len());
@@ -246,6 +262,9 @@ pub async fn run(spec: AppSpec, home: Option<PathBuf>) -> i32 {
         }
     }
 
+    if let Some(c) = cron {
+        c.abort();
+    }
     if let Some(c) = &cluster {
         c.shutdown().await;
     }

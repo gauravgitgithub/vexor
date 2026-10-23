@@ -10,6 +10,10 @@ before 1.0, minor versions may include breaking changes, which are listed here.
   200M`): an instance whose resident memory goes above the limit is
   restarted gracefully; checked every 5 s and recorded as a
   `memory_restart` event.
+- `cron_restart` (ecosystem files, `vexor start --cron-restart "0 3 * * *"`):
+  restarts every instance on a schedule, with PM2 7's pattern syntax; an
+  app that exited is run again. Unlike PM2, an app stopped with
+  `vexor stop` stays stopped.
 - `vexor migrate --from-pm2 --dry-run`: reads PM2's `dump.pm2` and shows
   how each app would run under Vexor, every unsupported setting, and the
   expected downtime. Changes nothing (no PM2 command, no Vexor state).

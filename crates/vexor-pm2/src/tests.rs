@@ -122,7 +122,6 @@ fn interpreter_none_runs_script_directly_and_bare_commands_use_path() {
 fn behaviour_changing_fields_are_fatal() {
     let t = tr(json!({
         "name": "a", "script": "/bin/sleep",
-        "cron_restart": "0 * * * *",
         "watch": true,
         "uid": "www",
         "exec_mode": "cluster",
@@ -134,7 +133,6 @@ fn behaviour_changing_fields_are_fatal() {
     assert_eq!(
         f,
         [
-            "cron_restart",
             "exec_mode",
             "increment_var",
             "shutdown_with_message",
@@ -508,4 +506,34 @@ fn max_memory_restart_translates() {
             .iter()
             .any(|n| n.field == "max_memory_restart" && n.severity == Severity::Fatal)
     );
+}
+
+#[test]
+fn cron_restart_translates_and_is_validated() {
+    let dir = tempfile::tempdir().expect("dir");
+    let ok = |p: &str| {
+        translate(
+            &json!({"name": "a", "script": "/bin/sh", "cron_restart": p}),
+            &ctx(dir.path()),
+        )
+        .expect("translates")
+    };
+    let t = ok("0 3 * * *");
+    assert_eq!(t.spec.cron_restart.as_deref(), Some("0 3 * * *"));
+    assert!(fatal(&t.notes).is_empty(), "{:?}", t.notes);
+    assert_eq!(
+        ok("*/10 * * * * *").spec.cron_restart.as_deref(),
+        Some("*/10 * * * * *")
+    );
+    for bad in ["61 * * * *", "nightly", ""] {
+        let t = ok(bad);
+        assert!(t.spec.cron_restart.is_none());
+        assert_eq!(fatal(&t.notes), ["cron_restart"], "{bad}");
+    }
+    let t = translate(
+        &json!({"name": "a", "script": "/bin/sh", "cron_restart": 5}),
+        &ctx(dir.path()),
+    )
+    .expect("translates");
+    assert_eq!(fatal(&t.notes), ["cron_restart"]);
 }

@@ -50,6 +50,10 @@ pub struct AppSpec {
     /// listening sockets. `args` above is not used.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cluster: Option<ClusterSpec>,
+    /// PM2 `cron_restart`: restart every instance on this schedule (5 or 6
+    /// cron fields, local time). Also starts instances that have stopped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cron_restart: Option<String>,
 }
 
 impl AppSpec {

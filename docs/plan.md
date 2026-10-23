@@ -67,7 +67,7 @@ First the three settings that block migrations (and `vexor start` of ecosystem f
 
 6.1 ✅ `max_memory_restart`: the shim reads each instance's resident memory (Linux `/proc/<pid>/statm`, macOS `proc_pidinfo`) every 5 s (`memory_check_interval_ms`) while it is online and not reloading, after checking the PID is still the process it started; above the limit, a graceful restart (counted as a restart, not a crash) and a `memory_restart` event with the measured size. Ecosystem `max_memory_restart` (bytes or K/M/G) is now supported; `vexor start --max-memory-restart`; shown in `describe` and `events`. Tested: RSS reader unit tests, size parsing and translation tests, shim tests (restarts over the limit repeatedly without a crash-loop error; leaves an app under the limit alone; cluster mode restarts only the worker over the limit).
 
-6.2 `cron_restart`.
+6.2 ✅ `cron_restart`: the shim schedules restarts of every instance with `croner` (the Rust port of the library PM2 7 uses; 5 or 6 fields, local time), re-reading the clock at least every 30 s so clock changes delay a run by at most that; a job that exited (`autorestart: false`) runs again, and a standalone shim stays up for it. Invalid patterns are rejected by `vexor check`/`start`/the shim. `vexor start --cron-restart`; `describe`, `events`. Checked against PM2 7.1.0: running app restarted, exited job re-run, and PM2 also restarts an app stopped with `pm2 stop` (Vexor keeps it stopped: documented difference). Tested: pattern parsing, translation/validation, shim tests (restart on schedule across 2 instances, job re-run, invalid pattern rejected), CLI test through the daemon.
 
 6.3 `watch`.
 

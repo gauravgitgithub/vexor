@@ -480,13 +480,7 @@ mod tests {
         let t = crate::translate(&app(&d, "py").app, &ctx).expect("translates");
         assert_eq!(t.spec.exec, std::path::Path::new("/bin/sleep"));
         assert_eq!(t.spec.args, ["1000"]);
-        let fatal: Vec<_> = crate::translate(&app(&d, "worker").app, &ctx)
-            .expect("translates")
-            .notes
-            .into_iter()
-            .filter(|n| n.severity == Severity::Fatal)
-            .map(|n| n.field)
-            .collect();
-        assert!(fatal.contains(&"cron_restart".to_owned()), "{fatal:?}");
+        let worker = crate::translate(&app(&d, "worker").app, &ctx).expect("translates");
+        assert_eq!(worker.spec.cron_restart.as_deref(), Some("0 3 * * *"));
     }
 }

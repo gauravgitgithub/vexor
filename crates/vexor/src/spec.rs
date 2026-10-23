@@ -77,6 +77,7 @@ pub fn start_plan(args: &StartArgs, home: &Path) -> Result<Plan, String> {
             || !args.args.is_empty()
             || args.only.is_some()
             || args.max_memory_restart.is_some()
+            || args.cron_restart.is_some()
         {
             return Err(format!(
                 "{target:?} is not a file; options like --name/-i/--env/--only only apply when starting a file"
@@ -104,9 +105,10 @@ fn ecosystem_plan(args: &StartArgs, path: &Path, home: &Path) -> Result<Plan, St
         || args.fork
         || !args.args.is_empty()
         || args.max_memory_restart.is_some()
+        || args.cron_restart.is_some()
     {
         return Err(
-            "--name, -i, --max-memory-restart and app arguments don't apply to ecosystem files; set them in the file"
+            "--name, -i, --max-memory-restart, --cron-restart and app arguments don't apply to ecosystem files; set them in the file"
                 .into(),
         );
     }
@@ -252,6 +254,13 @@ fn build(args: &StartArgs, script: &Path, home: &Path) -> Result<AppSpec, String
             ..PolicySpec::default()
         },
         cluster,
+        cron_restart: match &args.cron_restart {
+            Some(p) => {
+                vexor_pm2::check_cron(p).map_err(|e| format!("--cron-restart: {e}"))?;
+                Some(p.trim().to_owned())
+            }
+            None => None,
+        },
     })
 }
 

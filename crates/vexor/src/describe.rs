@@ -175,6 +175,9 @@ pub fn print(status: &AppStatus, spec: &AppSpec, events: &[Value], show_env: boo
             }
         ),
     );
+    if let Some(c) = &spec.cron_restart {
+        row("Schedule", format!("restart at \"{c}\" (cron, local time)"));
+    }
     if let Some(limit) = p.max_memory_bytes {
         row(
             "Memory",

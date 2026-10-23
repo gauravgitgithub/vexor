@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use vexor_pm2::dump::{self, DumpApp};
 use vexor_pm2::{Context, Note, Severity, Translated};
@@ -37,6 +37,12 @@ pub struct AppPlan {
     /// Environment variable names (values are never shown).
     pub env_keys: Vec<String>,
     pub notes: Vec<Note>,
+    /// The unredacted spec, for `--apply`. Never serialized.
+    #[serde(skip)]
+    pub full_spec: Option<vexor_core::AppSpec>,
+    /// Whether PM2 was running the app when the dump was saved.
+    #[serde(skip)]
+    pub running: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -69,7 +75,7 @@ pub fn default_pm2_home() -> PathBuf {
         .map_or_else(|| PathBuf::from(".pm2"), |h| PathBuf::from(h).join(".pm2"))
 }
 
-fn current_user() -> Option<String> {
+pub(crate) fn current_user() -> Option<String> {
     std::env::var("USER")
         .or_else(|_| std::env::var("LOGNAME"))
         .ok()
@@ -223,6 +229,8 @@ fn plan_app(a: &DumpApp, pm2_home: &Path) -> AppPlan {
         spec,
         env_keys,
         notes,
+        full_spec: translated.map(|t| t.spec),
+        running: a.running(),
     }
 }
 
@@ -467,7 +475,7 @@ const PM2_FILES: &[&str] = &["dump.pm2", "dump.pm2.bak", "module_conf.json", "co
 /// Largest file a backup copies (PM2's state files are a few KiB).
 const MAX_FILE: u64 = 64 << 20;
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct BackedUpFile {
     pub source: PathBuf,
     /// Path inside the backup directory.
@@ -478,11 +486,11 @@ pub struct BackedUpFile {
     pub sha256: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Manifest {
     pub id: String,
     pub created_at: String,
-    pub vexor_version: &'static str,
+    pub vexor_version: String,
     pub pm2_home: PathBuf,
     pub dump: PathBuf,
     pub files: Vec<BackedUpFile>,
@@ -508,7 +516,7 @@ pub fn sha256(data: &[u8]) -> String {
 }
 
 /// Read a regular file without following a symlink at its final component.
-fn read_regular(path: &Path) -> std::io::Result<(Vec<u8>, u32)> {
+pub(crate) fn read_regular(path: &Path) -> std::io::Result<(Vec<u8>, u32)> {
     use std::io::Read;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     let mut f = std::fs::OpenOptions::new()
@@ -535,7 +543,7 @@ fn libc_o_nofollow() -> i32 {
 }
 
 /// Write `data` to a new file readable only by the owner.
-fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     let mut f = std::fs::OpenOptions::new()
@@ -643,7 +651,7 @@ pub fn backup(
         let manifest = Manifest {
             id: id.clone(),
             created_at: format!("{stamp} UTC"),
-            vexor_version: env!("CARGO_PKG_VERSION"),
+            vexor_version: env!("CARGO_PKG_VERSION").to_owned(),
             pm2_home: pm2_home.to_path_buf(),
             dump: dump.to_path_buf(),
             files,

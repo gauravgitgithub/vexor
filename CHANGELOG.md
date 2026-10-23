@@ -12,6 +12,10 @@ before 1.0, minor versions may include breaking changes, which are listed here.
 - `vexor migrate --from-pm2 --backup`: copies PM2's state, its boot service
   file and the migration plan to a private, never-overwritten directory
   under `~/.vexor/migrations/`, with SHA-256 hashes.
+- `vexor migrate --from-pm2 --apply`: moves apps one at a time (`pm2 stop`,
+  start under Vexor, wait until healthy), puts an unhealthy app back under
+  PM2 and stops, journals every step so a rerun resumes, and only applies
+  a reviewed plan whose PM2 dump hasn't changed since the backup.
 
 ## 0.1.1 (2026-10-23, prerelease)
 

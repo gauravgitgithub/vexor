@@ -65,7 +65,7 @@ The wrapper is a zero-dependency ES5 script with no `postinstall` and no network
 | scale | same | cluster mode |
 | flush / reloadLogs | same | |
 | monit | `vexor top` | simple TUI later |
-| — | migrate --from-pm2 | Dry run implemented: plans a move from PM2's `dump.pm2` without changing anything (docs/migration.md). Apply and rollback: planned |
+| — | migrate --from-pm2 | Dry run, backup and apply implemented (docs/migration.md). Rollback: planned |
 | deploy, install, link, plus, ecosystem gen | — | unsupported, explicit error |
 
 Install: `npm i -g vexord` (provides the `vexor` command).

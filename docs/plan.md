@@ -54,7 +54,7 @@ dry-run, backup, journaled apply, rollback (docs/migration.md).
 
 5.2 ✅ `vexor migrate --from-pm2 --backup`: copies PM2's state files and boot service, the plan (`plan.json`, redacted) and a manifest with SHA-256 hashes to `<home>/migrations/<id>/` (0700 dirs, 0600 files), via a temporary directory renamed when complete; never overwrites; a `--dump` outside the PM2 home is backed up alone. Tested: CLI test (two backups get distinct ids, permissions, byte-identical dump copy, manifest hashes, redacted plan, no leftovers, PM2 files unchanged, no daemon, nothing kept when the dump is missing); `cargo deny` with the new `sha2` dependency.
 
-5.3 `--apply`: journaled cutover per app, with automatic fallback to PM2 when the Vexor start is unhealthy.
+5.3 ✅ `vexor migrate --from-pm2 --apply`: applies the newest (or `--backup-id`) backup's plan only if PM2's dump is unchanged since (SHA-256) and the plan intact; confirmation (`--yes`); per app `pm2 stop` → Vexor start → health check (all instances online, no restart, same live processes for `min_uptime`), else `vexor delete` + `pm2 start` and stop; blocked apps stay on PM2; refuses names Vexor already has; journal `journal.jsonl` in the backup (fsync per step) for resume; lock per backup. Tested: 3 CLI tests with a recording stand-in for `pm2` (happy path + journal + idempotent rerun; unhealthy app put back under PM2; no backup / no `--yes` / changed dump / existing name / failing `pm2 stop`), journal unit test; end to end against PM2 7.1.0 (3 apps in 3 s, 2 of 456 probe requests failed during a ~240 ms cutover gap).
 
 5.4 `--rollback <id>` and `--status`.
 

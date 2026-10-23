@@ -46,14 +46,20 @@ Implemented (plan 5.2): `vexor migrate --from-pm2 --backup [--pm2-home DIR] [--d
 - Never overwrites: each backup gets a new id (`-2`, `-3`, … within the same second). It is written to a hidden temporary directory and renamed into place only when complete; on any error nothing is kept.
 - Restoring PM2's process list by hand: `cp <backup>/pm2/dump.pm2 ~/.pm2/dump.pm2 && pm2 resurrect` (printed after each backup).
 
-## Apply: cutover per app (sequential by default)
+## Apply: cutover per app (sequential)
 
-1. Pre-flight: backup exists, plan hash matches what the user confirmed, interpreter/cwd/script exist, Vexor daemon healthy.
-2. Journal `begin(app)`.
-3. `pm2 stop <app>`. Never `delete`, so PM2 still holds its definition for rollback.
-4. `vexor start` with the translated config; wait for readiness (or `min_uptime`).
-5. Healthy → journal `done(app)`. Unhealthy → `vexor delete`, `pm2 start <app>`, journal `rolled_back(app)`, stop the run.
-6. After all apps: `pm2 save` is **not** run, and PM2 startup is **not** removed. The report tells the user how to disable it (`pm2 unstartup`) once satisfied. Two boot-time supervisors would double-start apps, so `vexor doctor` flags this state until it is resolved.
+Implemented (plan 5.3): `vexor migrate --from-pm2 --apply [--backup-id ID] [--only a,b] [--yes] [--pm2 PATH] [--timeout SECS]`.
+
+1. Pre-flight: the backup (newest, or `--backup-id`) exists; PM2's current `dump.pm2` has the same SHA-256 as the backup's copy (otherwise: back up again and review the new plan); the backup's `plan.json` matches its manifest hash. Blocked apps are listed and stay on PM2. The plan is shown and confirmed (`--yes` when not on a terminal). One `--apply` per backup at a time (lock file).
+2. Journal `begin(app)`, after checking Vexor has no app by that name (if it has, PM2 is not touched and the run stops).
+3. Running under PM2: `pm2 stop <app>` (with `PM2_HOME` set). Never `delete`, so PM2 still holds its definition for rollback. A failing `pm2 stop` stops the run; nothing changed for that app.
+4. Start under Vexor with the translated spec (apps PM2 had stopped are added stopped). Healthy = every instance `online`, no restart, and the same live processes for `min_uptime` (at least 1 s, at most 15 s), within `--timeout` (default 30 s) plus `listen_timeout`.
+5. Healthy → journal `done(app)`. Unhealthy → `vexor delete`, `pm2 start <app>`, journal `rolled_back(app)` with the reason, stop the run (exit 1). If putting it back fails too: `failed(app)`, and the message says to check `pm2 ls` and `vexor ls`.
+6. After all apps: `pm2 save` is **not** run, and PM2 startup is **not** removed. PM2's saved list still has the apps as running, so the report tells the user to run `pm2 unstartup` (then `vexor startup`): two boot-time supervisors would double-start apps.
+
+The journal is `journal.jsonl` in the backup directory (0600, one JSON line per step, flushed to disk before the next step; a torn last line is ignored). Re-running `--apply` resumes: apps `done` are skipped; an app interrupted mid-move (`begin` / `pm2_stopped` / `vexor_started`) is continued (`pm2 stop` again, start the Vexor app if present, health check), never started twice; an app `rolled_back` is tried again.
+
+Measured (PM2 7.1.0, Docker, `node:22-alpine`): cluster app with 2 instances on port 3000, fork app and a stopped app moved in 3 s; an HTTP probe every 50 ms saw 454 successes and 2 failures, all during the cluster app's stop-to-start gap (about 240 ms).
 
 Cluster apps whose port is held by PM2 can't overlap with Vexor instances, so cutover is stop-then-start and the report says `brief` downtime. Zero downtime is never claimed for single-host migration. Ways to get it:
 
@@ -62,6 +68,6 @@ Cluster apps whose port is held by PM2 can't overlap with Vexor instances, so cu
 
 Once migrated, later Vexor daemon crashes and upgrades don't cause downtime (architecture.md §7).
 
-## Idempotency & partial failure
+## Rollback (plan 5.4)
 
-The journal (the `migration_steps` table in `events.db`, exported as `migrations/<id>/report.json` alongside the backup after every step) is the source of truth. Re-running `--apply` resumes from it. Apps already `done` are skipped, and apps `in_progress` are re-verified, never blindly restarted. `--rollback` walks the journal in reverse and asks for confirmation before each disruptive step.
+`--rollback <id>` walks the journal in reverse and asks for confirmation before each disruptive step.

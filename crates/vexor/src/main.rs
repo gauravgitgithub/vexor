@@ -1,5 +1,6 @@
 //! `vexor`: process manager CLI.
 
+mod apply;
 mod client;
 mod describe;
 mod logs;
@@ -157,6 +158,28 @@ enum Command {
         /// a new directory under <home>/migrations/. PM2 is not touched.
         #[arg(long, conflicts_with = "dry_run")]
         backup: bool,
+        /// Move the apps: for each, stop it under PM2, start it under Vexor
+        /// and wait until healthy; put it back under PM2 if it isn't.
+        /// Applies the plan of the newest backup (or --backup-id), which must
+        /// match PM2's current dump. Asks for confirmation unless --yes.
+        #[arg(long, conflicts_with_all = ["dry_run", "backup"])]
+        apply: bool,
+        /// With --apply: the backup whose plan to apply [default: newest].
+        #[arg(long, requires = "apply")]
+        backup_id: Option<String>,
+        /// With --apply: only these apps (comma-separated).
+        #[arg(long, requires = "apply")]
+        only: Option<String>,
+        /// With --apply: don't ask for confirmation.
+        #[arg(long, short = 'y', requires = "apply")]
+        yes: bool,
+        /// With --apply: the pm2 command [default: pm2 on PATH].
+        #[arg(long, requires = "apply")]
+        pm2: Option<PathBuf>,
+        /// With --apply: seconds to wait for each app to become healthy
+        /// under Vexor (plus its listen_timeout).
+        #[arg(long, default_value_t = 30, requires = "apply")]
+        timeout: u64,
         /// PM2 home directory [default: $PM2_HOME, else ~/.pm2]
         #[arg(long)]
         pm2_home: Option<PathBuf>,
@@ -308,10 +331,43 @@ fn main() -> ExitCode {
             from_pm2: _,
             dry_run: _,
             backup,
+            apply,
+            backup_id,
+            only,
+            yes,
+            pm2,
+            timeout,
             pm2_home,
             dump,
             json,
-        } => migrate_cmd(&home, pm2_home, dump, backup, json),
+        } => {
+            if apply {
+                let pm2_home = pm2_home.unwrap_or_else(migrate::default_pm2_home);
+                let dump = dump.unwrap_or_else(|| pm2_home.join("dump.pm2"));
+                let only = only
+                    .map(|o| {
+                        o.split(',')
+                            .map(|s| s.trim().to_owned())
+                            .filter(|s| !s.is_empty())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                ExitCode::from(apply::run(
+                    &home,
+                    &pm2_home,
+                    &dump,
+                    apply::Options {
+                        backup_id,
+                        only,
+                        yes,
+                        pm2,
+                        timeout: std::time::Duration::from_secs(timeout),
+                    },
+                ))
+            } else {
+                migrate_cmd(&home, pm2_home, dump, backup, json)
+            }
+        }
         Command::Events {
             app,
             since,

@@ -1095,3 +1095,214 @@ fn migrate_backup_copies_pm2_state_privately_and_never_overwrites() {
         Some(2)
     );
 }
+
+/// A stand-in for `pm2` that records its arguments; `pm2 stop` fails while
+/// `<work>/pm2-fail` exists.
+fn fake_pm2(env: &Env) -> (PathBuf, PathBuf) {
+    let log = env.work.path().join("pm2-calls.log");
+    let fail = env.work.path().join("pm2-fail");
+    let bin = env.script(
+        "fake-pm2",
+        &format!(
+            "#!/bin/sh\necho \"$*\" >> '{}'\n[ \"$1\" = stop ] && [ -e '{}' ] && {{ echo 'boom' >&2; exit 1; }}\nexit 0\n",
+            log.display(),
+            fail.display()
+        ),
+    );
+    (bin, log)
+}
+
+fn pm2_calls(log: &Path) -> Vec<String> {
+    std::fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// PM2 home holding `pm2_dump`, plus a backup of it.
+fn pm2_home_with_backup(env: &Env) -> PathBuf {
+    let pm2_home = env.work.path().join("pm2home");
+    std::fs::create_dir_all(&pm2_home).expect("mkdir");
+    let dump = pm2_dump(env);
+    std::fs::rename(&dump, pm2_home.join("dump.pm2")).expect("move dump");
+    env.ok(&[
+        "migrate",
+        "--from-pm2",
+        "--backup",
+        "--pm2-home",
+        pm2_home.to_str().expect("utf-8"),
+    ]);
+    pm2_home
+}
+
+fn journal(env: &Env) -> Vec<Value> {
+    let root = env.home.path().join("migrations");
+    let dir = std::fs::read_dir(&root)
+        .expect("ls")
+        .map(|e| e.expect("entry").path())
+        .find(|p| p.join("journal.jsonl").exists())
+        .expect("a journal");
+    std::fs::read_to_string(dir.join("journal.jsonl"))
+        .expect("read")
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("json line"))
+        .collect()
+}
+
+#[test]
+fn migrate_apply_moves_running_apps_and_resumes_idempotently() {
+    let env = Env::new();
+    let pm2_home = pm2_home_with_backup(&env);
+    let (pm2, log) = fake_pm2(&env);
+    let args = [
+        "migrate",
+        "--from-pm2",
+        "--apply",
+        "--yes",
+        "--pm2-home",
+        pm2_home.to_str().expect("utf-8"),
+        "--pm2",
+        pm2.to_str().expect("utf-8"),
+    ];
+    let out = env.ok(&args);
+    assert!(
+        out.contains("web: stopped under PM2, running under Vexor"),
+        "{out}"
+    );
+    assert!(out.contains("idle: added to Vexor (stopped)"), "{out}");
+    assert!(out.contains("pm2 unstartup"), "{out}");
+    // Only the running app is stopped under PM2, and nothing is deleted there.
+    assert_eq!(pm2_calls(&log), ["stop web"]);
+
+    let apps = env.list();
+    let web = apps.iter().find(|a| a["name"] == "web").expect("web");
+    assert_eq!(states(web), ["online", "online"]);
+    let idle = apps.iter().find(|a| a["name"] == "idle").expect("idle");
+    assert_eq!(idle["desired"], "stopped");
+    let steps: Vec<(String, String)> = journal(&env)
+        .iter()
+        .map(|e| {
+            (
+                e["app"].as_str().unwrap_or("").to_owned(),
+                e["step"].as_str().unwrap_or("").to_owned(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        steps,
+        [
+            ("web", "begin"),
+            ("web", "pm2_stopped"),
+            ("web", "vexor_started"),
+            ("web", "done"),
+            ("idle", "begin"),
+            ("idle", "vexor_started"),
+            ("idle", "done"),
+        ]
+        .map(|(a, s)| (a.to_owned(), s.to_owned()))
+    );
+
+    // Running it again changes nothing.
+    let again = env.ok(&args);
+    assert!(again.contains("already migrated: web, idle"), "{again}");
+    assert!(again.contains("Nothing to migrate"), "{again}");
+    assert_eq!(pm2_calls(&log), ["stop web"]);
+}
+
+#[test]
+fn migrate_apply_puts_an_unhealthy_app_back_under_pm2() {
+    let env = Env::new();
+    env.script("loop.sh", "#!/bin/sh\necho crashing >&2\nexit 3\n");
+    let pm2_home = pm2_home_with_backup(&env);
+    let (pm2, log) = fake_pm2(&env);
+    let out = env.run(&[
+        "migrate",
+        "--from-pm2",
+        "--apply",
+        "--yes",
+        "--only",
+        "web",
+        "--timeout",
+        "10",
+        "--pm2-home",
+        pm2_home.to_str().expect("utf-8"),
+        "--pm2",
+        pm2.to_str().expect("utf-8"),
+    ]);
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("running under PM2 again"), "{stderr}");
+    assert_eq!(pm2_calls(&log), ["stop web", "start web"]);
+    assert!(
+        env.list().iter().all(|a| a["name"] != "web"),
+        "left in Vexor"
+    );
+    let last = journal(&env).pop().expect("entry");
+    assert_eq!(
+        (last["app"].as_str(), last["step"].as_str()),
+        (Some("web"), Some("rolled_back"))
+    );
+}
+
+#[test]
+fn migrate_apply_refuses_unsafe_starts() {
+    let env = Env::new();
+    let (pm2, log) = fake_pm2(&env);
+    let pm2 = pm2.to_str().expect("utf-8").to_owned();
+    // No backup yet.
+    let nowhere = env.work.path().join("pm2home");
+    std::fs::create_dir_all(&nowhere).expect("mkdir");
+    let dump = pm2_dump(&env);
+    std::fs::copy(&dump, nowhere.join("dump.pm2")).expect("copy");
+    let ph = nowhere.to_str().expect("utf-8").to_owned();
+    let apply = |extra: &[&str]| {
+        let mut a = vec![
+            "migrate",
+            "--from-pm2",
+            "--apply",
+            "--pm2-home",
+            &ph,
+            "--pm2",
+            &pm2,
+        ];
+        a.extend_from_slice(extra);
+        env.run(&a)
+    };
+    let out = apply(&["--yes"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--backup"));
+
+    env.ok(&["migrate", "--from-pm2", "--backup", "--pm2-home", &ph]);
+    // Not a terminal and no --yes.
+    let out = apply(&[]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--yes"));
+
+    // PM2's dump changed since the backup.
+    let mut d: Value =
+        serde_json::from_str(&std::fs::read_to_string(nowhere.join("dump.pm2")).expect("read"))
+            .expect("json");
+    d[0]["max_restarts"] = 3.into();
+    std::fs::write(nowhere.join("dump.pm2"), d.to_string()).expect("write");
+    let out = apply(&["--yes"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("changed since backup"));
+    std::fs::copy(&dump, nowhere.join("dump.pm2")).expect("restore");
+
+    // Vexor already has an app by that name: PM2 is not touched.
+    let script = env.work.path().join("loop.sh");
+    env.ok(&["start", script.to_str().expect("utf-8"), "--name", "web"]);
+    let out = apply(&["--yes"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("already has an app"));
+
+    // pm2 stop failing: the app is not moved.
+    env.ok(&["delete", "web"]);
+    std::fs::write(env.work.path().join("pm2-fail"), "").expect("touch");
+    let out = apply(&["--yes"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("boom"));
+    assert!(env.list().iter().all(|a| a["name"] != "web"));
+    assert_eq!(pm2_calls(&log), ["stop web"]);
+}

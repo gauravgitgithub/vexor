@@ -1443,3 +1443,26 @@ fn cron_restart_from_the_command_line() {
         "{printed}"
     );
 }
+
+#[test]
+fn watch_from_the_command_line() {
+    let env = Env::new();
+    env.ok(&["start", "loop.sh", "--watch"]);
+    let describe = env.ok(&["describe", "loop"]);
+    assert!(describe.contains("restart on changes in"), "{describe}");
+    assert!(describe.contains("ignoring .* node_modules"), "{describe}");
+    // Polling watchers take their first snapshot within a second.
+    std::thread::sleep(Duration::from_millis(1500));
+    std::fs::write(env.work.path().join("changed.js"), "x").expect("write");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let ev = events(&env, "loop");
+        if ev.iter().any(|e| e["type"] == "watch_restart") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "{ev:?}");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let printed = env.ok(&["events", "loop"]);
+    assert!(printed.contains("changed.js"), "{printed}");
+}

@@ -69,7 +69,9 @@ First the three settings that block migrations (and `vexor start` of ecosystem f
 
 6.2 ✅ `cron_restart`: the shim schedules restarts of every instance with `croner` (the Rust port of the library PM2 7 uses; 5 or 6 fields, local time), re-reading the clock at least every 30 s so clock changes delay a run by at most that; a job that exited (`autorestart: false`) runs again, and a standalone shim stays up for it. Invalid patterns are rejected by `vexor check`/`start`/the shim. `vexor start --cron-restart`; `describe`, `events`. Checked against PM2 7.1.0: running app restarted, exited job re-run, and PM2 also restarts an app stopped with `pm2 stop` (Vexor keeps it stopped: documented difference). Tested: pattern parsing, translation/validation, shim tests (restart on schedule across 2 instances, job re-run, invalid pattern rejected), CLI test through the daemon.
 
-6.3 `watch`.
+6.3 ✅ `watch` / `ignore_watch` / `watch_delay`: the shim watches the paths (inotify through `rustix` on Linux, adding directories as they appear; polling every second elsewhere) and restarts every instance once per burst of changes (at least 100 ms, or `watch_delay`); PM2's default ignore list, glob patterns, the app's own logs always ignored, symlinks not followed. `vexor start --watch`; `describe`, `events`. No new license: `notify` was considered and dropped because it is CC0-1.0 (and `inotify` ISC), which `deny.toml` doesn't allow; `globset` is MIT. Tested: matcher unit tests (PM2 default, globs, own logs, invalid patterns), translation tests, shim tests on macOS and Linux (ignored changes don't restart; a change in a directory created after the start does; one restart per instance per change; `watch_delay`), CLI test.
+
+The three settings that blocked migrations are supported now; `uid`/`gid`, `increment_var` and `shutdown_with_message` remain fatal.
 
 ## Phase 6b: observability and alerting
 

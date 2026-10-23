@@ -78,6 +78,7 @@ pub fn start_plan(args: &StartArgs, home: &Path) -> Result<Plan, String> {
             || args.only.is_some()
             || args.max_memory_restart.is_some()
             || args.cron_restart.is_some()
+            || args.watch
         {
             return Err(format!(
                 "{target:?} is not a file; options like --name/-i/--env/--only only apply when starting a file"
@@ -106,9 +107,10 @@ fn ecosystem_plan(args: &StartArgs, path: &Path, home: &Path) -> Result<Plan, St
         || !args.args.is_empty()
         || args.max_memory_restart.is_some()
         || args.cron_restart.is_some()
+        || args.watch
     {
         return Err(
-            "--name, -i, --max-memory-restart, --cron-restart and app arguments don't apply to ecosystem files; set them in the file"
+            "--name, -i, --max-memory-restart, --cron-restart, --watch and app arguments don't apply to ecosystem files; set them in the file"
                 .into(),
         );
     }
@@ -225,6 +227,11 @@ fn build(args: &StartArgs, script: &Path, home: &Path) -> Result<AppSpec, String
         env.insert(k.to_owned(), v.to_owned());
     }
 
+    let watch = args.watch.then(|| vexor_core::WatchSpec {
+        paths: vec![cwd.clone()],
+        ignore: vexor_core::WatchSpec::default_ignore(),
+        delay_ms: 0,
+    });
     let logs = home.join("logs");
     Ok(AppSpec {
         logs: LogSpec::new(
@@ -261,6 +268,7 @@ fn build(args: &StartArgs, script: &Path, home: &Path) -> Result<AppSpec, String
             }
             None => None,
         },
+        watch,
     })
 }
 

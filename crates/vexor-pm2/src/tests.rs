@@ -122,7 +122,6 @@ fn interpreter_none_runs_script_directly_and_bare_commands_use_path() {
 fn behaviour_changing_fields_are_fatal() {
     let t = tr(json!({
         "name": "a", "script": "/bin/sleep",
-        "watch": true,
         "uid": "www",
         "exec_mode": "cluster",
         "shutdown_with_message": true,
@@ -132,13 +131,7 @@ fn behaviour_changing_fields_are_fatal() {
     f.sort_unstable();
     assert_eq!(
         f,
-        [
-            "exec_mode",
-            "increment_var",
-            "shutdown_with_message",
-            "uid",
-            "watch"
-        ]
+        ["exec_mode", "increment_var", "shutdown_with_message", "uid",]
     );
 }
 
@@ -536,4 +529,65 @@ fn cron_restart_translates_and_is_validated() {
     )
     .expect("translates");
     assert_eq!(fatal(&t.notes), ["cron_restart"]);
+}
+
+#[test]
+fn watch_settings_translate() {
+    let dir = tempfile::tempdir().expect("dir");
+    std::fs::create_dir(dir.path().join("src")).expect("mkdir");
+    let tr = |v: serde_json::Value| translate(&v, &ctx(dir.path())).expect("translates");
+    let base = |extra: serde_json::Value| {
+        let mut v = json!({"name": "a", "script": "/bin/sh"});
+        if let (Some(b), Some(e)) = (v.as_object_mut(), extra.as_object()) {
+            b.extend(e.clone());
+        }
+        v
+    };
+    assert!(tr(base(json!({}))).spec.watch.is_none());
+    assert!(tr(base(json!({"watch": false}))).spec.watch.is_none());
+
+    let w = tr(base(json!({"watch": true}))).spec.watch.expect("watch");
+    assert_eq!(w.paths, [dir.path()]);
+    assert_eq!(w.ignore, [".*", "node_modules"]);
+    assert_eq!(w.delay_ms, 0);
+
+    let t = tr(base(json!({
+        "watch": ["src", "missing"],
+        "ignore_watch": ["*.log", "tmp/"],
+        "watch_delay": 1500,
+        "watch_options": {"usePolling": true}
+    })));
+    let w = t.spec.watch.expect("watch");
+    assert_eq!(
+        w.paths,
+        [dir.path().join("src"), dir.path().join("missing")]
+    );
+    assert_eq!(w.ignore, ["*.log", "tmp/"]);
+    assert_eq!(w.delay_ms, 1500);
+    assert!(fatal(&t.notes).is_empty(), "{:?}", t.notes);
+    assert!(
+        t.notes
+            .iter()
+            .any(|n| n.field == "watch" && n.message.contains("missing"))
+    );
+    assert!(
+        t.notes
+            .iter()
+            .any(|n| n.field == "watch_options" && n.severity == Severity::Ignored)
+    );
+
+    let t = tr(base(
+        json!({"watch": "src", "ignore_watch": "[\\/\\\\]\\./"}),
+    ));
+    assert!(
+        t.notes
+            .iter()
+            .any(|n| n.field == "ignore_watch" && n.severity == Severity::Partial),
+        "{:?}",
+        t.notes
+    );
+    let t = tr(base(json!({"watch": true, "ignore_watch": ["a["]})));
+    assert_eq!(fatal(&t.notes), ["ignore_watch"]);
+    let t = tr(base(json!({"watch": 5})));
+    assert_eq!(fatal(&t.notes), ["watch"]);
 }

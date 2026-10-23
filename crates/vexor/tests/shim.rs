@@ -993,3 +993,95 @@ fn invalid_cron_restart_is_rejected() {
     assert_eq!(done.code, Some(2));
     assert!(done.stderr.contains("cron_restart"), "{}", done.stderr);
 }
+
+fn watch_spec(shim: &Shim, delay_ms: u64) -> PathBuf {
+    // The app logs continuously into the watched directory: its own log
+    // files must not count as changes.
+    let script = "echo started; while :; do echo tick; sleep 0.1; done";
+    let extra = json!({
+        "instances": 2,
+        "watch": {
+            "paths": [shim.dir.path()],
+            "ignore": [".*", "node_modules"],
+            "delay_ms": delay_ms
+        }
+    });
+    shim.spec("/bin/sh", &["-c", script], extra)
+}
+
+fn starts(shim: &Shim) -> usize {
+    shim.out_log().matches("started").count()
+}
+
+#[test]
+fn watch_restarts_on_changes_but_not_ignored_ones() {
+    let shim = Shim::new();
+    std::fs::create_dir_all(shim.path("node_modules/pkg")).expect("mkdir");
+    std::fs::create_dir_all(shim.path(".git")).expect("mkdir");
+    std::fs::create_dir_all(shim.path("src")).expect("mkdir");
+    let child = shim.start(&watch_spec(&shim, 0));
+    let started = Instant::now();
+    while starts(&shim) < 2 {
+        assert!(started.elapsed() < TIMEOUT);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // Let a polling watcher take its first snapshot.
+    std::thread::sleep(Duration::from_millis(1500));
+    std::fs::write(shim.path("node_modules/pkg/index.js"), "x").expect("write");
+    std::fs::write(shim.path(".git/HEAD"), "x").expect("write");
+    std::thread::sleep(Duration::from_millis(2500));
+    assert_eq!(starts(&shim), 2, "ignored changes restarted the app");
+
+    // A new file in a directory created after the watch began.
+    std::fs::create_dir_all(shim.path("src/lib")).expect("mkdir");
+    std::thread::sleep(Duration::from_millis(300));
+    std::fs::write(shim.path("src/lib/app.js"), "x").expect("write");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while starts(&shim) < 4 {
+        assert!(Instant::now() < deadline, "no restart after a change");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::thread::sleep(Duration::from_millis(500));
+    kill(child.id(), "TERM");
+    let done = finish(child, started);
+    let fired: Vec<&Value> = done
+        .events
+        .iter()
+        .filter(|e| e["type"] == "watch_restart")
+        .collect();
+    assert!(!fired.is_empty(), "{:?}", done.events);
+    assert!(
+        fired
+            .iter()
+            .all(|e| e["path"].as_str().is_some_and(|p| p.contains("src"))),
+        "{fired:?}"
+    );
+    // Each restart restarts both instances once (PM2 restarts the app once
+    // per instance per change).
+    assert_eq!(starts(&shim), 2 + 2 * fired.len(), "{}", shim.out_log());
+}
+
+#[test]
+fn watch_delay_postpones_the_restart() {
+    let shim = Shim::new();
+    let child = shim.start(&watch_spec(&shim, 2000));
+    let started = Instant::now();
+    while starts(&shim) < 2 {
+        assert!(started.elapsed() < TIMEOUT);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::thread::sleep(Duration::from_millis(1500));
+    let changed = Instant::now();
+    std::fs::write(shim.path("app.js"), "x").expect("write");
+    while starts(&shim) < 4 {
+        assert!(changed.elapsed() < Duration::from_secs(10), "no restart");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        changed.elapsed() >= Duration::from_millis(1900),
+        "{:?}",
+        changed.elapsed()
+    );
+    kill(child.id(), "TERM");
+    let _ = finish(child, started);
+}

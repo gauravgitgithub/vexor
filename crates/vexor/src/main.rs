@@ -255,12 +255,16 @@ pub struct StartArgs {
     /// time), e.g. "0 3 * * *", as PM2. Also re-runs an app that exited.
     #[arg(long, value_name = "PATTERN")]
     pub cron_restart: Option<String>,
+    /// Restart when files in the working directory change (dot-files and
+    /// node_modules ignored), as PM2.
+    #[arg(long)]
+    pub watch: bool,
     /// Pass this shell's whole environment to the app (PM2 behaviour).
     /// By default only a small allowlist is passed (see docs/security.md T2).
     #[arg(long)]
     pub inherit_env: bool,
     /// Start from a complete app spec file (JSON) instead of a script.
-    #[arg(long, conflicts_with_all = ["target", "name", "instances", "interpreter", "cwd", "env", "inherit_env", "max_memory_restart", "cron_restart"])]
+    #[arg(long, conflicts_with_all = ["target", "name", "instances", "interpreter", "cwd", "env", "inherit_env", "max_memory_restart", "cron_restart", "watch"])]
     pub spec: Option<PathBuf>,
     /// Arguments for the app, after `--`.
     #[arg(last = true)]
@@ -584,6 +588,7 @@ fn check(
         args: Vec::new(),
         max_memory_restart: None,
         cron_restart: None,
+        watch: false,
         only,
         allow_unsupported: false,
     };
@@ -838,6 +843,11 @@ pub(crate) fn print_events(events: &[serde_json::Value]) {
         }
         if let Some(s) = e["signal"].as_str() {
             detail.push(format!("signal={s}"));
+        }
+        if e["type"] == "watch_restart"
+            && let Some(p) = e["path"].as_str()
+        {
+            detail.push(format!("path={p}"));
         }
         if let Some(t) = e["scheduled"].as_str() {
             detail.push(format!("scheduled={t}"));

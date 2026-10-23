@@ -10,6 +10,7 @@ publish.workspace = true
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 command-fds = { version = "0.3.3", features = ["tokio"] }
 croner = "4.0.2"
+globset = "0.4.20"
 libc = "0.2.191"
 rustix = { version = "1.1.5", features = ["fs", "param", "process"] }
 serde = { version = "1.0.229", features = ["derive"] }

@@ -74,6 +74,8 @@ pub enum ShimEvent<'a> {
         rss_bytes: u64,
         limit_bytes: u64,
     },
+    /// A watched file changed: every instance is being restarted.
+    WatchRestart { app: &'a str, path: &'a Path },
     /// `cron_restart` fired: every instance is being restarted.
     CronRestart { app: &'a str, scheduled: String },
     SpawnError {

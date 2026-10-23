@@ -13,6 +13,7 @@
 mod cluster;
 mod control;
 mod cron;
+mod filewatch;
 mod identity;
 mod instance;
 mod logs;
@@ -128,6 +129,12 @@ pub fn validate(spec: &AppSpec) -> Result<(), String> {
     if let Some(c) = &spec.cron_restart {
         cron::parse(c)?;
     }
+    if let Some(w) = &spec.watch {
+        if w.paths.is_empty() || w.paths.iter().any(|p| !p.is_absolute()) {
+            return Err("`watch.paths` must be one or more absolute paths".into());
+        }
+        filewatch::matcher(w, Vec::new())?;
+    }
     Ok(())
 }
 
@@ -228,6 +235,17 @@ pub async fn run(spec: AppSpec, home: Option<PathBuf>) -> i32 {
             restart_tx.clone(),
         ))
     });
+    let watcher = spec.watch.clone().map(|w| {
+        let logs = vec![spec.logs.out.clone(), spec.logs.err.clone()];
+        let m = filewatch::matcher(&w, logs).expect("validated");
+        tokio::spawn(filewatch::run(
+            w,
+            m,
+            spec.name.clone(),
+            out.clone(),
+            restart_tx.clone(),
+        ))
+    });
     let epoch = tokio::time::Instant::now();
     let mut set = tokio::task::JoinSet::new();
     for index in 0..spec.instances {
@@ -241,8 +259,8 @@ pub async fn run(spec: AppSpec, home: Option<PathBuf>) -> i32 {
             cluster.clone(),
         );
         // Standalone, the shim ends once every instance has stopped, unless
-        // a schedule will start them again.
-        let exit_when_idle = home.is_none() && spec.cron_restart.is_none();
+        // a schedule or a file change can start them again.
+        let exit_when_idle = home.is_none() && spec.cron_restart.is_none() && spec.watch.is_none();
         set.spawn(runner.run(stop_rx.clone(), restart_tx.subscribe(), exit_when_idle));
     }
 
@@ -264,6 +282,9 @@ pub async fn run(spec: AppSpec, home: Option<PathBuf>) -> i32 {
 
     if let Some(c) = cron {
         c.abort();
+    }
+    if let Some(w) = watcher {
+        w.abort();
     }
     if let Some(c) = &cluster {
         c.shutdown().await;

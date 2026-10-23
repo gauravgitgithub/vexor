@@ -54,6 +54,33 @@ pub struct AppSpec {
     /// cron fields, local time). Also starts instances that have stopped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cron_restart: Option<String>,
+    /// PM2 `watch`: restart every instance when files change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watch: Option<WatchSpec>,
+}
+
+/// What `watch` watches.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WatchSpec {
+    /// Absolute files or directories (directories recursively).
+    pub paths: Vec<PathBuf>,
+    /// Glob patterns of changes to ignore, matched against the path relative
+    /// to the watched directory, each directory above it, and each single
+    /// path component. The app's own log files are always ignored.
+    #[serde(default)]
+    pub ignore: Vec<String>,
+    /// Wait this long after the first change before restarting (PM2
+    /// `watch_delay`).
+    #[serde(default)]
+    pub delay_ms: u64,
+}
+
+impl WatchSpec {
+    /// PM2's default `ignore_watch`: dot-files and `node_modules`.
+    pub fn default_ignore() -> Vec<String> {
+        vec![".*".to_owned(), "node_modules".to_owned()]
+    }
 }
 
 impl AppSpec {

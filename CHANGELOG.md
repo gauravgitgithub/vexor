@@ -14,6 +14,10 @@ before 1.0, minor versions may include breaking changes, which are listed here.
   restarts every instance on a schedule, with PM2 7's pattern syntax; an
   app that exited is run again. Unlike PM2, an app stopped with
   `vexor stop` stays stopped.
+- `watch`, `ignore_watch`, `watch_delay` (ecosystem files, `vexor start
+  --watch`): restart every instance when files change; PM2's default
+  ignore list; the app's own logs are never a trigger. inotify on Linux,
+  polling every second on macOS.
 - `vexor migrate --from-pm2 --dry-run`: reads PM2's `dump.pm2` and shows
   how each app would run under Vexor, every unsupported setting, and the
   expected downtime. Changes nothing (no PM2 command, no Vexor state).

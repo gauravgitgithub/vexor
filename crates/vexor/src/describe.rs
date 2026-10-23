@@ -175,6 +175,26 @@ pub fn print(status: &AppStatus, spec: &AppSpec, events: &[Value], show_env: boo
             }
         ),
     );
+    if let Some(w) = &spec.watch {
+        let paths: Vec<String> = w.paths.iter().map(|p| p.display().to_string()).collect();
+        row(
+            "Watch",
+            format!(
+                "restart on changes in {}{}{}",
+                paths.join(", "),
+                if w.ignore.is_empty() {
+                    String::new()
+                } else {
+                    format!(", ignoring {}", w.ignore.join(" "))
+                },
+                if w.delay_ms > 0 {
+                    format!(", after {}", ms(w.delay_ms))
+                } else {
+                    String::new()
+                }
+            ),
+        );
+    }
     if let Some(c) = &spec.cron_restart {
         row("Schedule", format!("restart at \"{c}\" (cron, local time)"));
     }

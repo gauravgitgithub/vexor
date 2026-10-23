@@ -351,18 +351,6 @@ pub fn translate(app: &Value, ctx: &Context) -> Result<Translated, Vec<Note>> {
         }
     }
 
-    // Watching files.
-    if obj
-        .get("watch")
-        .is_some_and(|w| w.as_bool() != Some(false) && !w.is_null())
-    {
-        c.note(
-            "watch",
-            Severity::Fatal,
-            "restarting on file changes is not implemented yet",
-        );
-    }
-
     // Execution mode.
     let mode = match obj.get("exec_mode").and_then(Value::as_str) {
         None | Some("fork" | "fork_mode") => ExecMode::Fork,
@@ -587,6 +575,7 @@ pub fn translate(app: &Value, ctx: &Context) -> Result<Translated, Vec<Note>> {
             None
         }
     };
+    let watch = watch_spec(obj, &cwd, &mut c);
     let wait_ready = obj.get("wait_ready").and_then(Value::as_bool) == Some(true);
     let listen_timeout = duration_ms(obj.get("listen_timeout"), "listen_timeout", &mut c);
     if wait_ready {
@@ -681,6 +670,7 @@ pub fn translate(app: &Value, ctx: &Context) -> Result<Translated, Vec<Note>> {
         // Cluster mode always uses the IPC channel to control the primary.
         cluster,
         cron_restart,
+        watch,
     };
     let autostart = obj
         .get("autostart")
@@ -799,6 +789,93 @@ fn duration_ms(v: Option<&Value>, field: &str, c: &mut Ctx) -> Option<u64> {
         },
         other => number(other, field, c),
     }
+}
+
+/// PM2 `watch` / `ignore_watch` / `watch_delay` (docs/compatibility.md).
+fn watch_spec(
+    obj: &serde_json::Map<String, Value>,
+    cwd: &Path,
+    c: &mut Ctx,
+) -> Option<vexor_core::WatchSpec> {
+    let list = |v: &Value| -> Option<Vec<String>> {
+        match v {
+            Value::String(s) => Some(vec![s.clone()]),
+            Value::Array(a) => a.iter().map(|x| x.as_str().map(str::to_owned)).collect(),
+            _ => None,
+        }
+    };
+    let paths: Vec<PathBuf> = match obj.get("watch") {
+        None | Some(Value::Null | Value::Bool(false)) => return None,
+        Some(Value::Bool(true)) => vec![cwd.to_path_buf()],
+        Some(v) => match list(v) {
+            Some(l) if l.is_empty() => vec![cwd.to_path_buf()],
+            Some(l) => l.iter().map(|p| normalize(&cwd.join(p))).collect(),
+            None => {
+                c.note(
+                    "watch",
+                    Severity::Fatal,
+                    "expected true, a path, or an array of paths",
+                );
+                return None;
+            }
+        },
+    };
+    for p in &paths {
+        if !p.exists() {
+            c.note(
+                "watch",
+                Severity::Partial,
+                format!(
+                    "{} does not exist; it is watched once it does only if its parent is watched",
+                    p.display()
+                ),
+            );
+        }
+    }
+    let ignore = match obj.get("ignore_watch") {
+        None | Some(Value::Null) => vexor_core::WatchSpec::default_ignore(),
+        Some(v) => match list(v) {
+            Some(l) => l,
+            None => {
+                c.note(
+                    "ignore_watch",
+                    Severity::Fatal,
+                    "expected a pattern or an array of patterns",
+                );
+                return None;
+            }
+        },
+    };
+    for p in &ignore {
+        if let Err(e) = globset::Glob::new(p.trim_end_matches('/')) {
+            c.note(
+                "ignore_watch",
+                Severity::Fatal,
+                format!("invalid pattern {p:?}: {e}"),
+            );
+            return None;
+        }
+        if p.contains('\\') || p.starts_with('^') || p.ends_with('$') || p.contains('|') {
+            c.note(
+                "ignore_watch",
+                Severity::Partial,
+                format!("{p:?} looks like a regular expression; Vexor matches ignore_watch entries as glob patterns (e.g. \"*.log\", \"node_modules\")"),
+            );
+        }
+    }
+    let delay_ms = duration_ms(obj.get("watch_delay"), "watch_delay", c).unwrap_or(0);
+    if obj.contains_key("watch_options") {
+        c.note(
+            "watch_options",
+            Severity::Ignored,
+            "chokidar options are not used; Vexor watches with inotify (Linux) or by polling every second",
+        );
+    }
+    Some(vexor_core::WatchSpec {
+        paths,
+        ignore,
+        delay_ms,
+    })
 }
 
 /// Validate a `cron_restart` pattern as PM2 7 reads it (its `croner`

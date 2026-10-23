@@ -49,8 +49,12 @@ pub const LOCK: &str = "daemon.lock";
 pub const DUMP: &str = "dump.json";
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
-/// How long `start` waits for the shim to come up.
+/// How long `start` waits for the instances to settle (online, or failed)
+/// before answering; they keep starting after that either way.
 const START_WAIT: Duration = Duration::from_secs(10);
+/// How long `start` waits for a new shim to come up. Generous: on a loaded
+/// machine (many apps starting at once) a shim can take several seconds.
+const SHIM_WAIT: Duration = Duration::from_secs(60);
 /// Extra time `stop` allows on top of the app's kill_timeout.
 const STOP_SLACK: Duration = Duration::from_secs(10);
 const POLL: Duration = Duration::from_millis(20);
@@ -720,14 +724,14 @@ impl Daemon {
     }
 
     async fn wait_connected(&self, name: &str) -> Result<(), String> {
-        let deadline = tokio::time::Instant::now() + START_WAIT;
+        let deadline = tokio::time::Instant::now() + SHIM_WAIT;
         loop {
             if self.shim_pid(name).is_some() {
                 return Ok(());
             }
             if tokio::time::Instant::now() >= deadline {
                 return Err(format!(
-                    "its shim did not come up within {START_WAIT:?}; see {}",
+                    "its shim did not come up within {SHIM_WAIT:?}; see {}",
                     vexor_shim::shims_dir(&self.home)
                         .join(format!("{name}.log"))
                         .display()

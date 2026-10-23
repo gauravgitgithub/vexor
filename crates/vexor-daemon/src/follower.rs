@@ -20,8 +20,10 @@ use vexor_shim::{Identity, Paths};
 use crate::events::Events;
 use crate::log::Log;
 
-/// How long to wait for a newly launched shim's socket.
-const SHIM_START_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long to wait for a newly launched shim's socket. Another shim is
+/// launched only after this, or once the first has exited: a slow start
+/// on a loaded machine must not pile up shims (and more load).
+const SHIM_START_TIMEOUT: Duration = Duration::from_secs(60);
 /// Pause between attempts when a shim can't be reached or launched.
 const RETRY: Duration = Duration::from_millis(200);
 
@@ -195,14 +197,25 @@ impl Follower {
                     "app": self.name,
                     "pid": child.id(),
                 }));
+                let deadline = tokio::time::Instant::now() + SHIM_START_TIMEOUT;
+                while tokio::time::Instant::now() < deadline && !self.paths.socket.exists() {
+                    if matches!(child.try_wait(), Ok(Some(_))) {
+                        // Exited (e.g. another shim holds the lock): retry.
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                if !self.paths.socket.exists() {
+                    self.log.write(json!({
+                        "type": "error",
+                        "app": self.name,
+                        "error": format!("shim not ready after {SHIM_START_TIMEOUT:?}"),
+                    }));
+                }
                 // Reap the shim if it exits while this daemon runs.
                 tokio::spawn(async move {
                     let _ = child.wait().await;
                 });
-                let deadline = tokio::time::Instant::now() + SHIM_START_TIMEOUT;
-                while tokio::time::Instant::now() < deadline && !self.paths.socket.exists() {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
             }
             Err(e) => self.log.write(json!({
                 "type": "error",

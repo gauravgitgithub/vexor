@@ -103,7 +103,8 @@ Implemented in `crates/vexor-pm2` (4.1). `vexor check ecosystem.config.js` print
 - Linux only: descendants that escape the group (`setsid`, double fork) are adopted by the shim (child subreaper), reaped when they exit, reported as `orphan` events, and stopped when the shim shuts down. **macOS:** such processes re-parent to launchd and Vexor can't track them.
 - Automatic restarts are limited to one per second per instance (spawn to spawn). PM2 restarts immediately with `restart_delay: 0`.
 - `listen_timeout` expiry without a ready signal is a failed start (stopped, counted as unstable, restarted with backoff). PM2 marks the app online anyway.
-- `max_restarts: N` allows N automatic restarts of consecutive unstable runs; the (N+1)th unstable exit marks the app errored. Exact PM2 off-by-one to be confirmed in conformance tests.
+- `max_restarts: N` means at most N runs in a row that end before `min_uptime`, then errored, as in PM2 7 (verified by the conformance harness). `max_restarts: 0` in an ecosystem file means PM2's default, 16.
+- Graceful stop sends **SIGINT** by default, as PM2 does (verified); set `kill_signal` (e.g. `"SIGTERM"`) to change it. Leftover processes after a crash still get SIGTERM, then SIGKILL.
 - `@pm2/io` metrics/actions are not collected.
 - Log rotation is built in and on by default: 10 MiB per file, 5 rotated files (PM2 needs `pm2-logrotate`, whose defaults are 10 MB and 30 files).
 - When an app writes output faster than the disk can take it, Vexor discards the excess by default and says so in the log and in a `log_dropped` event, so the app never waits on logging. `logs.overflow: block` makes the app wait instead (nothing lost).

@@ -3,6 +3,29 @@
 All notable changes to Vexor. Versions follow [Semantic Versioning](https://semver.org/);
 before 1.0, minor versions may include breaking changes, which are listed here.
 
+## 0.1.1 (unreleased)
+
+Fixes found by running the same ecosystem files under PM2 7.1.0 and Vexor
+(`tests/conformance`).
+
+### Changed (PM2 compatibility)
+- **Stop signal is now SIGINT**, as PM2 (was SIGTERM). Apps that only
+  handle SIGINT now shut down gracefully instead of being killed. New
+  `kill_signal` setting (also in ecosystem files) to choose another signal.
+- **`max_restarts: N` now allows N runs in a row** before errored, as PM2
+  (0.1.0 allowed N + 1). `max_restarts: 0` in an ecosystem file means PM2's
+  default, 16.
+
+### Added
+- PM2 conformance harness (`tests/conformance`) and report
+  (`docs/conformance.md`): 11 scenarios, 10 identical to PM2 7.1.0, 1
+  intentional difference.
+
+### Fixed
+- `install.sh` with no version resolved GitHub's "latest" release, which
+  skips prereleases, and failed with a 404; it now installs the newest
+  release.
+
 ## 0.1.0 (2026-10-22, prerelease)
 
 First public prerelease. **Not yet recommended for production**: there is no

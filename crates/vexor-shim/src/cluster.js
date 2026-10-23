@@ -7,7 +7,7 @@
 // start, stop and restart them.
 //
 //   shim -> primary: {cmd:'spawn', id, instance}  {cmd:'signal', id, signal}
-//                    {cmd:'retire', id}  {cmd:'shutdown'}
+//                    {cmd:'retire', id, signal}  {cmd:'shutdown'}
 //   primary -> shim: {ev:'spawned', id, pid}  {ev:'spawn_failed', id, error}
 //                    {ev:'ready', id}  {ev:'listening', id}  {ev:'exit', id, code, signal}
 //
@@ -93,12 +93,14 @@
     } else if (msg.cmd === 'retire') {
       // Graceful retirement (reload): stop routing new connections to the
       // worker and let in-flight ones finish (worker.disconnect closes its
-      // servers), then SIGTERM it. The shim sends SIGKILL after kill_timeout.
+      // servers), then send the stop signal. The shim sends SIGKILL after
+      // kill_timeout.
       var old = workers[msg.id];
+      var stopSignal = msg.signal || 'SIGINT';
       if (old) {
         old.once('disconnect', function () {
           try {
-            old.process.kill('SIGTERM');
+            old.process.kill(stopSignal);
           } catch (e) {
             // Already gone.
           }
@@ -106,7 +108,7 @@
         try {
           old.disconnect();
         } catch (e) {
-          old.process.kill('SIGTERM');
+          old.process.kill(stopSignal);
         }
       }
     } else if (msg.cmd === 'shutdown') {

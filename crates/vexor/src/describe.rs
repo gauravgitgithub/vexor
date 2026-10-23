@@ -165,7 +165,8 @@ pub fn print(status: &AppStatus, spec: &AppSpec, events: &[Value], show_env: boo
     row(
         "Stop",
         format!(
-            "SIGTERM, then SIGKILL after {}{}",
+            "{}, then SIGKILL after {}{}",
+            p.kill_signal.name(),
             ms(p.kill_timeout_ms),
             if spec.treekill {
                 ", whole process group"

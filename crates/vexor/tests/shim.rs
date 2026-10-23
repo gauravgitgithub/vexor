@@ -222,7 +222,8 @@ fn running_states_report_pid_and_identity() {
 #[test]
 fn crash_loop_restarts_with_floor_then_errors() {
     let shim = Shim::new();
-    let extra = json!({ "instances": 2, "policy": { "max_restarts": 2 } });
+    // max_restarts 3: errored after 3 runs in a row (as PM2 7).
+    let extra = json!({ "instances": 2, "policy": { "max_restarts": 3 } });
     let done = shim.run(&shim.spec("/bin/sh", &["-c", "echo run; exit 3"], extra));
     assert_eq!(done.code, Some(1), "errored exits 1; {}", done.stderr);
     // 1 start + 2 restarts per instance.
@@ -269,16 +270,18 @@ fn invalid_spec_exits_2_with_a_message() {
 // ---------------------------------------------------------------- stopping
 
 #[test]
-fn sigterm_stops_the_app_gracefully() {
+fn sigterm_stops_the_app_gracefully_with_sigint() {
+    // The shim gets SIGTERM; the app gets the stop signal, SIGINT by default
+    // (as PM2).
     let shim = Shim::new();
-    let script = r#"trap 'echo got-term; exit 0' TERM; echo started; while :; do sleep 0.05; done"#;
+    let script = r#"trap 'echo got-int; exit 0' INT; trap 'echo got-term; exit 0' TERM; echo started; while :; do sleep 0.05; done"#;
     let child = shim.start(&shim.spec("/bin/sh", &["-c", script], json!({})));
     let started = Instant::now();
     shim.wait_for_output("started");
     kill(child.id(), "TERM");
     let done = finish(child, started);
     assert_eq!(done.code, Some(0), "{}", done.stderr);
-    assert!(shim.out_log().contains("got-term"));
+    assert!(shim.out_log().contains("got-int"), "{}", shim.out_log());
     assert_eq!(
         states(&done.events, 0),
         ["starting", "online", "stopping", "stopped"]
@@ -286,9 +289,23 @@ fn sigterm_stops_the_app_gracefully() {
 }
 
 #[test]
+fn kill_signal_setting_is_honoured() {
+    let shim = Shim::new();
+    let script = r#"trap 'echo got-int; exit 0' INT; trap 'echo got-term; exit 0' TERM; echo started; while :; do sleep 0.05; done"#;
+    let extra = json!({ "policy": { "kill_signal": "SIGTERM" } });
+    let child = shim.start(&shim.spec("/bin/sh", &["-c", script], extra));
+    let started = Instant::now();
+    shim.wait_for_output("started");
+    kill(child.id(), "TERM");
+    let done = finish(child, started);
+    assert_eq!(done.code, Some(0), "{}", done.stderr);
+    assert!(shim.out_log().contains("got-term"), "{}", shim.out_log());
+}
+
+#[test]
 fn app_ignoring_sigterm_is_killed_after_kill_timeout() {
     let shim = Shim::new();
-    let script = r#"trap '' TERM; echo started; while :; do sleep 0.05; done"#;
+    let script = r#"trap '' INT TERM; echo started; while :; do sleep 0.05; done"#;
     let extra = json!({ "policy": { "kill_timeout_ms": 300 } });
     let child = shim.start(&shim.spec("/bin/sh", &["-c", script], extra));
     let started = Instant::now();
@@ -673,7 +690,7 @@ fn wait_workers(port: u16, count: usize) -> std::collections::BTreeMap<u32, Stri
 
 const CLUSTER_APP: &str = r"
 var port = +process.env.PORT;
-process.on('SIGTERM', function () { console.log('term ' + process.env.NODE_APP_INSTANCE); process.exit(0); });
+['SIGINT', 'SIGTERM'].forEach(function (sig) { process.on(sig, function () { console.log('term ' + process.env.NODE_APP_INSTANCE); process.exit(0); }); });
 require('http').createServer(function (q, r) { r.setHeader('Connection', 'close'); r.end(process.pid + ' ' + process.env.NODE_APP_INSTANCE); })
   .listen(port, '127.0.0.1', function () { process.send('ready'); });
 ";

@@ -284,6 +284,7 @@ const HANDLED: &[&str] = &[
     "watch_delay",
     "watch_options",
     "append_env_to_name",
+    "kill_signal",
     "name_prefix",
 ];
 
@@ -521,7 +522,17 @@ pub fn translate(app: &Value, ctx: &Context) -> Result<Translated, Vec<Note>> {
         policy.autorestart = b;
     }
     if let Some(n) = number(obj.get("max_restarts"), "max_restarts", &mut c) {
-        policy.max_restarts = u32::try_from(n).unwrap_or(u32::MAX);
+        policy.max_restarts = if n == 0 {
+            // PM2 treats 0 as unset (its default, 16), not "never restart".
+            c.note(
+                "max_restarts",
+                Severity::Partial,
+                "0 means PM2's default (16 runs in a row) in PM2; Vexor does the same. Use autorestart: false to never restart",
+            );
+            16
+        } else {
+            u32::try_from(n).unwrap_or(u32::MAX)
+        };
     }
     if let Some(ms) = duration_ms(obj.get("min_uptime"), "min_uptime", &mut c) {
         policy.min_uptime_ms = ms;
@@ -538,6 +549,18 @@ pub fn translate(app: &Value, ctx: &Context) -> Result<Translated, Vec<Note>> {
     }
     if let Some(ms) = duration_ms(obj.get("kill_timeout"), "kill_timeout", &mut c) {
         policy.kill_timeout_ms = ms;
+    }
+    match obj.get("kill_signal") {
+        None | Some(Value::Null) => {}
+        Some(Value::String(sig)) => match vexor_core::KillSignal::parse(sig) {
+            Some(k) => policy.kill_signal = k,
+            None => c.note(
+                "kill_signal",
+                Severity::Fatal,
+                format!("unsupported signal {sig:?}; use SIGINT, SIGTERM, SIGHUP, SIGQUIT, SIGUSR1 or SIGUSR2"),
+            ),
+        },
+        Some(_) => c.note("kill_signal", Severity::Fatal, "expected a signal name such as \"SIGTERM\""),
     }
     let wait_ready = obj.get("wait_ready").and_then(Value::as_bool) == Some(true);
     let listen_timeout = duration_ms(obj.get("listen_timeout"), "listen_timeout", &mut c);

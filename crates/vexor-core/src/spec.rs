@@ -172,6 +172,53 @@ pub struct PolicySpec {
     /// Reload: how long a replacement may take to become ready (cluster
     /// mode without `ready_timeout_ms`, where "listening" counts as ready).
     pub reload_timeout_ms: Option<u64>,
+    /// Signal for a graceful stop (stop, restart, retiring after reload).
+    /// SIGINT by default, as PM2.
+    pub kill_signal: KillSignal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum KillSignal {
+    #[default]
+    #[serde(rename = "SIGINT")]
+    Int,
+    #[serde(rename = "SIGTERM")]
+    Term,
+    #[serde(rename = "SIGHUP")]
+    Hup,
+    #[serde(rename = "SIGQUIT")]
+    Quit,
+    #[serde(rename = "SIGUSR1")]
+    Usr1,
+    #[serde(rename = "SIGUSR2")]
+    Usr2,
+}
+
+impl KillSignal {
+    pub fn name(self) -> &'static str {
+        match self {
+            KillSignal::Int => "SIGINT",
+            KillSignal::Term => "SIGTERM",
+            KillSignal::Hup => "SIGHUP",
+            KillSignal::Quit => "SIGQUIT",
+            KillSignal::Usr1 => "SIGUSR1",
+            KillSignal::Usr2 => "SIGUSR2",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<KillSignal> {
+        let s = s.trim().to_ascii_uppercase();
+        let s = s.strip_prefix("SIG").unwrap_or(&s);
+        Some(match s {
+            "INT" => KillSignal::Int,
+            "TERM" => KillSignal::Term,
+            "HUP" => KillSignal::Hup,
+            "QUIT" => KillSignal::Quit,
+            "USR1" => KillSignal::Usr1,
+            "USR2" => KillSignal::Usr2,
+            _ => return None,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -210,6 +257,7 @@ impl Default for PolicySpec {
             health_restart_after: None,
             reload_strategy: ReloadStrategy::Auto,
             reload_timeout_ms: None,
+            kill_signal: KillSignal::Int,
         }
     }
 }

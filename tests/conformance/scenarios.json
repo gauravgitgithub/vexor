@@ -1,0 +1,120 @@
+[
+  {
+    "id": "crash-budget",
+    "question": "How many runs before errored with max_restarts 3?",
+    "app": {
+      "behavior": "crash",
+      "max_restarts": 3,
+      "min_uptime": 1000,
+      "restart_delay": 0
+    },
+    "wait": 12
+  },
+  {
+    "id": "crash-budget-0",
+    "question": "How many runs before errored with max_restarts 0?",
+    "app": {
+      "behavior": "crash",
+      "max_restarts": 0,
+      "min_uptime": 1000,
+      "restart_delay": 0
+    },
+    "wait": 22
+  },
+  {
+    "id": "crash-budget-1",
+    "question": "How many runs before errored with max_restarts 1?",
+    "app": {
+      "behavior": "crash",
+      "max_restarts": 1,
+      "min_uptime": 1000,
+      "restart_delay": 0
+    },
+    "wait": 8
+  },
+  {
+    "id": "paths",
+    "question": "Relative cwd and script resolution",
+    "app": {
+      "cwd": "sub",
+      "script": "probe.js",
+      "probe_in_sub": true
+    },
+    "wait": 3
+  },
+  {
+    "id": "env-args",
+    "question": "env + env_production with --env production; args string splitting; instance var",
+    "app": {
+      "env": {
+        "MODE": "dev",
+        "A": "1"
+      },
+      "env_production": {
+        "MODE": "prod"
+      },
+      "args": "x 'y z' w",
+      "instances": 2
+    },
+    "env_name": "production",
+    "wait": 3
+  },
+  {
+    "id": "stop-exit-codes",
+    "question": "Exit 0 with stop_exit_codes [0]",
+    "app": {
+      "behavior": "exit0",
+      "stop_exit_codes": [
+        0
+      ]
+    },
+    "wait": 4
+  },
+  {
+    "id": "autorestart-false",
+    "question": "Crash with autorestart false",
+    "app": {
+      "behavior": "crash",
+      "autorestart": false
+    },
+    "wait": 4
+  },
+  {
+    "id": "stop-signal",
+    "question": "Which signal does stop send?",
+    "app": {
+      "kill_timeout": 3000
+    },
+    "wait": 2,
+    "stop": true
+  },
+  {
+    "id": "wait-ready-missing",
+    "question": "wait_ready with no ready signal (listen_timeout 1500)",
+    "app": {
+      "wait_ready": true,
+      "listen_timeout": 1500,
+      "max_restarts": 1
+    },
+    "wait": 6
+  },
+  {
+    "id": "wait-ready-ok",
+    "question": "wait_ready with a ready signal",
+    "app": {
+      "behavior": "ready",
+      "wait_ready": true,
+      "listen_timeout": 5000
+    },
+    "wait": 3
+  },
+  {
+    "id": "cluster-instances",
+    "question": "Cluster mode with 2 instances: instance numbers",
+    "app": {
+      "exec_mode": "cluster",
+      "instances": 2
+    },
+    "wait": 4
+  }
+]

@@ -568,7 +568,7 @@ impl Instance {
         if uptime >= rp.backoff_reset_after {
             self.backoff_attempt = 0;
         }
-        if self.unstable_streak > rp.max_restarts {
+        if self.unstable_streak >= rp.max_restarts {
             self.error = Some(ErrorReason::CrashLoop {
                 unstable_runs: self.unstable_streak,
             });

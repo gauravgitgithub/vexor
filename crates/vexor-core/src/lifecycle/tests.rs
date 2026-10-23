@@ -200,8 +200,9 @@ fn crash_loop_errors_after_max_restarts() {
         step(&mut i, Event::Spawned, now);
         auto_restarts += 1;
     }
-    assert_eq!(auto_restarts, 3);
-    assert_eq!(i.error(), Some(ErrorReason::CrashLoop { unstable_runs: 4 }));
+    // PM2 7: max_restarts 3 means 3 runs, i.e. 2 automatic restarts.
+    assert_eq!(auto_restarts, 2);
+    assert_eq!(i.error(), Some(ErrorReason::CrashLoop { unstable_runs: 3 }));
     // An operator start clears the error and the budget.
     assert_eq!(step(&mut i, Event::Start, now + 1), vec![Effect::Spawn]);
     assert_eq!(i.error(), None);
@@ -211,7 +212,7 @@ fn crash_loop_errors_after_max_restarts() {
 fn stable_run_resets_crash_budget() {
     let policy = InstancePolicy {
         restart: RestartPolicy {
-            max_restarts: 1,
+            max_restarts: 2,
             ..RestartPolicy::default()
         },
         ..InstancePolicy::default()
@@ -817,7 +818,7 @@ proptest! {
             } else {
                 streak = 0;
             }
-            if streak > policy.restart.max_restarts {
+            if streak >= policy.restart.max_restarts {
                 prop_assert_eq!(i.state(), State::Errored);
                 break;
             }

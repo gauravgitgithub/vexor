@@ -363,7 +363,7 @@ impl Runner {
                     }
                 }
             }
-            Effect::SignalStop => self.signal_current(Signal::TERM),
+            Effect::SignalStop => self.signal_current(self.kill_signal()),
             Effect::ForceKill => self.signal_current(Signal::KILL),
             Effect::ArmTimer {
                 timer,
@@ -455,6 +455,7 @@ impl Runner {
     fn retire_child(&mut self, mut child: tokio::process::Child, pid: u32) {
         let treekill = self.spec.treekill;
         let kill_timeout = self.inst.policy().kill_timeout;
+        let stop_signal = self.kill_signal();
         let managed = self.managed.clone();
         let signal = move |sig| {
             let _ = if treekill {
@@ -464,7 +465,7 @@ impl Runner {
             };
         };
         self.retiring.push(tokio::spawn(async move {
-            signal(Signal::TERM);
+            signal(stop_signal);
             if tokio::time::timeout(kill_timeout, child.wait())
                 .await
                 .is_err()
@@ -488,8 +489,9 @@ impl Runner {
         };
         let c = c.clone();
         let kill_timeout = self.inst.policy().kill_timeout;
+        let stop_signal = self.kill_signal();
         self.retiring.push(tokio::spawn(async move {
-            c.retire(wid);
+            c.retire(wid, stop_signal);
             tokio::time::sleep(kill_timeout).await;
             // Ignored by the primary if the worker is already gone.
             c.signal(wid, Signal::KILL);
@@ -505,6 +507,18 @@ impl Runner {
             }
         };
         let _ = tokio::time::timeout(limit, all).await;
+    }
+
+    /// The configured graceful-stop signal (SIGINT by default, as PM2).
+    fn kill_signal(&self) -> Signal {
+        match self.spec.policy.kill_signal {
+            vexor_core::KillSignal::Int => Signal::INT,
+            vexor_core::KillSignal::Term => Signal::TERM,
+            vexor_core::KillSignal::Hup => Signal::HUP,
+            vexor_core::KillSignal::Quit => Signal::QUIT,
+            vexor_core::KillSignal::Usr1 => Signal::USR1,
+            vexor_core::KillSignal::Usr2 => Signal::USR2,
+        }
     }
 
     fn keep_log_tasks(&mut self, tasks: Vec<JoinHandle<()>>) {

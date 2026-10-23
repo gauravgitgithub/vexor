@@ -392,7 +392,7 @@ fn crash_budget_and_history_survive_a_daemon_kill() {
         // A long min_uptime keeps every run unstable even on a loaded
         // machine; this test is about the budget surviving a daemon kill,
         // not about the min_uptime boundary.
-        "policy": { "max_restarts": 3, "min_uptime_ms": 10000 },
+        "policy": { "max_restarts": 4, "min_uptime_ms": 10000 },
     });
     std::fs::write(&spec, json.to_string()).expect("spec");
     env.ok(&["start", "--spec", &spec.to_string_lossy()]);

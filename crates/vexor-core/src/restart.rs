@@ -39,9 +39,11 @@ pub struct RestartPolicy {
     pub jitter: Jitter,
     /// PM2 `min_uptime`: a run shorter than this is *unstable*.
     pub min_uptime: Duration,
-    /// PM2 `max_restarts`: automatic restarts allowed after consecutive
-    /// unstable runs. The next unstable exit after that marks the instance
-    /// errored. A stable run resets the count.
+    /// PM2 `max_restarts`: the instance is errored once this many runs in a
+    /// row were unstable, so it runs at most this many times in a crash loop
+    /// (as PM2 7: `max_restarts: 3` gives 3 runs). A stable run resets the
+    /// count. 0 means errored on the first unstable exit; PM2 configs with
+    /// 0 are translated to PM2's default of 16 by vexor-pm2.
     pub max_restarts: u32,
     /// A run at least this long resets the exponential backoff to `initial`.
     pub backoff_reset_after: Duration,

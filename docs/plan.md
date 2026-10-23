@@ -45,7 +45,8 @@ Open:
 
 4.5 ✅ `vexor save` / `resurrect` (explicit `dump.json` snapshot, 0600; the daemon already restores apps from its own state at every start), `vexor startup [systemd|launchd]` / `unstartup` (systemd system unit `vexor-<user>.service` with `KillMode=process`, so stopping the service never stops apps; per-user LaunchAgent with `AbandonProcessGroup`; non-root on systemd prints the exact `sudo` command). Tested: unit tests for the generated files (quoting, escaping, `plutil -lint` on macOS); CLI tests for save/resurrect (desired state kept, idempotent) and `startup --print`; a real systemd run in a container: verify, install, stop keeps the app, start reconnects to the same app, killed daemon restarted, unstartup leaves apps running. launchd install not run live (it would add a login item on the dev machine).
 
-Remaining: 
+4.6 ✅ PM2 conformance harness (`tests/conformance`): 11 scenarios run under PM2 7.1.0 and Vexor in isolated homes, comparing what a probe app saw (runs, argv, cwd, env, instance numbers, stop signal) and what each tool reported. It found two real incompatibilities, fixed for 0.1.1: `max_restarts` off by one (and `0` = PM2 default 16), and SIGTERM instead of SIGINT on stop (new `kill_signal` setting). Result: 10 identical, 1 intentional difference (`wait_ready` without a ready signal is a failed start, PM2 says online). Report: docs/conformance.md.
+
 ## Phase 5: migration
 dry-run, backup, journaled apply, rollback (docs/migration.md).
 

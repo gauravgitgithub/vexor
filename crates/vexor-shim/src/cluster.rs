@@ -64,7 +64,7 @@ enum Cmd {
     },
     Signal(u32, Signal),
     /// Graceful retirement: disconnect, then SIGTERM (see cluster.js).
-    Retire(u32),
+    Retire(u32, Signal),
     Shutdown(oneshot::Sender<()>),
 }
 
@@ -120,8 +120,8 @@ impl Cluster {
 
     /// Stop routing connections to worker `wid`, let in-flight ones finish,
     /// then SIGTERM it.
-    pub fn retire(&self, wid: u32) {
-        let _ = self.tx.send(Cmd::Retire(wid));
+    pub fn retire(&self, wid: u32, sig: Signal) {
+        let _ = self.tx.send(Cmd::Retire(wid, sig));
     }
 
     /// Stop the primary (its workers must already have been stopped).
@@ -165,9 +165,9 @@ impl Actor {
                     Some(Cmd::Subscribe(id, tx)) => { self.subscribers.insert(id, tx); }
                     Some(Cmd::Spawn { wid, instance }) => self.spawn(wid, instance).await,
                     Some(Cmd::Signal(id, sig)) => self.signal(id, sig).await,
-                    Some(Cmd::Retire(id)) => {
-                        if self.live.contains(&id)
-                            && !self.send(&json!({ "cmd": "retire", "id": id })).await
+                    Some(Cmd::Retire(id, sig)) => {
+                        let msg = json!({ "cmd": "retire", "id": id, "signal": signal_name(sig) });
+                        if self.live.contains(&id) && !self.send(&msg).await
                         {
                             self.primary_gone().await;
                         }
@@ -219,11 +219,7 @@ impl Actor {
         if !self.live.contains(&id) {
             return;
         }
-        let name = if sig == Signal::KILL {
-            "SIGKILL"
-        } else {
-            "SIGTERM"
-        };
+        let name = signal_name(sig);
         if !self
             .send(&json!({ "cmd": "signal", "id": id, "signal": name }))
             .await
@@ -404,6 +400,18 @@ async fn next_message(primary: &mut Option<Primary>) -> Option<Value> {
     }
 }
 
+fn signal_name(sig: Signal) -> &'static str {
+    match sig {
+        Signal::KILL => "SIGKILL",
+        Signal::INT => "SIGINT",
+        Signal::HUP => "SIGHUP",
+        Signal::QUIT => "SIGQUIT",
+        Signal::USR1 => "SIGUSR1",
+        Signal::USR2 => "SIGUSR2",
+        _ => "SIGTERM",
+    }
+}
+
 fn signal_number(name: &str) -> Option<i32> {
     Some(match name {
         "SIGHUP" => 1,
@@ -414,6 +422,8 @@ fn signal_number(name: &str) -> Option<i32> {
         "SIGSEGV" => 11,
         "SIGPIPE" => 13,
         "SIGTERM" => 15,
+        "SIGUSR1" => 10,
+        "SIGUSR2" => 12,
         _ => return None,
     })
 }

@@ -58,14 +58,14 @@ if wait_for "$D/natural.events" '"stopped"' 5; then pass "natural exit with IPC 
 wait "$pid" 2>/dev/null
 
 # 3. SIGTERM to the shim stops the app gracefully.
-spec term "process.on('SIGTERM',function(){console.log('term');process.exit(0)});console.log('up');setInterval(function(){},1000)" '{}'
+spec term "['SIGINT','SIGTERM'].forEach(function(s){process.on(s,function(){console.log('term');process.exit(0)})});console.log('up');setInterval(function(){},1000)" '{}'
 run_bg term; pid=$!
 wait_for "$D/term.out" up 5
 kill -TERM "$pid"; wait "$pid"; code=$?
 [ "$code" = 0 ] && grep -q term "$D/term.out" && pass "graceful SIGTERM" || fail "graceful SIGTERM" "exit=$code"
 
 # 4. Crash, restart with backoff, crash-loop limit.
-spec crash "console.log('run');process.exit(3)" '{"max_restarts":1}'
+spec crash "console.log('run');process.exit(3)" '{"max_restarts":2}'
 "$VEXOR" shim --spec "$D/crash.json" > "$D/crash.events" 2>&1; code=$?
 runs=$(grep -c run "$D/crash.out")
 [ "$code" = 1 ] && [ "$runs" = 2 ] && grep -q '"errored"' "$D/crash.events" \
@@ -88,7 +88,7 @@ got=$(states "$D/noready.events")
 # 8. Cluster mode: two workers forked by the primary, each reporting ready,
 #    then stopped gracefully.
 cat > "$D/worker.js" <<'WORKER_END'
-process.on('SIGTERM', function () { console.log('bye ' + process.env.NODE_APP_INSTANCE); process.exit(0); });
+['SIGINT', 'SIGTERM'].forEach(function (s) { process.on(s, function () { console.log('bye ' + process.env.NODE_APP_INSTANCE); process.exit(0); }); });
 console.log('worker ' + process.env.NODE_APP_INSTANCE);
 setTimeout(function () { process.send('ready'); }, 100);
 setInterval(function () {}, 1000);

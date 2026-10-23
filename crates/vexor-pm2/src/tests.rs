@@ -320,6 +320,28 @@ fn cluster_mode_translates_to_a_cluster_spec() {
 }
 
 #[test]
+fn max_restarts_zero_means_pm2_default() {
+    let t = tr(json!({ "name": "a", "script": "/bin/sleep", "max_restarts": 0 }));
+    assert_eq!(t.spec.policy.max_restarts, 16);
+    assert!(t.notes.iter().any(|n| n.field == "max_restarts"));
+}
+
+#[test]
+fn kill_signal_extension() {
+    let t = tr(json!({ "name": "a", "script": "/bin/sleep", "kill_signal": "SIGTERM" }));
+    assert_eq!(t.spec.policy.kill_signal, vexor_core::KillSignal::Term);
+    assert!(fatal(&t.notes).is_empty());
+    let t = tr(json!({ "name": "a", "script": "/bin/sleep" }));
+    assert_eq!(
+        t.spec.policy.kill_signal,
+        vexor_core::KillSignal::Int,
+        "PM2 default"
+    );
+    let t = tr(json!({ "name": "a", "script": "/bin/sleep", "kill_signal": "SIGWHAT" }));
+    assert_eq!(fatal(&t.notes), ["kill_signal"]);
+}
+
+#[test]
 fn durations() {
     assert_eq!(parse_duration_ms("500"), Some(500));
     assert_eq!(parse_duration_ms("500ms"), Some(500));

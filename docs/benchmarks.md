@@ -1,6 +1,60 @@
-# Benchmark Methodology (Phase 1 draft, no results yet)
+# Benchmarks
 
-No performance claims exist yet. Targets (engineering goals, not claims): idle supervisor RSS at least 50% lower than PM2; selected start operations at least 30% faster.
+## Results (2026-10-23)
+
+Measured 2026-10-23 on Apple M5 (Docker Desktop VM) (10 cores, 8 GB), linux/arm64 7.0.12-linuxkit, in a container, Node v22.23.4. Each tool runs alone, installed from npm, on the same apps. **Bold** = best; n/a = not supported or failed (see notes).
+
+| Measure | Vexor 0.3.1 | PM2 7.1.0 | OxMgr 0.5.0 | forever 4.0.3 |
+|---|---|---|---|---|
+| List apps (CLI), median | **23 ms** | 76 ms | 24 ms | 109 ms |
+| Start 10 apps until online, median | 352 ms | 435 ms | **317 ms** | 1268 ms |
+| Supervisor memory (PSS), 1 app | 5.7 MiB | 33 MiB | **3.5 MiB** | 37 MiB |
+| Supervisor memory (PSS), 10 apps | 7.9 MiB | 21 MiB | **5.7 MiB** | 191 MiB |
+| Supervisor memory (PSS), 50 apps | 17 MiB | 21 MiB | **4.6 MiB** | 825 MiB |
+| Supervisor memory (RSS), 1 app | 8.1 MiB | 66 MiB | **3.5 MiB** | 67 MiB |
+| Supervisor memory (RSS), 10 apps | 33 MiB | 68 MiB | **5.7 MiB** | 675 MiB |
+| Supervisor memory (RSS), 50 apps | 140 MiB | 72 MiB | **4.6 MiB** | 3316 MiB |
+| Supervisor CPU while idle, 1 app | **0.00%** | 0.37% | 0.07% | 0.37% |
+| Supervisor CPU while idle, 10 apps | **0.00%** | 0.70% | 0.07% | 2.26% |
+| Supervisor CPU while idle, 50 apps | 0.33% | 1.50% | **0.17%** | 7.48% |
+| Crash to back online, median | 38 ms | 159 ms | 20 ms | **13 ms** |
+| Failed requests in 5 cluster reloads | **0** | **0** | **0** | n/a |
+| Supervisor daemon killed: failed requests | **0** | 739 | **0** | n/a |
+| Supervisor daemon killed: app still managed | **yes** | no | **yes** | n/a |
+| Installed size (npm) | 5.8 MiB | 17 MiB | **3.9 MiB** | 20 MiB |
+
+Requests sent: reloads Vexor 1615, PM2 1726, OxMgr 1645, forever 0; daemon kill Vexor 1239, PM2 1219, OxMgr 1220, forever 0.
+
+Notes:
+- OxMgr, crash_restart_ms: Measured separately: OxMgr marks an app errored after its 3rd crash by default (crash_restart_limit 3), even with uptime between crashes, so only 3 restarts can be timed.
+
+Charts: [`docs/benchmarks/`](benchmarks/). Raw results and the run log:
+[`benchmarks/results/2026-10-23-apple-m5-docker/`](../benchmarks/results/2026-10-23-apple-m5-docker/).
+
+### What was measured
+
+- **List apps (CLI):** wall time of `<tool> ls` (forever: `forever list`) with 5 apps running, median of 15 runs after 2 warm-ups. Each tool as installed from npm, so Vexor's time includes its Node.js launcher.
+- **Start 10 apps:** from the start command (an ecosystem file for Vexor and PM2; one `start` per app for OxMgr and forever) until all 10 are online, median of 5.
+- **Supervisor memory and CPU:** everything the tool runs besides the apps (PM2's God daemon; Vexor's daemon and per-app shims; OxMgr's daemon; forever's per-app monitors), with 1, 10 and 50 idle apps, sampled after 3 s and over 30 s. PSS splits shared pages (one binary's code mapped by many processes) between processes and is the fair total; RSS counts them in each process.
+- **Crash to back online:** `kill -9` of the app until a new process is online, 8 times with 1.5 s between (OxMgr: 3, its default crash limit).
+- **Reload:** a 2-instance cluster HTTP app under constant load (2 clients, a request every 5 ms each) during 5 reloads; failed requests counted.
+- **Supervisor killed:** `kill -9` of the daemon under the same load; failed requests over the next 3 s, and whether the next `list` still shows the app.
+- **Installed size:** `du` of the globally installed package (with its platform binary).
+
+### Reproduce
+
+```sh
+cargo build --release --target aarch64-unknown-linux-musl   # or x86_64
+docker run --rm -v "$PWD/benchmarks":/b:ro -v "$PWD/target/.../release":/v node:22-alpine sh -c '
+  npm i -g pm2@7.1.0 vexord oxmgr forever &&
+  cp /v/vexor "$(npm root -g)/vexord/node_modules/vexord-linux-arm64/bin/vexor" &&
+  node /b/run.js --out /b/results.json'
+node benchmarks/charts.js results.json docs/benchmarks
+```
+
+## Methodology (Phase 1 plan)
+
+Targets set before any measurement (engineering goals): idle supervisor RSS at least 50% lower than PM2; selected start operations at least 30% faster.
 
 ## Rules
 

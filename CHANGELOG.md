@@ -3,7 +3,16 @@
 All notable changes to Vexor. Versions follow [Semantic Versioning](https://semver.org/);
 before 1.0, minor versions may include breaking changes, which are listed here.
 
-## Unreleased
+## 0.3.1 (2026-10-23, prerelease)
+
+Benchmarked against PM2, OxMgr and forever (results and charts in the
+README and docs/benchmarks.md), with the weak points they showed fixed.
+
+### Performance
+- Starting the apps of an ecosystem file is parallel: 10 apps in 352 ms
+  (was 2.4 s; PM2: 435 ms).
+- Idle CPU with 50 apps is 0.33% of a core (was 6.6%; PM2: 1.5%): each
+  shim reads only its own children instead of scanning /proc.
 
 ### Fixed
 - A daemon left running by another Vexor version (e.g. after an upgrade)

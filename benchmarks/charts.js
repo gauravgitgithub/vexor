@@ -31,14 +31,20 @@ const ok = (v) => v !== null && v !== undefined && !(typeof v === 'object' && v.
 function chart(file, title, subtitle, unit, groups) {
   const W = 780;
   const left = 120;
-  const right = 110;
+  const right = 170;
   const barH = 16;
   const gap = 5;
   const groupGap = 20;
   const top = 66;
   const vals = groups.flatMap((g) => TOOLS.map((t) => g.get(t)).filter((v) => typeof v === 'number'));
-  const max = Math.max(...vals, 0) || 1;
-  const scale = (v) => (v / max) * (W - left - right);
+  // Outliers would flatten every other bar: bars beyond 1.5x the 75th
+  // percentile (when that's well below the maximum) are cut at the edge,
+  // marked », and keep their real value as a label.
+  const asc = [...vals].sort((a, b) => a - b);
+  const p75 = asc[Math.floor(asc.length * 0.75)] || 0;
+  const cut = asc.length > 3 && asc[asc.length - 1] > 3 * p75 ? p75 * 1.5 : null;
+  const max = (cut || Math.max(...vals, 0)) || 1;
+  const scale = (v) => (Math.min(v, max) / max) * (W - left - right);
   let y = top;
   let body = '';
   for (const g of groups) {
@@ -49,8 +55,9 @@ function chart(file, title, subtitle, unit, groups) {
       const v = g.get(t);
       if (typeof v !== 'number') continue;
       const w = Math.max(2, scale(v));
+      const over = cut !== null && v > max;
       body += `<rect x="${left}" y="${y}" width="${w.toFixed(1)}" height="${barH}" rx="3" fill="${COLORS[t]}"/>`;
-      body += `<text x="${left + w + 6}" y="${y + barH - 4}" class="v">${esc(one(v))}${unit} · ${esc(NAMES[t])}</text>`;
+      body += `<text x="${left + w + 6}" y="${y + barH - 4}" class="v">${over ? '» ' : ''}${esc(one(v))}${unit} · ${esc(NAMES[t])}</text>`;
       y += barH + gap;
     }
     y += groupGap - gap;
@@ -117,7 +124,7 @@ const lines = [
   row('Crash to back online, median', med('crash_restart_ms'), (v) => `${one(v)} ms`),
   row('Failed requests in 5 cluster reloads', failed('reload'), (v) => `${v}`),
   row('Supervisor daemon killed: failed requests', failed('daemon_crash'), (v) => `${v}`),
-  `| Supervisor daemon killed: app still managed | ${TOOLS.map((t) => (ok(r[t].daemon_crash) ? (r[t].daemon_crash.still_managed ? 'yes' : '**no**') : 'n/a')).join(' | ')} |`,
+  `| Supervisor daemon killed: app still managed | ${TOOLS.map((t) => (ok(r[t].daemon_crash) ? (r[t].daemon_crash.still_managed ? '**yes**' : 'no') : 'n/a')).join(' | ')} |`,
   row('Installed size (npm)', (t) => (r[t].install_bytes ? MiB(r[t].install_bytes) : undefined), (v) => `${one(v)} MiB`),
   '',
   `Requests sent: reloads ${TOOLS.map((t) => `${NAMES[t]} ${total('reload')(t)}`).join(', ')}; daemon kill ${TOOLS.map((t) => `${NAMES[t]} ${total('daemon_crash')(t)}`).join(', ')}.`,
@@ -126,6 +133,7 @@ const notes = [];
 for (const t of TOOLS) {
   for (const [k, v] of Object.entries(r[t])) {
     if (v && typeof v === 'object' && v.error) notes.push(`- ${NAMES[t]}, ${k}: ${v.error}`);
+    if (v && typeof v === 'object' && v.note) notes.push(`- ${NAMES[t]}, ${k}: ${v.note}`);
   }
 }
 if (notes.length) lines.push('', 'Notes:', ...notes);

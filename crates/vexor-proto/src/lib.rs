@@ -188,6 +188,9 @@ pub struct AppStatus {
     pub instances: u32,
     /// Latest `state` event per instance, as reported by the shim.
     pub snapshot: Vec<serde_json::Value>,
+    /// `cluster` or `fork` (absent from daemons before 0.3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -220,11 +220,6 @@ const IGNORED: &[(&str, &str)] = &[
     ("windowsHide", "Windows only"),
     ("force", "Vexor never starts two apps with the same name"),
     ("log_type", "log lines are written as the app prints them"),
-    ("time", "per-line timestamps are not implemented yet"),
-    (
-        "log_date_format",
-        "per-line timestamps are not implemented yet",
-    ),
     (
         "filter_env",
         "Vexor passes only an allowlist of the caller's environment by default",
@@ -287,6 +282,8 @@ const HANDLED: &[&str] = &[
     "max_memory_restart",
     "cron_restart",
     "health_check",
+    "time",
+    "log_date_format",
 ];
 
 /// Translate one PM2 app definition.
@@ -649,6 +646,18 @@ pub fn translate(app: &Value, ctx: &Context) -> Result<Translated, Vec<Note>> {
     if logs.out == Path::new("/dev/null") || logs.err == Path::new("/dev/null") {
         // Never rotate (rename) a device file.
         logs.max_size_bytes = 0;
+    }
+    // Vexor timestamps plain-text log lines by default; `time: false` turns
+    // it off (PM2's `time: true` turns it on, which is already the case).
+    if obj.get("time").and_then(Value::as_bool) == Some(false) {
+        logs.timestamps = false;
+    }
+    if obj.contains_key("log_date_format") {
+        c.note(
+            "log_date_format",
+            Severity::Ignored,
+            "lines are timestamped in Vexor's own format (ISO 8601 with milliseconds and UTC offset)",
+        );
     }
     if obj.contains_key("log_file") {
         c.note(

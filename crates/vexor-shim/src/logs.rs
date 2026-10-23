@@ -81,6 +81,7 @@ pub struct Sink {
     tx: mpsc::Sender<Vec<u8>>,
     overflow: Overflow,
     dropped: Arc<AtomicU64>,
+    timestamps: bool,
 }
 
 impl Sink {
@@ -113,6 +114,7 @@ impl Sink {
                 tx,
                 overflow: spec.overflow,
                 dropped,
+                timestamps: spec.timestamps,
             },
             handle,
         ))
@@ -120,6 +122,8 @@ impl Sink {
 
     /// Copy a pipe into this sink until EOF.
     pub async fn pump(self, mut from: impl AsyncRead + Unpin) {
+        // Per pipe: whether the next byte starts a line.
+        let mut at_line_start = true;
         loop {
             let mut buf = vec![0; CHUNK];
             let n = match from.read(&mut buf).await {
@@ -127,6 +131,9 @@ impl Sink {
                 Ok(n) => n,
             };
             buf.truncate(n);
+            if self.timestamps {
+                buf = stamp(&buf, &mut at_line_start, &now_stamp());
+            }
             match self.overflow {
                 Overflow::Block => {
                     if self.tx.send(buf).await.is_err() {
@@ -143,6 +150,32 @@ impl Sink {
             }
         }
     }
+}
+
+/// `2026-10-23T15:15:12.345+05:30 `: local time, sortable, unambiguous.
+fn now_stamp() -> String {
+    chrono::Local::now()
+        .format("%Y-%m-%dT%H:%M:%S%.3f%:z ")
+        .to_string()
+}
+
+/// Put `ts` at the start of every line that has content and doesn't start
+/// with `{` (JSON logs carry their own time).
+fn stamp(buf: &[u8], at_line_start: &mut bool, ts: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(buf.len() + ts.len() * 4);
+    for &b in buf {
+        if *at_line_start {
+            if !matches!(b, b'{' | b'\n' | b'\r') {
+                out.extend_from_slice(ts.as_bytes());
+            }
+            *at_line_start = false;
+        }
+        out.push(b);
+        if b == b'\n' {
+            *at_line_start = true;
+        }
+    }
+    out
 }
 
 fn len_u64(b: &[u8]) -> u64 {
@@ -330,6 +363,23 @@ impl LogFile {
 }
 
 #[cfg(test)]
+mod stamp_tests {
+    use super::stamp;
+
+    #[test]
+    fn plain_lines_are_stamped_json_and_blank_lines_are_not() {
+        let mut start = true;
+        let out = stamp(b"one\n{\"a\":1}\n\ntwo", &mut start, "T ");
+        assert_eq!(out, b"T one\n{\"a\":1}\n\nT two");
+        assert!(!start);
+        // A line split across reads is stamped once.
+        let out = stamp(b" more\nthree\n", &mut start, "U ");
+        assert_eq!(out, b" more\nU three\n");
+        assert!(start);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -395,6 +445,7 @@ mod tests {
         let path = dir.path().join("out.log");
         let spec = LogSpec {
             buffer_bytes: u32::try_from(CHUNK).expect("fits"),
+            timestamps: false,
             ..LogSpec::new(path.clone(), path.clone())
         };
         let events = Output::new(false);
@@ -458,6 +509,7 @@ mod tests {
             overflow: Overflow::Block,
             max_size_bytes: 100_000,
             retain: 1000,
+            timestamps: false,
             ..LogSpec::new(path.clone(), path.clone())
         };
         let events = Output::new(false);

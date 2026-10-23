@@ -104,6 +104,17 @@ impl Drop for Env {
     }
 }
 
+/// Log text without the per-line timestamps Vexor writes.
+fn untimed(text: &str) -> String {
+    text.lines()
+        .map(|l| match l.split_once(' ') {
+            Some((ts, rest)) if ts.len() >= 23 && ts.as_bytes()[10] == b'T' => rest,
+            _ => l,
+        })
+        .map(|l| format!("{l}\n"))
+        .collect()
+}
+
 fn pids(app: &Value) -> Vec<u64> {
     app["snapshot"]
         .as_array()
@@ -500,7 +511,7 @@ fn events_command_table_and_filters() {
     env.ok(&["start", "loop.sh", "--name", "one"]);
     env.ok(&["start", "loop.sh", "--name", "two"]);
     let table = env.ok(&["events", "one"]);
-    assert!(table.starts_with("TIME (UTC)"), "{table}");
+    assert!(table.starts_with("Time"), "{table}");
     assert!(table.contains("online"), "{table}");
     assert!(!table.contains("two"), "{table}");
     std::thread::sleep(Duration::from_millis(1500));
@@ -741,17 +752,28 @@ fn logs_show_the_last_lines_per_stream() {
         assert!(Instant::now() < deadline, "output never reached the log");
         std::thread::sleep(Duration::from_millis(50));
     }
-    assert_eq!(
-        env.ok(&["logs", "talk", "--raw", "--out", "--lines", "3"]),
-        "out 18\nout 19\nout 20\n"
+    // Log files carry a timestamp per line; --raw prints them as written.
+    let raw = env.ok(&["logs", "talk", "--raw", "--out", "--lines", "3"]);
+    assert!(
+        raw.lines()
+            .all(|l| l.len() > 30 && l.as_bytes()[10] == b'T'),
+        "{raw}"
     );
+    assert_eq!(untimed(&raw), "out 18\nout 19\nout 20\n");
     assert_eq!(
-        env.ok(&["logs", "talk", "--raw", "--err", "--lines", "2"]),
+        untimed(&env.ok(&["logs", "talk", "--raw", "--err", "--lines", "2"])),
         "err 19\nerr 20\n"
     );
+    // One timeline: time, app, stream marker (| out, ! err), message.
     let both = env.ok(&["logs", "--lines", "1"]);
-    assert!(both.contains("talk|out | out 20"), "{both}");
-    assert!(both.contains("talk|err | err 20"), "{both}");
+    let lines: Vec<&str> = both.lines().collect();
+    assert_eq!(lines.len(), 2, "{both}");
+    for (l, want) in lines.iter().zip(["talk | out 20", "talk ! err 20"]) {
+        assert!(
+            l.ends_with(want) && l.as_bytes()[2] == b':' && l.as_bytes()[8] == b'.',
+            "{both}"
+        );
+    }
     let out = env.run(&["logs", "nope"]);
     assert_eq!(out.status.code(), Some(1));
 }
@@ -772,6 +794,7 @@ fn logs_follow_keeps_every_line_across_rotation() {
         "cwd": env.work.path(),
         "env": { "PATH": "/usr/bin:/bin" },
         "logs": {
+            "timestamps": false,
             "out": env.work.path().join("count.out"),
             "err": env.work.path().join("count.err"),
             "max_size_bytes": 2048,
@@ -934,7 +957,24 @@ fn migrate_dry_run_reports_and_changes_nothing() {
     let env = Env::new();
     let dump = pm2_dump(&env);
     let dump = dump.to_str().expect("utf-8");
-    let out = env.ok(&["migrate", "--from-pm2", "--dump", dump]);
+    // Default: the plan only.
+    let plan = env.ok(&["migrate", "--from-pm2", "--dump", dump]);
+    assert!(plan.contains("2 apps · 3 processes · PM2 7.1.0"), "{plan}");
+    assert!(
+        plan.contains("move (brief stop)") && plan.contains("add stopped"),
+        "{plan}"
+    );
+    assert!(plan.contains("2 of 2 apps ready to move"), "{plan}");
+    assert!(
+        plan.contains("Next: vexor migrate --from-pm2 --backup"),
+        "{plan}"
+    );
+    assert!(
+        !plan.contains("variables") && !plan.contains("run:"),
+        "{plan}"
+    );
+    // --verbose: commands, paths, environment.
+    let out = env.ok(&["migrate", "--from-pm2", "--dump", dump, "--verbose"]);
     assert!(out.contains("PM2 7.1.0, 3 processes, 2 apps"), "{out}");
     assert!(out.contains("brief (stop, then start)"), "{out}");
     assert!(out.contains("none (not running)"), "{out}");
@@ -948,7 +988,7 @@ fn migrate_dry_run_reports_and_changes_nothing() {
     assert!(!out.contains("API_KEY"), "{out}");
     let named = env.ok(&["migrate", "--from-pm2", "--dump", dump, "--env-names"]);
     assert!(named.contains("API_KEY"), "{named}");
-    for o in [&out, &named] {
+    for o in [&plan, &out, &named] {
         assert!(!o.contains("s3cr3t-value"), "env value printed: {o}");
         assert!(!o.contains("PM2_HOME"), "PM2's own variables kept: {o}");
     }
@@ -988,7 +1028,8 @@ fn migrate_blocked_apps_exit_4_and_missing_dump_explains() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("uid"), "{stdout}");
     assert!(stdout.contains("blocked: uid"), "{stdout}");
-    assert!(stdout.contains("1 of 2 apps can be migrated"), "{stdout}");
+    assert!(stdout.contains("1 of 2 apps ready to move"), "{stdout}");
+    assert!(stdout.contains("Needs attention"), "{stdout}");
 
     let out = env.run(&[
         "migrate",

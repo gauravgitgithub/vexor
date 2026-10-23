@@ -383,7 +383,12 @@ fn apply(home: &Path, pm2_home: &Path, dump: &Path, opts: Options) -> Result<u8,
         .map(|a| a.name.as_str())
         .collect();
 
-    println!("Migration {id} from {}", dump.display());
+    crate::ui::assign_app_colors(report.apps.iter().map(|a| a.name.as_str()));
+    println!(
+        "{} {}",
+        crate::ui::bold(&format!("Migration {id}")),
+        crate::ui::dim(&format!("from {}", dump.display()))
+    );
     if !already.is_empty() {
         println!("  already migrated: {}", already.join(", "));
     }
@@ -406,11 +411,18 @@ fn apply(home: &Path, pm2_home: &Path, dump: &Path, opts: Options) -> Result<u8,
             Downtime::Brief => "stop under PM2, start under Vexor",
             _ => "add to Vexor stopped (not running under PM2)",
         };
-        println!("  {}: {what}", a.name);
+        println!(
+            "  {} {}: {what}",
+            crate::ui::info_mark(),
+            crate::ui::app(&a.name)
+        );
     }
     println!(
-        "An app Vexor can't run healthily within {}s is deleted from Vexor and started again under PM2, and the migration stops there.",
-        opts.timeout.as_secs()
+        "{}",
+        crate::ui::dim(&format!(
+            "An app Vexor can't run healthily within {}s is deleted from Vexor and started again under PM2, and the migration stops there.",
+            opts.timeout.as_secs()
+        ))
     );
     if !opts.yes {
         if !std::io::stdin().is_terminal() {
@@ -456,7 +468,7 @@ fn apply(home: &Path, pm2_home: &Path, dump: &Path, opts: Options) -> Result<u8,
             );
             return Ok(1);
         }
-        print!("{name}: ");
+        print!("{}: ", crate::ui::app(name));
         let _ = std::io::stdout().flush();
         if !resumed {
             journal.write(name, Step::Begin, None)?;
@@ -466,12 +478,16 @@ fn apply(home: &Path, pm2_home: &Path, dump: &Path, opts: Options) -> Result<u8,
             if let Err(e) = pm2.run(&["stop", name]) {
                 // Nothing changed for this app yet.
                 journal.write(name, Step::Failed, Some(e.clone()))?;
-                println!("failed");
+                println!(
+                    "{} {}",
+                    crate::ui::fail_mark(),
+                    crate::ui::bold_red("failed")
+                );
                 eprintln!("vexor: {name}: {e}; the app was not moved");
                 return Ok(1);
             }
             journal.write(name, Step::Pm2Stopped, None)?;
-            print!("stopped under PM2, ");
+            print!("{}", crate::ui::dim("stopped under PM2, "));
             let _ = std::io::stdout().flush();
         }
         let in_vexor = resumed && vexor_apps(home)?.iter().any(|x| x.name == name);
@@ -503,16 +519,21 @@ fn apply(home: &Path, pm2_home: &Path, dump: &Path, opts: Options) -> Result<u8,
             Ok(()) => {
                 journal.write(name, Step::Done, None)?;
                 println!(
-                    "{}",
+                    "{} {}",
                     if a.running {
-                        "running under Vexor"
+                        crate::ui::bold_green("running under Vexor")
                     } else {
-                        "added to Vexor (stopped)"
-                    }
+                        crate::ui::green("added to Vexor (stopped)")
+                    },
+                    crate::ui::ok_mark()
                 );
             }
             Err(why) => {
-                println!("not healthy");
+                println!(
+                    "{} {}",
+                    crate::ui::bold_red("not healthy"),
+                    crate::ui::fail_mark()
+                );
                 eprintln!("vexor: {name}: {why}");
                 let back = vexor_ok(
                     home,
@@ -569,7 +590,10 @@ fn apply(home: &Path, pm2_home: &Path, dump: &Path, opts: Options) -> Result<u8,
     }
 
     if left_on_pm2.is_empty() {
-        println!("\nMigration {id} complete.");
+        println!(
+            "\n{}",
+            crate::ui::bold_green(&format!("Migration {id} complete."))
+        );
     } else {
         println!(
             "\nMigration {id} finished. Left on PM2 because they were already failing there: {}. \
@@ -682,7 +706,10 @@ fn rollback(home: &Path, opts: RollbackOptions) -> Result<u8, String> {
         return Err("not a terminal: pass --yes to confirm the rollback".into());
     }
     let mut journal = Journal::open(&backup.dir)?;
-    println!("Rolling back migration {id}");
+    println!(
+        "{}",
+        crate::ui::bold(&format!("Rolling back migration {id}"))
+    );
     for (name, moved) in apps {
         let what = if moved.pm2_stopped {
             "delete from Vexor, start under PM2 again"
@@ -727,12 +754,20 @@ fn rollback(home: &Path, opts: RollbackOptions) -> Result<u8, String> {
         if done.is_empty() {
             done.push("nothing to undo");
         }
-        println!("{name}: {}", done.join(", "));
+        println!(
+            "{}: {} {}",
+            crate::ui::app(&name),
+            crate::ui::green(&done.join(", ")),
+            crate::ui::ok_mark()
+        );
         journal.write(&name, Step::RolledBack, Some("rollback".into()))?;
     }
     println!(
-        "Rolled back. If you ran `pm2 unstartup`, run `pm2 startup` again; `vexor unstartup` \
-         if Vexor no longer runs anything."
+        "{} {}",
+        crate::ui::bold_green("Rolled back."),
+        crate::ui::dim(
+            "If you ran `pm2 unstartup`, run `pm2 startup` again; `vexor unstartup` if Vexor no longer runs anything."
+        )
     );
     Ok(0)
 }
@@ -791,36 +826,43 @@ pub fn status(home: &Path, id: Option<&str>, json: bool) -> u8 {
         println!("No migrations yet (`vexor migrate --from-pm2 --backup` starts one).");
         return 0;
     }
+    use crate::ui;
     for m in &out {
         let apps = m["apps"].as_array().map_or(&[][..], Vec::as_slice);
         println!(
-            "{}  created {}  {}",
-            m["id"].as_str().unwrap_or("?"),
-            m["created_at"].as_str().unwrap_or("?"),
+            "{} {}{}",
+            ui::bold(m["id"].as_str().unwrap_or("?")),
+            ui::dim(&format!(
+                "created {}",
+                m["created_at"].as_str().unwrap_or("?")
+            )),
             if apps.is_empty() {
-                "backup only (not applied)"
+                format!("  {}", ui::dim("backup only (not applied)"))
             } else {
-                ""
+                String::new()
             }
         );
+        if apps.is_empty() {
+            continue;
+        }
+        ui::assign_app_colors(apps.iter().filter_map(|a| a["app"].as_str()));
+        let mut t = ui::Table::new(&["App", "Where", "When", "Detail"]).shrink(3);
         for a in apps {
             let step = a["step"].as_str().unwrap_or("?");
             let label = match step {
-                "done" => "migrated",
-                "rolled_back" => "back on PM2",
-                "failed" => "FAILED",
-                _ => "interrupted (run --apply to continue, or --rollback)",
+                "done" => ui::green("migrated"),
+                "rolled_back" => ui::cyan("back on PM2"),
+                "failed" => ui::bold_red("FAILED"),
+                _ => ui::yellow("interrupted (run --apply to continue, or --rollback)"),
             };
-            println!(
-                "  {:<20} {label:<12} {}{}",
-                a["app"].as_str().unwrap_or("?"),
-                a["at"].as_str().unwrap_or(""),
-                a["detail"]
-                    .as_str()
-                    .map(|d| format!("  ({d})"))
-                    .unwrap_or_default()
-            );
+            t.row(vec![
+                ui::app(a["app"].as_str().unwrap_or("?")),
+                label,
+                ui::dim(a["at"].as_str().unwrap_or("")),
+                a["detail"].as_str().unwrap_or("").to_owned(),
+            ]);
         }
+        t.print();
     }
     0
 }

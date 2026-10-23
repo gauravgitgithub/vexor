@@ -52,7 +52,10 @@ pub struct Report {
     /// Seconds since the dump was written.
     pub dump_age_secs: Option<u64>,
     pub processes: usize,
-    /// Findings about the PM2 installation as a whole.
+    /// Findings about the PM2 installation as a whole that need action.
+    pub important: Vec<String>,
+    /// Background findings about the PM2 installation (shown with
+    /// --verbose).
     pub warnings: Vec<String>,
     /// Environment variable names most apps share (empty when no two apps
     /// share one): the report lists each app's differences from it.
@@ -105,6 +108,7 @@ pub fn plan(dump_path: &Path, pm2_home: &Path) -> Result<Report, String> {
         dump::parse(&text, user.as_deref()).map_err(|e| format!("{}: {e}", dump_path.display()))?;
 
     let mut warnings = Vec::new();
+    let mut important = Vec::new();
     let meta = std::fs::metadata(dump_path).ok();
     let dump_age_secs = meta
         .as_ref()
@@ -116,18 +120,15 @@ pub fn plan(dump_path: &Path, pm2_home: &Path) -> Result<Report, String> {
         if let Some(m) = &meta
             && m.permissions().mode() & 0o077 != 0
         {
-            warnings.push(format!(
-                "{} is readable by other users (mode {:o}) and holds every app's environment, \
-                 secrets included; consider `chmod 600` it",
-                dump_path.display(),
-                m.permissions().mode() & 0o777
+            important.push(format!(
+                "{} is readable by other users and holds every app's secrets: chmod 600 it",
+                dump_path.display()
             ));
         }
     }
     if let Some(unit) = pm2_startup_unit(user.as_deref()) {
-        warnings.push(format!(
-            "PM2 starts at boot ({}). After migrating, remove it with `pm2 unstartup`, or both \
-             would start the apps",
+        important.push(format!(
+            "PM2 starts at boot ({}): after migrating, run `pm2 unstartup` so apps don't start twice",
             unit.display()
         ));
     }
@@ -189,6 +190,7 @@ pub fn plan(dump_path: &Path, pm2_home: &Path) -> Result<Report, String> {
         pm2_version: dump.pm2_version,
         dump_age_secs,
         processes: dump.processes,
+        important,
         warnings,
         shared_env,
         session_env,
@@ -539,7 +541,129 @@ fn quote(a: &str) -> String {
     }
 }
 
-pub fn print(r: &Report, env_names: bool) {
+/// What needs a person's attention: errors, apps PM2 keeps restarting, a
+/// different Node.js major, another user.
+fn attention(n: &Note) -> bool {
+    n.severity == Severity::Fatal
+        || (n.severity == Severity::Partial
+            && (matches!(n.field.as_str(), "status" | "username")
+                || (n.field == "interpreter" && n.message.starts_with("PM2 ran"))))
+}
+
+/// The plan, compactly: a table with each app's outcome, then only what
+/// needs attention, then the next step.
+pub fn print(r: &Report, env_names: bool, verbose: bool) {
+    use crate::ui;
+    if verbose || env_names {
+        return print_verbose(r, env_names);
+    }
+    ui::assign_app_colors(r.apps.iter().map(|a| a.name.as_str()));
+    let ready = r.apps.len() - r.blocked();
+    println!(
+        "{} {}",
+        ui::bold("PM2 → Vexor migration plan"),
+        ui::dim(&format!(
+            "· {} apps · {} processes{}{}",
+            r.apps.len(),
+            r.processes,
+            r.pm2_version
+                .as_deref()
+                .map(|v| format!(" · PM2 {v}"))
+                .unwrap_or_default(),
+            r.dump_age_secs
+                .map(|s| format!(" · saved {}", age(s)))
+                .unwrap_or_default()
+        ))
+    );
+    if r.apps.is_empty() {
+        println!("The dump has no apps.");
+        return;
+    }
+    let mut t = ui::Table::new(&["App", "Mode", "#", "PM2", "Plan"])
+        .right(&[2])
+        .shrink(0);
+    for a in &r.apps {
+        let mut st = a.pm2_status.clone();
+        st.dedup();
+        let pm2 = st
+            .iter()
+            .map(|s| ui::state(s))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let crash_looping = a.notes.iter().any(|n| n.field == "status");
+        let plan = match a.downtime {
+            Downtime::Blocked => format!("{} {}", ui::fail_mark(), ui::red(&blocked_reason(a))),
+            _ if crash_looping => format!(
+                "{} {}",
+                ui::warn_mark(),
+                ui::yellow("move, but it keeps crashing")
+            ),
+            Downtime::Brief => format!("{} move {}", ui::ok_mark(), ui::dim("(brief stop)")),
+            Downtime::None => format!("{} add stopped", ui::ok_mark()),
+        };
+        t.row(vec![
+            ui::app(&a.name),
+            if a.mode == "cluster" {
+                ui::magenta(a.mode)
+            } else {
+                ui::cyan(a.mode)
+            },
+            a.instances.to_string(),
+            pm2,
+            plan,
+        ]);
+    }
+    t.print();
+
+    let mut items: Vec<String> = Vec::new();
+    for a in &r.apps {
+        for n in a.notes.iter().filter(|n| attention(n)) {
+            let mark = if n.severity == Severity::Fatal {
+                ui::fail_mark()
+            } else {
+                ui::warn_mark()
+            };
+            let mut msg = n.message.clone();
+            if n.field == "status"
+                && let Some(log) = a.spec.as_ref().and_then(|s| s["logs"]["err"].as_str())
+            {
+                msg = format!("PM2 keeps restarting it (it keeps exiting); see {log}");
+            }
+            items.push(format!("{mark} {} {msg}", ui::app(&a.name)));
+        }
+    }
+    for w in &r.important {
+        items.push(format!("{} {w}", ui::warn_mark()));
+    }
+    if !items.is_empty() {
+        println!("\n{}", ui::bold("Needs attention"));
+        for i in items {
+            println!("  {i}");
+        }
+    }
+    println!();
+    let summary = format!("{ready} of {} apps ready to move.", r.apps.len());
+    println!(
+        "{} {}",
+        if ready == r.apps.len() {
+            ui::bold_green(&summary)
+        } else {
+            ui::bold_yellow(&summary)
+        },
+        ui::dim(
+            "Each running app is stopped under PM2 and started under Vexor: a gap of about its start time."
+        )
+    );
+    println!(
+        "{} {}   {}",
+        ui::info_mark(),
+        ui::bold("Next: vexor migrate --from-pm2 --backup"),
+        ui::dim("(--verbose: commands, paths and environment)")
+    );
+}
+
+/// Everything: commands, paths, environment, every finding (--verbose).
+pub fn print_verbose(r: &Report, env_names: bool) {
     println!(
         "PM2 dump: {} ({}{} processes, {} apps{})",
         r.dump.display(),
@@ -553,7 +677,7 @@ pub fn print(r: &Report, env_names: bool) {
             .map(|s| format!(", saved {}", age(s)))
             .unwrap_or_default(),
     );
-    for w in &r.warnings {
+    for w in r.important.iter().chain(&r.warnings) {
         println!("warning: {w}");
     }
     let sharing = r

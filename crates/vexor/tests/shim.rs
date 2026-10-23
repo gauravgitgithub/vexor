@@ -39,7 +39,7 @@ impl Shim {
             "args": args,
             "cwd": self.dir.path(),
             "env": { "PATH": "/usr/bin:/bin" },
-            "logs": { "out": self.path("out.log"), "err": self.path("err.log") },
+            "logs": { "timestamps": false, "out": self.path("out.log"), "err": self.path("err.log") },
         });
         merge(&mut spec, extra);
         let path = self.path("spec.json");
@@ -547,6 +547,7 @@ fn one_gigabyte_flood_stays_under_the_cap_with_bounded_memory() {
     let extra = json!({
         "policy": { "autorestart": false },
         "logs": {
+            "timestamps": false,
             "out": shim.path("out.log"),
             "err": shim.path("err.log"),
             "max_size_bytes": max,
@@ -601,6 +602,7 @@ fn block_mode_rotation_keeps_every_line_in_order() {
     let extra = json!({
         "policy": { "autorestart": false },
         "logs": {
+            "timestamps": false,
             "out": shim.path("out.log"),
             "err": shim.path("err.log"),
             "max_size_bytes": 65536,

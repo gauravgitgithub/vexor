@@ -635,3 +635,33 @@ fn health_check_translates() {
         assert!(t.spec.health_check.is_none());
     }
 }
+
+#[test]
+fn time_setting_controls_log_timestamps() {
+    let dir = tempfile::tempdir().expect("dir");
+    let tr = |v: serde_json::Value| translate(&v, &ctx(dir.path())).expect("translates");
+    assert!(
+        tr(json!({"name": "a", "script": "/bin/sh"}))
+            .spec
+            .logs
+            .timestamps
+    );
+    assert!(
+        tr(json!({"name": "a", "script": "/bin/sh", "time": true}))
+            .spec
+            .logs
+            .timestamps
+    );
+    assert!(
+        !tr(json!({"name": "a", "script": "/bin/sh", "time": false}))
+            .spec
+            .logs
+            .timestamps
+    );
+    let t = tr(json!({"name": "a", "script": "/bin/sh", "log_date_format": "YYYY"}));
+    assert!(
+        t.notes
+            .iter()
+            .any(|n| n.field == "log_date_format" && n.severity == Severity::Ignored)
+    );
+}

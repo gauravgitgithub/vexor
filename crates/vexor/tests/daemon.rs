@@ -49,6 +49,7 @@ impl Home {
             "cwd": self.dir.path(),
             "env": { "PATH": "/usr/bin:/bin" },
             "logs": {
+                "timestamps": false,
                 "out": self.path(&format!("{name}.out")),
                 "err": self.path(&format!("{name}.err")),
             },

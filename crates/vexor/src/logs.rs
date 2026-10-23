@@ -11,10 +11,13 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-/// One log file to show, with the label printed before its lines.
+/// One log file to show.
 #[derive(Debug, Clone)]
 pub struct Source {
-    pub label: String,
+    pub app: String,
+    /// Standard error (or a merged file, when `merged`).
+    pub err: bool,
+    pub merged: bool,
     pub path: PathBuf,
 }
 
@@ -72,29 +75,180 @@ pub fn last_lines_with_rotated(path: &Path, n: usize) -> Vec<String> {
     lines
 }
 
-fn print_line(out: &mut impl Write, label: &str, line: &str, raw: bool) -> io::Result<()> {
-    if raw {
-        writeln!(out, "{line}")
-    } else {
-        writeln!(out, "{label} | {line}")
+type Time = chrono::DateTime<chrono::Local>;
+
+/// A log line split into its timestamp (Vexor's prefix, or a JSON log's
+/// own time field) and the rest.
+struct Line<'a> {
+    ts: Option<Time>,
+    text: &'a str,
+}
+
+/// `2026-10-23T15:17:05.344+05:30 message` (as the shim writes it).
+fn vexor_stamp(line: &str) -> Option<(Time, &str)> {
+    let (head, rest) = line.split_once(' ')?;
+    if head.len() < 23 || head.as_bytes().get(10) != Some(&b'T') {
+        return None;
+    }
+    let t = chrono::DateTime::parse_from_rfc3339(head).ok()?;
+    Some((t.with_timezone(&chrono::Local), rest))
+}
+
+/// A JSON log line's own time: pino `time` (epoch ms), winston
+/// `timestamp`, `@timestamp`, `ts` (epoch s or ms, or RFC 3339).
+fn json_time(v: &serde_json::Value) -> Option<Time> {
+    use chrono::TimeZone;
+    for key in ["time", "timestamp", "@timestamp", "ts"] {
+        match &v[key] {
+            serde_json::Value::Number(n) => {
+                let x = n.as_f64()?;
+                let ms = if x < 1e11 { x * 1000.0 } else { x };
+                #[allow(clippy::cast_possible_truncation)]
+                return chrono::Local.timestamp_millis_opt(ms as i64).single();
+            }
+            serde_json::Value::String(s) => {
+                if let Ok(t) = chrono::DateTime::parse_from_rfc3339(s) {
+                    return Some(t.with_timezone(&chrono::Local));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn parse(line: &str) -> Line<'_> {
+    if let Some((ts, text)) = vexor_stamp(line) {
+        return Line { ts: Some(ts), text };
+    }
+    if line.starts_with('{')
+        && let Ok(v) = serde_json::from_str::<serde_json::Value>(line)
+    {
+        return Line {
+            ts: json_time(&v),
+            text: line,
+        };
+    }
+    Line {
+        ts: None,
+        text: line,
     }
 }
 
-/// Print the last `n` lines of each source, one source after another.
+/// `15:17:05.344`, with the date when it isn't today.
+fn clock(ts: Option<Time>) -> String {
+    match ts {
+        Some(t) if t.date_naive() == chrono::Local::now().date_naive() => {
+            t.format("%H:%M:%S%.3f").to_string()
+        }
+        Some(t) => t.format("%m-%d %H:%M:%S%.3f").to_string(),
+        None => " ".repeat(12),
+    }
+}
+
+/// Pretty JSON logs (pino, winston, bunyan): level, message, other fields.
+fn pretty_json(text: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(text).ok()?;
+    let obj = v.as_object()?;
+    let msg = obj.get("msg").or_else(|| obj.get("message"))?.as_str()?;
+    let level = match obj.get("level") {
+        Some(serde_json::Value::Number(n)) => match n.as_u64().unwrap_or(30) {
+            0..=10 => "trace",
+            11..=20 => "debug",
+            21..=30 => "info",
+            31..=40 => "warn",
+            41..=50 => "error",
+            _ => "fatal",
+        }
+        .to_owned(),
+        Some(serde_json::Value::String(s)) => s.to_lowercase(),
+        _ => "info".to_owned(),
+    };
+    let badge = match level.as_str() {
+        "error" | "fatal" => crate::ui::bold_red(&format!("{level:<5}")),
+        "warn" | "warning" => crate::ui::bold_yellow(&format!("{level:<5}")),
+        "debug" | "trace" => crate::ui::dim(&format!("{level:<5}")),
+        _ => crate::ui::green(&format!("{level:<5}")),
+    };
+    const SKIP: &[&str] = &[
+        "msg",
+        "message",
+        "level",
+        "time",
+        "timestamp",
+        "@timestamp",
+        "ts",
+        "pid",
+        "hostname",
+        "v",
+    ];
+    let rest: Vec<String> = obj
+        .iter()
+        .filter(|(k, _)| !SKIP.contains(&k.as_str()))
+        .map(|(k, v)| match v {
+            serde_json::Value::String(s) => format!("{k}={s}"),
+            other => format!("{k}={other}"),
+        })
+        .collect();
+    Some(if rest.is_empty() {
+        format!("{badge} {msg}")
+    } else {
+        format!("{badge} {msg} {}", crate::ui::dim(&rest.join(" ")))
+    })
+}
+
+/// Print one line: time, app (in its colour), stream marker, message.
+fn print_line(
+    out: &mut impl Write,
+    src: &Source,
+    line: &str,
+    raw: bool,
+    app_width: usize,
+    fallback: Option<Time>,
+) -> io::Result<()> {
+    if raw {
+        return writeln!(out, "{line}");
+    }
+    let l = parse(line);
+    let ts = l.ts.or(fallback);
+    let name = crate::ui::pad(&crate::ui::app(&src.app), app_width);
+    let fancy = crate::ui::fancy();
+    let bar = match (src.err && !src.merged, fancy) {
+        (true, true) => crate::ui::bold_red("┃"),
+        (true, false) => "!".to_owned(),
+        (false, true) => crate::ui::dim("│"),
+        (false, false) => "|".to_owned(),
+    };
+    let text = pretty_json(l.text).unwrap_or_else(|| l.text.to_owned());
+    writeln!(out, "{} {name} {bar} {text}", crate::ui::dim(&clock(ts)))
+}
+
+fn app_width(sources: &[Source]) -> usize {
+    crate::ui::assign_app_colors(sources.iter().map(|s| s.app.as_str()));
+    sources.iter().map(|s| s.app.len()).max().unwrap_or(0)
+}
+
+/// Print the last `n` lines of each source as one timeline: lines from
+/// every file are merged by time (a line without a time keeps the time of
+/// the line before it, so stack traces stay together).
 pub fn print_tail(sources: &[Source], n: usize, raw: bool) -> io::Result<()> {
     let mut out = io::stdout().lock();
-    for s in sources {
-        if !raw {
-            writeln!(
-                out,
-                "--- {} ({}), last {n} lines ---",
-                s.label,
-                s.path.display()
-            )?;
+    let width = app_width(sources);
+    let mut all: Vec<(Option<Time>, usize, usize, String)> = Vec::new();
+    for (i, s) in sources.iter().enumerate() {
+        let mut last: Option<Time> = None;
+        for (seq, line) in last_lines_with_rotated(&s.path, n).into_iter().enumerate() {
+            let ts = parse(&line).ts.or(last);
+            last = ts;
+            all.push((ts, i, seq, line));
         }
-        for line in last_lines_with_rotated(&s.path, n) {
-            print_line(&mut out, &s.label, &line, raw)?;
-        }
+    }
+    if !raw {
+        // Stable: equal times keep file order.
+        all.sort_by_key(|(ts, i, seq, _)| (*ts, *i, *seq));
+    }
+    for (ts, i, _, line) in &all {
+        print_line(&mut out, &sources[*i], line, raw, width, *ts)?;
     }
     out.flush()
 }
@@ -189,13 +343,16 @@ impl Followed {
 }
 
 /// Print new lines from every source as they arrive, until interrupted.
+/// A line without a time of its own is shown with the time it arrived.
 pub fn follow(sources: Vec<Source>, raw: bool) -> io::Result<()> {
+    let width = app_width(&sources);
     let mut followed: Vec<Followed> = sources.into_iter().map(Followed::new).collect();
     loop {
         let mut out = io::stdout().lock();
         for f in &mut followed {
             for line in f.poll() {
-                print_line(&mut out, &f.source.label, &line, raw)?;
+                let now = Some(chrono::Local::now());
+                print_line(&mut out, &f.source, &line, raw, width, now)?;
             }
         }
         out.flush()?;
@@ -235,6 +392,26 @@ mod tests {
     }
 
     #[test]
+    fn times_come_from_the_stamp_or_the_json() {
+        let l = parse("2026-10-23T15:17:05.344+05:30 hello world");
+        assert_eq!(l.text, "hello world");
+        assert!(l.ts.is_some());
+        let j = parse(r#"{"level":30,"time":1792742206407,"msg":"up"}"#);
+        assert!(j.ts.is_some());
+        assert!(parse("plain line").ts.is_none());
+        assert!(parse("2026-10-23 nope").ts.is_none());
+        let p = pretty_json(r#"{"level":50,"time":1,"msg":"boom","route":"/x","pid":3}"#)
+            .expect("pretty");
+        assert!(
+            p.contains("error")
+                && p.contains("boom")
+                && p.contains("route=/x")
+                && !p.contains("pid")
+        );
+        assert!(pretty_json(r#"{"no":"msg"}"#).is_none());
+    }
+
+    #[test]
     fn rotated_file_fills_in_short_current_file() {
         let dir = tempfile::tempdir().expect("tempdir");
         write(dir.path(), "out.log.1", "old1\nold2\nold3\n");
@@ -247,7 +424,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = write(dir.path(), "out.log", "before\n");
         let mut f = Followed::new(Source {
-            label: "a|out".into(),
+            app: "a".into(),
+            err: false,
+            merged: false,
             path: path.clone(),
         });
         assert!(f.poll().is_empty(), "starts at the end");

@@ -60,8 +60,21 @@ fn ms(v: u64) -> String {
 }
 
 pub fn print(status: &AppStatus, spec: &AppSpec, events: &[Value], show_env: bool) {
+    use crate::ui;
     let now = now_ms();
-    let row = |k: &str, v: String| println!("{k:<13}{v}");
+    ui::assign_app_colors([spec.name.as_str()]);
+    let row = |k: &str, v: String| println!("  {} {v}", ui::cyan(&format!("{k:<12}")));
+    let section = |t: &str| println!("\n{}", ui::bold(t));
+    println!(
+        "{} {}",
+        ui::app(&spec.name),
+        ui::dim(if spec.cluster.is_some() {
+            "· cluster"
+        } else {
+            "· fork"
+        })
+    );
+    section("Status");
     row("Name", spec.name.clone());
     let desired = match status.desired {
         Desired::Running => "running",
@@ -99,16 +112,16 @@ pub fn print(status: &AppStatus, spec: &AppSpec, events: &[Value], show_env: boo
             parts.push(format!("error: {r}"));
         }
         row(
-            "",
+            &format!("#{}", s["instance"]),
             format!(
-                "{} {}: {}",
-                s["instance"],
-                s["state"].as_str().unwrap_or("?"),
-                parts.join(", ")
+                "{}  {}",
+                ui::state(s["state"].as_str().unwrap_or("?")),
+                ui::dim(&parts.join(" · "))
             ),
         );
     }
 
+    section("Process");
     row("Exec", spec.exec.display().to_string());
     match &spec.cluster {
         Some(c) => {
@@ -137,11 +150,24 @@ pub fn print(status: &AppStatus, spec: &AppSpec, events: &[Value], show_env: boo
         if show_env {
             env.join(" ")
         } else {
-            format!("{} (values hidden; --show-env to show)", env.join(", "))
+            let shown: Vec<&str> = env.iter().take(12).map(String::as_str).collect();
+            let more = env.len().saturating_sub(shown.len());
+            format!(
+                "{} variables: {}{} {}",
+                env.len(),
+                shown.join(", "),
+                if more > 0 {
+                    format!(" and {more} more")
+                } else {
+                    String::new()
+                },
+                ui::dim("(values hidden; --show-env to show)")
+            )
         },
     );
     row("Instance var", spec.instance_var.clone());
 
+    section("Behaviour");
     let p = &spec.policy;
     let policy = spec.instance_policy();
     let restart = if p.autorestart {
@@ -262,18 +288,20 @@ pub fn print(status: &AppStatus, spec: &AppSpec, events: &[Value], show_env: boo
     let rotation = if l.max_size_bytes == 0 {
         "no rotation".to_owned()
     } else {
-        format!(
-            "rotate at {} KiB, keep {}",
-            l.max_size_bytes / 1024,
-            l.retain
-        )
+        format!("rotate at {}, keep {}", bytes(l.max_size_bytes), l.retain)
     };
+    section("Logs");
     row("Out log", l.out.display().to_string());
     row("Error log", l.err.display().to_string());
     row(
         "Logging",
         format!(
-            "{rotation}, on overflow: {}",
+            "{rotation}, {}, on overflow: {}",
+            if l.timestamps {
+                "timestamped lines"
+            } else {
+                "no timestamps"
+            },
             serde_json::to_value(l.overflow)
                 .ok()
                 .and_then(|v| v.as_str().map(str::to_owned))
@@ -282,8 +310,7 @@ pub fn print(status: &AppStatus, spec: &AppSpec, events: &[Value], show_env: boo
     );
 
     if !events.is_empty() {
-        println!();
-        println!("Recent events:");
+        section("Recent events");
         crate::print_events(events);
     }
 }

@@ -7,6 +7,7 @@ mod logs;
 mod migrate;
 mod spec;
 mod startup;
+mod ui;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -24,6 +25,10 @@ struct Cli {
     /// Vexor home directory [default: $VEXOR_HOME, else ~/.vexor]
     #[arg(long, global = true)]
     home: Option<PathBuf>,
+    /// Colours and tables: auto (on a terminal), always, never. NO_COLOR
+    /// turns colour off.
+    #[arg(long, global = true, value_enum, default_value_t = ui::ColorChoice::Auto)]
+    color: ui::ColorChoice,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -201,6 +206,10 @@ enum Command {
         /// (values are never shown).
         #[arg(long)]
         env_names: bool,
+        /// Dry run: show each app's command, paths, environment summary and
+        /// every finding.
+        #[arg(long, short = 'v')]
+        verbose: bool,
     },
     /// Run the supervisor daemon in the foreground. Other commands start it
     /// in the background automatically.
@@ -290,8 +299,10 @@ mod code {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    ui::init(cli.color);
     let home = cli.home.unwrap_or_else(default_home);
     let Some(command) = cli.command else {
+        overview();
         return ExitCode::SUCCESS;
     };
     match command {
@@ -373,6 +384,7 @@ fn main() -> ExitCode {
             dump,
             json,
             env_names,
+            verbose,
         } => {
             let moving = apply || rollback.is_some();
             if !moving && (only.is_some() || yes || pm2.is_some() || timeout.is_some()) {
@@ -419,7 +431,7 @@ fn main() -> ExitCode {
                     },
                 ))
             } else {
-                migrate_cmd(&home, pm2_home, dump, backup, json, env_names)
+                migrate_cmd(&home, pm2_home, dump, backup, json, env_names, verbose)
             }
         }
         Command::Events {
@@ -445,6 +457,48 @@ fn main() -> ExitCode {
             )
         }
     }
+}
+
+/// `vexor` with no command: what it is and the commands people use most.
+fn overview() {
+    println!(
+        "{} {}  {}",
+        ui::bold_cyan("vexor"),
+        ui::dim(env!("CARGO_PKG_VERSION")),
+        ui::dim("process manager for Node.js, PM2-compatible")
+    );
+    println!();
+    let cmds: [(&str, &str); 9] = [
+        ("start app.js -i 4", "start a script (cluster mode with -i)"),
+        (
+            "start ecosystem.config.js",
+            "start apps from a PM2 ecosystem file",
+        ),
+        ("ls", "apps, status, CPU and memory"),
+        ("logs [app] -f", "one timeline of all logs, with times"),
+        ("describe <app>", "configuration, status and recent events"),
+        (
+            "reload <app>",
+            "new processes first, then retire the old ones",
+        ),
+        ("stop | restart | delete <app|all>", "control apps"),
+        (
+            "migrate --from-pm2",
+            "plan a move from PM2 (changes nothing)",
+        ),
+        ("startup", "start at boot (systemd, launchd)"),
+    ];
+    let w = cmds.iter().map(|(c, _)| c.len()).max().unwrap_or(0);
+    for (c, d) in cmds {
+        println!(
+            "  {} {}  {}",
+            ui::dim("vexor"),
+            ui::cyan(&format!("{c:<w$}")),
+            ui::dim(d)
+        );
+    }
+    println!();
+    println!("{}", ui::dim("All commands: vexor --help"));
 }
 
 fn default_home() -> PathBuf {
@@ -529,11 +583,16 @@ fn print_notes(notes: &[vexor_pm2::Note]) {
     use vexor_pm2::Severity;
     for n in notes {
         let level = match n.severity {
-            Severity::Fatal => "error",
-            Severity::Partial => "warning",
-            Severity::Ignored => "note",
+            Severity::Fatal => ui::bold_red("error"),
+            Severity::Partial => ui::yellow("warning"),
+            Severity::Ignored => ui::dim("note"),
         };
-        eprintln!("vexor: {level}: {}: {}: {}", n.app, n.field, n.message);
+        eprintln!(
+            "vexor: {level}: {}: {}: {}",
+            ui::app(&n.app),
+            ui::bold(&n.field),
+            n.message
+        );
     }
 }
 
@@ -739,17 +798,17 @@ fn logs_cmd(
         let merged = l.out == l.err;
         if want_out || merged {
             sources.push(logs::Source {
-                label: if merged {
-                    spec.name.clone()
-                } else {
-                    format!("{}|out", spec.name)
-                },
+                app: spec.name.clone(),
+                err: merged,
+                merged,
                 path: l.out.clone(),
             });
         }
         if want_err && !merged {
             sources.push(logs::Source {
-                label: format!("{}|err", spec.name),
+                app: spec.name.clone(),
+                err: true,
+                merged: false,
                 path: l.err.clone(),
             });
         }
@@ -823,13 +882,11 @@ fn print_warnings(warnings: &[String]) {
 }
 
 pub(crate) fn print_events(events: &[serde_json::Value]) {
-    let mut rows = vec![[
-        "TIME (UTC)".to_owned(),
-        "APP".to_owned(),
-        "INST".to_owned(),
-        "EVENT".to_owned(),
-        "DETAIL".to_owned(),
-    ]];
+    use chrono::TimeZone;
+    ui::assign_app_colors(events.iter().filter_map(|e| e["app"].as_str()));
+    let mut t = ui::Table::new(&["Time", "App", "#", "Event", "Detail"])
+        .right(&[2])
+        .shrink(4);
     for e in events {
         let kind = e["type"].as_str().unwrap_or("?");
         let event = if kind == "state" {
@@ -887,19 +944,38 @@ pub(crate) fn print_events(events: &[serde_json::Value]) {
         if let Some(err) = e["error"].as_str() {
             detail.push(err.to_owned());
         }
-        rows.push([
-            e["ts_ms"]
-                .as_u64()
-                .map_or_else(|| "-".to_owned(), format_utc),
-            e["app"].as_str().unwrap_or("-").to_owned(),
+        let time = e["ts_ms"]
+            .as_u64()
+            .and_then(|ms| {
+                chrono::Local
+                    .timestamp_millis_opt(i64::try_from(ms).ok()?)
+                    .single()
+            })
+            .map_or_else(
+                || "-".to_owned(),
+                |t| t.format("%Y-%m-%d %H:%M:%S%.3f").to_string(),
+            );
+        let painted = match event.as_str() {
+            "online" | "reload" if e["outcome"] != "failed" => ui::green(&event),
+            "errored" | "spawn_error" | "log_error" => ui::bold_red(&event),
+            "stopped" | "stopping" | "starting" => ui::dim(&event),
+            "backoff" | "unhealthy" | "memory_restart" | "group_cleanup" | "log_dropped"
+            | "orphan" => ui::yellow(&event),
+            "health" if e["ok"] == false => ui::yellow(&event),
+            "cron_restart" | "watch_restart" | "health" => ui::cyan(&event),
+            _ => event.clone(),
+        };
+        t.row(vec![
+            ui::dim(&time),
+            e["app"].as_str().map_or_else(|| "-".to_owned(), ui::app),
             e["instance"]
                 .as_u64()
                 .map_or_else(|| "-".to_owned(), |i| i.to_string()),
-            event,
+            painted,
             detail.join(" "),
         ]);
     }
-    print_rows(&rows);
+    t.print();
 }
 
 /// `YYYY-MM-DD HH:MM:SS.mmm` in UTC, without a date library.
@@ -955,56 +1031,144 @@ pub(crate) fn print_rows<const N: usize>(rows: &[[String; N]]) {
     }
 }
 
+/// CPU % and resident memory per PID, from one `ps` call (best effort).
+fn usage(pids: &[u64]) -> std::collections::HashMap<u64, (f64, u64)> {
+    let mut out = std::collections::HashMap::new();
+    if pids.is_empty() {
+        return out;
+    }
+    let list: Vec<String> = pids.iter().map(u64::to_string).collect();
+    let Ok(o) = std::process::Command::new("ps")
+        .args(["-o", "pid=,%cpu=,rss=", "-p", &list.join(",")])
+        .output()
+    else {
+        return out;
+    };
+    for line in String::from_utf8_lossy(&o.stdout).lines() {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if let [pid, cpu, rss] = f.as_slice()
+            && let (Ok(pid), Ok(cpu), Ok(rss)) = (pid.parse(), cpu.parse(), rss.parse::<u64>())
+        {
+            out.insert(pid, (cpu, rss * 1024));
+        }
+    }
+    out
+}
+
 fn print_table(apps: &[AppStatus]) {
     let now = describe::now_ms();
-    let mut rows = vec![[
-        "NAME".to_owned(),
-        "INST".to_owned(),
-        "STATUS".to_owned(),
-        "PID".to_owned(),
-        "UPTIME".to_owned(),
-        "RESTARTS".to_owned(),
-    ]];
+    ui::assign_app_colors(apps.iter().map(|a| a.name.as_str()));
+    let pids: Vec<u64> = apps
+        .iter()
+        .flat_map(|a| a.snapshot.iter().filter_map(|s| s["pid"].as_u64()))
+        .collect();
+    let usage = usage(&pids);
+    let mut t = ui::Table::new(&[
+        "App", "Mode", "#", "Status", "PID", "CPU", "Memory", "Uptime", "↺",
+    ])
+    .right(&[2, 4, 5, 6, 7, 8])
+    .shrink(0);
+    let (mut online, mut errored, mut stopped, mut other) = (0, 0, 0, 0);
     for app in apps {
+        let mode = app.mode.as_deref().unwrap_or("-");
+        let mode = if mode == "cluster" {
+            ui::magenta(mode)
+        } else {
+            ui::cyan(mode)
+        };
         if app.snapshot.is_empty() {
             let status = match app.desired {
                 Desired::Stopped => "stopped",
                 Desired::Running => "launching",
             };
-            rows.push([
-                app.name.clone(),
+            if status == "stopped" {
+                stopped += 1;
+            } else {
+                other += 1;
+            }
+            t.row(vec![
+                ui::app(&app.name),
+                mode,
                 "-".into(),
-                status.into(),
-                "-".into(),
-                "-".into(),
-                "-".into(),
+                ui::state(status),
+                ui::dim("-"),
+                ui::dim("-"),
+                ui::dim("-"),
+                ui::dim("-"),
+                ui::dim("-"),
             ]);
+            continue;
         }
-        for s in &app.snapshot {
+        for (i, s) in app.snapshot.iter().enumerate() {
             // A shim that has gone means its instances are not running,
             // whatever their last reported state.
-            let stopped = app.shim_pid.is_none() && app.desired == Desired::Stopped;
-            let state = if stopped {
+            let gone = app.shim_pid.is_none() && app.desired == Desired::Stopped;
+            let state = if gone {
                 "stopped"
             } else {
                 s["state"].as_str().unwrap_or("?")
             };
-            rows.push([
-                app.name.clone(),
+            match state {
+                "online" => online += 1,
+                "errored" => errored += 1,
+                "stopped" => stopped += 1,
+                _ => other += 1,
+            }
+            let pid = s["pid"].as_u64().filter(|_| !gone);
+            let (cpu, mem) = pid.and_then(|p| usage.get(&p)).map_or_else(
+                || (ui::dim("-"), ui::dim("-")),
+                |(c, m)| (format!("{c:.1}%"), describe::bytes(*m)),
+            );
+            let restarts = s["restarts"].as_u64().unwrap_or(0);
+            t.row(vec![
+                if i == 0 {
+                    ui::app(&app.name)
+                } else {
+                    ui::dim(if ui::fancy() { "  └" } else { "" })
+                },
+                if i == 0 { mode.clone() } else { String::new() },
                 s["instance"].to_string(),
-                state.to_owned(),
-                s["pid"]
-                    .as_u64()
-                    .filter(|_| !stopped)
-                    .map_or_else(|| "-".to_owned(), |p| p.to_string()),
+                ui::state(state),
+                pid.map_or_else(|| ui::dim("-"), |p| p.to_string()),
+                cpu,
+                mem,
                 describe::uptime(s, now)
-                    .filter(|_| !stopped)
-                    .unwrap_or_else(|| "-".into()),
-                s["restarts"].to_string(),
+                    .filter(|_| !gone)
+                    .unwrap_or_else(|| ui::dim("-")),
+                if restarts > 0 {
+                    ui::yellow(&restarts.to_string())
+                } else {
+                    restarts.to_string()
+                },
             ]);
         }
     }
-    print_rows(&rows);
+    if apps.is_empty() {
+        println!(
+            "{}",
+            ui::dim(
+                "No apps yet. Start one with `vexor start app.js` or `vexor start ecosystem.config.js`."
+            )
+        );
+        return;
+    }
+    t.print();
+    let processes = online + errored + stopped + other;
+    let mut parts = vec![
+        format!("{} apps", apps.len()),
+        format!("{processes} processes"),
+        ui::green(&format!("{online} online")),
+    ];
+    if errored > 0 {
+        parts.push(ui::bold_red(&format!("{errored} errored")));
+    }
+    if stopped > 0 {
+        parts.push(ui::dim(&format!("{stopped} stopped")));
+    }
+    if other > 0 {
+        parts.push(ui::yellow(&format!("{other} other")));
+    }
+    println!(" {}", parts.join(&ui::dim(" · ")));
 }
 
 fn migrate_cmd(
@@ -1014,6 +1178,7 @@ fn migrate_cmd(
     backup: bool,
     json: bool,
     env_names: bool,
+    verbose: bool,
 ) -> ExitCode {
     let pm2_home = pm2_home.unwrap_or_else(migrate::default_pm2_home);
     let dump = dump.unwrap_or_else(|| pm2_home.join("dump.pm2"));
@@ -1058,7 +1223,7 @@ fn migrate_cmd(
             Err(e) => return fail(&e.to_string()),
         }
     } else {
-        migrate::print(&report, env_names);
+        migrate::print(&report, env_names, verbose);
     }
     if report.blocked() > 0 {
         ExitCode::from(code::PARTIAL)

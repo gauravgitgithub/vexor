@@ -1168,6 +1168,7 @@ name = "vexor"
 version = "0.2.0"
 dependencies = [
  "assert_cmd",
+ "chrono",
  "clap",
  "rustix",
  "serde",

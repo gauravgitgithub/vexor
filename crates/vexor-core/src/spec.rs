@@ -239,6 +239,11 @@ pub struct LogSpec {
     /// Output buffered per log file before `overflow` applies.
     #[serde(default = "default_buffer")]
     pub buffer_bytes: u32,
+    /// Start each plain-text line with the local time it was received
+    /// (ISO 8601 with milliseconds and UTC offset). Lines that start with
+    /// `{` (JSON logs, which carry their own time) are left as they are.
+    #[serde(default = "yes")]
+    pub timestamps: bool,
 }
 
 impl LogSpec {
@@ -251,6 +256,7 @@ impl LogSpec {
             retain: default_retain(),
             overflow: Overflow::default(),
             buffer_bytes: default_buffer(),
+            timestamps: true,
         }
     }
 }

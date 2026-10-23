@@ -11,7 +11,23 @@ before 1.0, minor versions may include breaking changes, which are listed here.
   is restarted after repeated failures; cluster apps are reloaded instead.
   Loopback targets only.
 
+- Log lines are timestamped: Vexor starts each plain-text line with the
+  local time it was received (ISO 8601 with milliseconds and UTC offset);
+  JSON lines keep their own time. `time: false` turns it off per app.
+- Colours and tables: `vexor ls` (status badges, CPU, memory, instances
+  grouped per app), `describe`, `events`, `migrate` and
+  `migrate --status`; `--color auto|always|never` (and `NO_COLOR`). Piped
+  output stays plain and aligned. `vexor` alone shows the common commands.
+
 ### Changed
+- `vexor logs` shows one timeline: lines from every app merged by time,
+  each with its time, the app name in its own colour and a stream marker
+  (stderr in red); JSON logs (pino, winston) are shown as level, message
+  and fields. `--raw` prints the files as written.
+- `vexor migrate --from-pm2` shows only the plan and what needs attention
+  (`--verbose` for commands, paths and environment). An app PM2 was
+  already crash-looping no longer stops a migration; a slow-starting shim
+  no longer makes a start fail.
 - `vexor migrate --from-pm2` report: findings common to all apps are said
   once; environments are summarised (shared set once, per-app
   differences); the table gives the blocking reason; apps PM2 keeps

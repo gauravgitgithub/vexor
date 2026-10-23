@@ -9,6 +9,9 @@ before 1.0, minor versions may include breaking changes, which are listed here.
 - `vexor migrate --from-pm2 --dry-run`: reads PM2's `dump.pm2` and shows
   how each app would run under Vexor, every unsupported setting, and the
   expected downtime. Changes nothing (no PM2 command, no Vexor state).
+- `vexor migrate --from-pm2 --backup`: copies PM2's state, its boot service
+  file and the migration plan to a private, never-overwritten directory
+  under `~/.vexor/migrations/`, with SHA-256 hashes.
 
 ## 0.1.1 (2026-10-23, prerelease)
 

@@ -36,6 +36,16 @@ Extra checks: the working directory and script exist; for Node.js apps, the Node
 
 Global findings: `dump.pm2` readable by other users (it holds every app's environment), a PM2 boot service (`/etc/systemd/system/pm2-<user>.service`, `~/Library/LaunchAgents/pm2.<user>.plist`), shell environment captured in the dump, and the dump's age (it should be saved right before migrating).
 
+## Backup
+
+Implemented (plan 5.2): `vexor migrate --from-pm2 --backup [--pm2-home DIR] [--dump FILE] [--json]`. PM2 is not touched and the daemon is not started.
+
+- Copies `dump.pm2`, `dump.pm2.bak`, `module_conf.json` and `conf.js` from the PM2 home (when present) and PM2's boot service file, to `<vexor home>/migrations/<id>/` (`<id>` = UTC time, e.g. `20261023-053917`). With `--dump FILE` outside the PM2 home, only that file is copied.
+- Also writes `plan.json` (the dry-run report, env values redacted) and `manifest.json` (source path, size, original mode and SHA-256 of each copy, SHA-256 of the plan). `--apply` will check the plan hash, so it applies exactly the plan the user reviewed.
+- Directories are 0700 and files 0600 (the dump copy holds every app's environment). Sources are read without following a final symlink, must be regular files, and at most 64 MiB.
+- Never overwrites: each backup gets a new id (`-2`, `-3`, … within the same second). It is written to a hidden temporary directory and renamed into place only when complete; on any error nothing is kept.
+- Restoring PM2's process list by hand: `cp <backup>/pm2/dump.pm2 ~/.pm2/dump.pm2 && pm2 resurrect` (printed after each backup).
+
 ## Apply: cutover per app (sequential by default)
 
 1. Pre-flight: backup exists, plan hash matches what the user confirmed, interpreter/cwd/script exist, Vexor daemon healthy.

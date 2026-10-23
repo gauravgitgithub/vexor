@@ -458,3 +458,214 @@ mod tests {
         assert_eq!(age(3 * 86400), "3 days ago");
     }
 }
+
+// ------------------------------------------------------------------ backup
+
+/// Files copied from the PM2 home, when present. `dump.pm2` is required.
+const PM2_FILES: &[&str] = &["dump.pm2", "dump.pm2.bak", "module_conf.json", "conf.js"];
+
+/// Largest file a backup copies (PM2's state files are a few KiB).
+const MAX_FILE: u64 = 64 << 20;
+
+#[derive(Debug, Serialize)]
+pub struct BackedUpFile {
+    pub source: PathBuf,
+    /// Path inside the backup directory.
+    pub copy: String,
+    pub size: u64,
+    /// Permission bits of the original.
+    pub mode: u32,
+    pub sha256: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Manifest {
+    pub id: String,
+    pub created_at: String,
+    pub vexor_version: &'static str,
+    pub pm2_home: PathBuf,
+    pub dump: PathBuf,
+    pub files: Vec<BackedUpFile>,
+    /// SHA-256 of `plan.json`, the dry-run report saved with the backup.
+    pub plan_sha256: String,
+}
+
+pub fn migrations_dir(home: &Path) -> PathBuf {
+    home.join("migrations")
+}
+
+fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    bytes.iter().fold(String::new(), |mut s, b| {
+        let _ = write!(s, "{b:02x}");
+        s
+    })
+}
+
+pub fn sha256(data: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    hex(&Sha256::digest(data))
+}
+
+/// Read a regular file without following a symlink at its final component.
+fn read_regular(path: &Path) -> std::io::Result<(Vec<u8>, u32)> {
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let mut f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc_o_nofollow())
+        .open(path)?;
+    let meta = f.metadata()?;
+    if !meta.is_file() {
+        return Err(std::io::Error::other("not a regular file"));
+    }
+    if meta.len() > MAX_FILE {
+        return Err(std::io::Error::other(format!(
+            "larger than {} MiB",
+            MAX_FILE >> 20
+        )));
+    }
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf)?;
+    Ok((buf, meta.mode() & 0o7777))
+}
+
+fn libc_o_nofollow() -> i32 {
+    rustix::fs::OFlags::NOFOLLOW.bits().cast_signed()
+}
+
+/// Write `data` to a new file readable only by the owner.
+fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    f.write_all(data)?;
+    f.sync_all()
+}
+
+/// Create a directory readable only by the owner; fails if it exists.
+fn private_new_dir(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new().mode(0o700).create(path)
+}
+
+/// Copy PM2's state and the migration plan to a new directory under
+/// `<home>/migrations/`. Never overwrites: each backup gets its own id. The
+/// directory appears only once complete.
+pub fn backup(
+    home: &Path,
+    pm2_home: &Path,
+    dump: &Path,
+    report: &Report,
+    now_ms: u64,
+) -> Result<(PathBuf, Manifest), String> {
+    let err = |what: &str, p: &Path, e: std::io::Error| format!("{what} {}: {e}", p.display());
+    let root = migrations_dir(home);
+    if !home.exists() {
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .create(home)
+            .map_err(|e| err("cannot create", home, e))?;
+        std::fs::set_permissions(home, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .map_err(|e| err("cannot restrict", home, e))?;
+    }
+    match private_new_dir(&root) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(err("cannot create", &root, e)),
+    }
+
+    let stamp = crate::format_utc(now_ms);
+    // "2026-10-23 05:30:12.345" -> "20261023-053012"
+    let digits: String = stamp
+        .chars()
+        .take(19)
+        .filter(char::is_ascii_digit)
+        .collect();
+    let base = format!("{}-{}", &digits[..8], &digits[8..]);
+    let mut id = base.clone();
+    let mut n = 1;
+    while root.join(&id).exists() || root.join(format!(".{id}.tmp")).exists() {
+        n += 1;
+        id = format!("{base}-{n}");
+    }
+    let tmp = root.join(format!(".{id}.tmp"));
+    private_new_dir(&tmp).map_err(|e| err("cannot create", &tmp, e))?;
+    let result = (|| {
+        private_new_dir(&tmp.join("pm2")).map_err(|e| err("cannot create", &tmp, e))?;
+        let mut files = Vec::new();
+        let mut sources: Vec<(PathBuf, String)> = PM2_FILES
+            .iter()
+            .map(|f| (pm2_home.join(f), format!("pm2/{f}")))
+            .collect();
+        // A dump from elsewhere (--dump) is backed up alone: the PM2
+        // home's other files belong to a different dump.
+        if dump != pm2_home.join("dump.pm2") {
+            sources = vec![(dump.to_path_buf(), "pm2/dump.pm2".into())];
+        }
+        if let Some(unit) = pm2_startup_unit(current_user().as_deref()) {
+            let name = unit
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            sources.push((unit, format!("startup/{name}")));
+        }
+        for (source, copy) in sources {
+            let (data, mode) = match read_regular(&source) {
+                Ok(x) => x,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound && copy != "pm2/dump.pm2" => {
+                    continue;
+                }
+                Err(e) => return Err(err("cannot read", &source, e)),
+            };
+            let dest = tmp.join(&copy);
+            if let Some(parent) = dest.parent()
+                && !parent.exists()
+            {
+                private_new_dir(parent).map_err(|e| err("cannot create", parent, e))?;
+            }
+            write_private(&dest, &data).map_err(|e| err("cannot write", &dest, e))?;
+            files.push(BackedUpFile {
+                source,
+                copy,
+                size: data.len() as u64,
+                mode,
+                sha256: sha256(&data),
+            });
+        }
+        let plan = serde_json::to_vec_pretty(report).map_err(|e| e.to_string())?;
+        write_private(&tmp.join("plan.json"), &plan)
+            .map_err(|e| err("cannot write", &tmp.join("plan.json"), e))?;
+        let manifest = Manifest {
+            id: id.clone(),
+            created_at: format!("{stamp} UTC"),
+            vexor_version: env!("CARGO_PKG_VERSION"),
+            pm2_home: pm2_home.to_path_buf(),
+            dump: dump.to_path_buf(),
+            files,
+            plan_sha256: sha256(&plan),
+        };
+        let m = serde_json::to_vec_pretty(&manifest).map_err(|e| e.to_string())?;
+        write_private(&tmp.join("manifest.json"), &m)
+            .map_err(|e| err("cannot write", &tmp.join("manifest.json"), e))?;
+        Ok(manifest)
+    })();
+    match result {
+        Ok(manifest) => {
+            let dir = root.join(&id);
+            std::fs::rename(&tmp, &dir).map_err(|e| err("cannot finish", &dir, e))?;
+            if let Ok(d) = std::fs::File::open(&root) {
+                let _ = d.sync_all();
+            }
+            Ok((dir, manifest))
+        }
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&tmp);
+            Err(e)
+        }
+    }
+}

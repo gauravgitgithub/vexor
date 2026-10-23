@@ -153,6 +153,10 @@ enum Command {
         /// later release).
         #[arg(long)]
         dry_run: bool,
+        /// Copy PM2's state (dump.pm2, its boot service, …) and this plan to
+        /// a new directory under <home>/migrations/. PM2 is not touched.
+        #[arg(long, conflicts_with = "dry_run")]
+        backup: bool,
         /// PM2 home directory [default: $PM2_HOME, else ~/.pm2]
         #[arg(long)]
         pm2_home: Option<PathBuf>,
@@ -303,10 +307,11 @@ fn main() -> ExitCode {
         Command::Migrate {
             from_pm2: _,
             dry_run: _,
+            backup,
             pm2_home,
             dump,
             json,
-        } => migrate_cmd(pm2_home, dump, json),
+        } => migrate_cmd(&home, pm2_home, dump, backup, json),
         Command::Events {
             app,
             since,
@@ -756,7 +761,7 @@ pub(crate) fn print_events(events: &[serde_json::Value]) {
 }
 
 /// `YYYY-MM-DD HH:MM:SS.mmm` in UTC, without a date library.
-fn format_utc(ms: u64) -> String {
+pub(crate) fn format_utc(ms: u64) -> String {
     let secs = ms / 1000;
     let days = i64::try_from(secs / 86_400).unwrap_or(0);
     let rem = secs % 86_400;
@@ -860,13 +865,50 @@ fn print_table(apps: &[AppStatus]) {
     print_rows(&rows);
 }
 
-fn migrate_cmd(pm2_home: Option<PathBuf>, dump: Option<PathBuf>, json: bool) -> ExitCode {
+fn migrate_cmd(
+    home: &std::path::Path,
+    pm2_home: Option<PathBuf>,
+    dump: Option<PathBuf>,
+    backup: bool,
+    json: bool,
+) -> ExitCode {
     let pm2_home = pm2_home.unwrap_or_else(migrate::default_pm2_home);
     let dump = dump.unwrap_or_else(|| pm2_home.join("dump.pm2"));
     let report = match migrate::plan(&dump, &pm2_home) {
         Ok(r) => r,
         Err(e) => return fail(&e),
     };
+    if backup {
+        let (dir, manifest) =
+            match migrate::backup(home, &pm2_home, &dump, &report, describe::now_ms()) {
+                Ok(x) => x,
+                Err(e) => return fail(&format!("backup failed, nothing was kept: {e}")),
+            };
+        if json {
+            let out = serde_json::json!({ "backup": dir, "manifest": manifest });
+            println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+        } else {
+            println!("Backup {} saved to {}:", manifest.id, dir.display());
+            for f in &manifest.files {
+                println!("  {} ({} bytes) <- {}", f.copy, f.size, f.source.display());
+            }
+            println!("  plan.json (this migration plan), manifest.json (SHA-256 of each file)");
+            println!(
+                "PM2 was not touched. To restore its process list from this backup: \
+                 cp {}/pm2/dump.pm2 {} && pm2 resurrect",
+                dir.display(),
+                pm2_home.join("dump.pm2").display()
+            );
+            let blocked = report.blocked();
+            if blocked > 0 {
+                println!(
+                    "{blocked} of {} apps are blocked; see `vexor migrate --from-pm2`.",
+                    report.apps.len()
+                );
+            }
+        }
+        return ExitCode::SUCCESS;
+    }
     if json {
         match serde_json::to_string_pretty(&report) {
             Ok(s) => println!("{s}"),

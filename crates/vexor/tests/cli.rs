@@ -989,3 +989,109 @@ fn migrate_blocked_apps_exit_4_and_missing_dump_explains() {
     // --from-pm2 is required.
     assert_eq!(env.run(&["migrate"]).status.code(), Some(2));
 }
+
+#[test]
+fn migrate_backup_copies_pm2_state_privately_and_never_overwrites() {
+    let env = Env::new();
+    let pm2_home = env.work.path().join("pm2home");
+    std::fs::create_dir(&pm2_home).expect("mkdir");
+    let dump = pm2_dump(&env);
+    std::fs::rename(&dump, pm2_home.join("dump.pm2")).expect("move dump");
+    std::fs::write(pm2_home.join("module_conf.json"), "{}").expect("write");
+    let original = std::fs::read(pm2_home.join("dump.pm2")).expect("read");
+    let ph = pm2_home.to_str().expect("utf-8");
+
+    let first: Value = serde_json::from_str(&env.ok(&[
+        "migrate",
+        "--from-pm2",
+        "--backup",
+        "--pm2-home",
+        ph,
+        "--json",
+    ]))
+    .expect("json");
+    let second: Value = serde_json::from_str(&env.ok(&[
+        "migrate",
+        "--from-pm2",
+        "--backup",
+        "--pm2-home",
+        ph,
+        "--json",
+    ]))
+    .expect("json");
+    let (a, b) = (
+        PathBuf::from(first["backup"].as_str().expect("dir")),
+        PathBuf::from(second["backup"].as_str().expect("dir")),
+    );
+    assert_ne!(
+        a, b,
+        "a second backup must not reuse the first one's directory"
+    );
+    assert!(a.starts_with(env.home.path().join("migrations")));
+
+    let mode = |p: &Path| std::fs::metadata(p).expect("stat").permissions().mode() & 0o777;
+    assert_eq!(mode(&env.home.path().join("migrations")), 0o700);
+    assert_eq!(mode(&a), 0o700);
+    for f in [
+        "pm2/dump.pm2",
+        "pm2/module_conf.json",
+        "plan.json",
+        "manifest.json",
+    ] {
+        assert_eq!(mode(&a.join(f)), 0o600, "{f}");
+    }
+    assert_eq!(
+        std::fs::read(a.join("pm2/dump.pm2")).expect("read"),
+        original
+    );
+    let manifest: Value =
+        serde_json::from_slice(&std::fs::read(a.join("manifest.json")).expect("read"))
+            .expect("json");
+    assert_eq!(manifest["files"].as_array().expect("files").len(), 2);
+    assert_eq!(manifest["files"][0]["copy"], "pm2/dump.pm2");
+    assert_eq!(manifest["files"][0]["mode"], 0o600);
+    assert_eq!(
+        manifest["files"][0]["sha256"].as_str().expect("hash").len(),
+        64
+    );
+    // The plan is redacted; only the dump copy holds values.
+    let plan = std::fs::read_to_string(a.join("plan.json")).expect("read");
+    assert!(plan.contains("API_KEY") && !plan.contains("s3cr3t-value"));
+    // No temporary directories left behind, PM2 untouched, no daemon.
+    let entries: Vec<_> = std::fs::read_dir(env.home.path().join("migrations"))
+        .expect("ls")
+        .map(|e| e.expect("entry").file_name())
+        .collect();
+    assert_eq!(entries.len(), 2, "{entries:?}");
+    assert_eq!(
+        std::fs::read(pm2_home.join("dump.pm2")).expect("read"),
+        original
+    );
+    assert!(!env.home.path().join("daemon.sock").exists());
+
+    // No dump: nothing is created.
+    let empty = env.work.path().join("empty");
+    std::fs::create_dir(&empty).expect("mkdir");
+    let out = env.run(&[
+        "migrate",
+        "--from-pm2",
+        "--backup",
+        "--pm2-home",
+        empty.to_str().expect("utf-8"),
+    ]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        std::fs::read_dir(env.home.path().join("migrations"))
+            .expect("ls")
+            .count(),
+        2
+    );
+
+    // --backup and --dry-run contradict each other.
+    assert_eq!(
+        env.run(&["migrate", "--from-pm2", "--backup", "--dry-run"])
+            .status
+            .code(),
+        Some(2)
+    );
+}

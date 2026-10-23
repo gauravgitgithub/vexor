@@ -20,6 +20,10 @@ todo = "warn"
 unwrap_used = "warn"
 
 [profile.release]
+# Size-optimised: a supervisor waits far more than it computes. Measured
+# against opt-level 3: binary 6.0 -> 3.8 MB, shim RSS 2.7 -> 2.4 MiB,
+# daemon RSS 4.8 -> 3.9 MiB, and `vexor ls` 5.3 -> 4.3 ms (less to load).
+opt-level = "z"
 lto = "fat"
 codegen-units = 1
 strip = "symbols"

@@ -56,7 +56,9 @@ dry-run, backup, journaled apply, rollback (docs/migration.md).
 
 5.3 ✅ `vexor migrate --from-pm2 --apply`: applies the newest (or `--backup-id`) backup's plan only if PM2's dump is unchanged since (SHA-256) and the plan intact; confirmation (`--yes`); per app `pm2 stop` → Vexor start → health check (all instances online, no restart, same live processes for `min_uptime`), else `vexor delete` + `pm2 start` and stop; blocked apps stay on PM2; refuses names Vexor already has; journal `journal.jsonl` in the backup (fsync per step) for resume; lock per backup. Tested: 3 CLI tests with a recording stand-in for `pm2` (happy path + journal + idempotent rerun; unhealthy app put back under PM2; no backup / no `--yes` / changed dump / existing name / failing `pm2 stop`), journal unit test; end to end against PM2 7.1.0 (3 apps in 3 s, 2 of 456 probe requests failed during a ~240 ms cutover gap).
 
-5.4 `--rollback <id>` and `--status`.
+5.4 ✅ `vexor migrate --rollback [ID]` (newest first: delete from Vexor, `pm2 start` and wait for `online` in `pm2 jlist`; per-app confirmation or `--yes`; journaled; repeatable; `--only`) and `vexor migrate --status [ID] [--json]`. Tested: rollback-scope unit test (order, never-begun and already-rolled-back apps, re-migration), CLI test (status before/after, refused without `--yes`, rollback, second rollback no-op, migrate again); end to end against PM2 7.1.0 (apply then rollback, PM2 back to its original states, 3 of 273 probe requests failed). Found while testing: on a heavily loaded macOS host an instantly crashing app's crash can be reported after a 1 s health window (no exit is lost; the report lags), documented in docs/migration.md.
+
+Phase 5 done: dry run, backup, apply and rollback.
 
 ## Phase 6: hardening
 HTTP/TCP health checks, readiness-gated reload, max_memory_restart, watch, cron_restart, metrics endpoint, `doctor`, fault-injection suite, uid/gid review, Windows feasibility study.

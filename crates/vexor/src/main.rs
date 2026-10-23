@@ -148,7 +148,7 @@ enum Command {
     /// yet, and the expected downtime. Changes nothing.
     Migrate {
         /// Migrate from PM2.
-        #[arg(long, required = true)]
+        #[arg(long, required_unless_present_any = ["rollback", "status"])]
         from_pm2: bool,
         /// Only report, change nothing (the default; applying comes in a
         /// later release).
@@ -167,19 +167,27 @@ enum Command {
         /// With --apply: the backup whose plan to apply [default: newest].
         #[arg(long, requires = "apply")]
         backup_id: Option<String>,
-        /// With --apply: only these apps (comma-separated).
-        #[arg(long, requires = "apply")]
+        /// Undo a migration (ID, default: the newest): each migrated app,
+        /// newest first, is deleted from Vexor and started again under PM2.
+        /// Asks before each app unless --yes.
+        #[arg(long, value_name = "ID", num_args = 0..=1, conflicts_with_all = ["dry_run", "backup", "apply", "status"])]
+        rollback: Option<Option<String>>,
+        /// Show migrations (or one, by ID) and where each app stands.
+        #[arg(long, value_name = "ID", num_args = 0..=1, conflicts_with_all = ["dry_run", "backup", "apply"])]
+        status: Option<Option<String>>,
+        /// With --apply or --rollback: only these apps (comma-separated).
+        #[arg(long)]
         only: Option<String>,
-        /// With --apply: don't ask for confirmation.
-        #[arg(long, short = 'y', requires = "apply")]
+        /// With --apply or --rollback: don't ask for confirmation.
+        #[arg(long, short = 'y')]
         yes: bool,
-        /// With --apply: the pm2 command [default: pm2 on PATH].
-        #[arg(long, requires = "apply")]
+        /// With --apply or --rollback: the pm2 command [default: pm2 on PATH].
+        #[arg(long)]
         pm2: Option<PathBuf>,
-        /// With --apply: seconds to wait for each app to become healthy
-        /// under Vexor (plus its listen_timeout).
-        #[arg(long, default_value_t = 30, requires = "apply")]
-        timeout: u64,
+        /// With --apply or --rollback: seconds to wait for each app to
+        /// become healthy (with --apply, plus its listen_timeout) [default: 30].
+        #[arg(long)]
+        timeout: Option<u64>,
         /// PM2 home directory [default: $PM2_HOME, else ~/.pm2]
         #[arg(long)]
         pm2_home: Option<PathBuf>,
@@ -333,6 +341,8 @@ fn main() -> ExitCode {
             backup,
             apply,
             backup_id,
+            rollback,
+            status,
             only,
             yes,
             pm2,
@@ -341,17 +351,38 @@ fn main() -> ExitCode {
             dump,
             json,
         } => {
-            if apply {
+            let moving = apply || rollback.is_some();
+            if !moving && (only.is_some() || yes || pm2.is_some() || timeout.is_some()) {
+                eprintln!(
+                    "vexor: --only, --yes, --pm2 and --timeout go with --apply or --rollback"
+                );
+                return ExitCode::from(2);
+            }
+            let only: Vec<String> = only
+                .map(|o| {
+                    o.split(',')
+                        .map(|s| s.trim().to_owned())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let timeout = std::time::Duration::from_secs(timeout.unwrap_or(30));
+            if let Some(id) = status {
+                ExitCode::from(apply::status(&home, id.as_deref(), json))
+            } else if let Some(id) = rollback {
+                ExitCode::from(apply::run_rollback(
+                    &home,
+                    apply::RollbackOptions {
+                        backup_id: id,
+                        only,
+                        yes,
+                        pm2,
+                        timeout,
+                    },
+                ))
+            } else if apply {
                 let pm2_home = pm2_home.unwrap_or_else(migrate::default_pm2_home);
                 let dump = dump.unwrap_or_else(|| pm2_home.join("dump.pm2"));
-                let only = only
-                    .map(|o| {
-                        o.split(',')
-                            .map(|s| s.trim().to_owned())
-                            .filter(|s| !s.is_empty())
-                            .collect()
-                    })
-                    .unwrap_or_default();
                 ExitCode::from(apply::run(
                     &home,
                     &pm2_home,
@@ -361,7 +392,7 @@ fn main() -> ExitCode {
                         only,
                         yes,
                         pm2,
-                        timeout: std::time::Duration::from_secs(timeout),
+                        timeout,
                     },
                 ))
             } else {

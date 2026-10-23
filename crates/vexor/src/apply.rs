@@ -179,6 +179,38 @@ struct Pm2 {
 }
 
 impl Pm2 {
+    /// Wait until every PM2 process named `name` is online.
+    fn wait_online(&self, name: &str, timeout: Duration) -> Result<(), String> {
+        let deadline = Instant::now() + timeout;
+        let mut last = String::from("no status");
+        while Instant::now() < deadline {
+            let out = Command::new(&self.bin)
+                .arg("jlist")
+                .env("PM2_HOME", &self.home)
+                .output()
+                .map_err(|e| format!("cannot run {}: {e}", self.bin.display()))?;
+            let text = String::from_utf8_lossy(&out.stdout);
+            // pm2 may print notices before the JSON.
+            let json = text.find('[').map_or("[]", |i| &text[i..]);
+            if let Ok(serde_json::Value::Array(list)) = serde_json::from_str(json) {
+                let st: Vec<&str> = list
+                    .iter()
+                    .filter(|p| p["name"] == name)
+                    .filter_map(|p| p["pm2_env"]["status"].as_str())
+                    .collect();
+                if !st.is_empty() && st.iter().all(|s| *s == "online") {
+                    return Ok(());
+                }
+                last = format!("{st:?}");
+            }
+            std::thread::sleep(Duration::from_millis(300));
+        }
+        Err(format!(
+            "not online under PM2 within {}s: {last}",
+            timeout.as_secs()
+        ))
+    }
+
     fn run(&self, args: &[&str]) -> Result<(), String> {
         let out = Command::new(&self.bin)
             .args(args)
@@ -529,9 +561,292 @@ fn apply(home: &Path, pm2_home: &Path, dump: &Path, opts: Options) -> Result<u8,
     })
 }
 
+// ---------------------------------------------------------------- rollback
+
+/// What a migration did to one app, from the journal entries since its last
+/// `begin`.
+#[derive(Debug, PartialEq, Eq)]
+struct Moved {
+    /// `pm2 stop` ran, so PM2 has to start it again.
+    pm2_stopped: bool,
+}
+
+/// Apps to move back, most recently moved first. Apps never begun (e.g.
+/// refused because Vexor had the name) or already rolled back are skipped.
+fn to_roll_back(journal: &[Entry]) -> Vec<(String, Moved)> {
+    let mut order: Vec<String> = Vec::new();
+    let mut since: BTreeMap<String, Vec<Step>> = BTreeMap::new();
+    for e in journal {
+        if e.step == Step::Begin {
+            order.retain(|a| a != &e.app);
+            order.push(e.app.clone());
+            since.insert(e.app.clone(), Vec::new());
+        }
+        if let Some(steps) = since.get_mut(&e.app) {
+            steps.push(e.step);
+        }
+    }
+    order
+        .into_iter()
+        .rev()
+        .filter_map(|app| {
+            let steps = &since[&app];
+            if steps.last() == Some(&Step::RolledBack) {
+                return None;
+            }
+            let moved = Moved {
+                pm2_stopped: steps.contains(&Step::Pm2Stopped),
+            };
+            Some((app, moved))
+        })
+        .collect()
+}
+
+pub struct RollbackOptions {
+    pub backup_id: Option<String>,
+    pub only: Vec<String>,
+    pub yes: bool,
+    pub pm2: Option<PathBuf>,
+    pub timeout: Duration,
+}
+
+pub fn run_rollback(home: &Path, opts: RollbackOptions) -> u8 {
+    match rollback(home, opts) {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("vexor: {e}");
+            1
+        }
+    }
+}
+
+fn rollback(home: &Path, opts: RollbackOptions) -> Result<u8, String> {
+    let backup = find_backup(home, opts.backup_id.as_deref())?;
+    let id = backup.manifest.id.clone();
+    let _lock = vexor_shim::try_lock(&backup.dir.join(".lock"))
+        .map_err(|e| format!("cannot lock backup {id}: {e}"))?
+        .ok_or_else(|| format!("another `vexor migrate` is using backup {id}"))?;
+    let journal_entries = read_journal(&backup.dir)?;
+    let mut apps = to_roll_back(&journal_entries);
+    for o in &opts.only {
+        if !apps.iter().any(|(a, _)| a == o) {
+            return Err(format!(
+                "--only {o}: migration {id} has nothing to undo for that app"
+            ));
+        }
+    }
+    if !opts.only.is_empty() {
+        apps.retain(|(a, _)| opts.only.contains(a));
+    }
+    if apps.is_empty() {
+        println!("Migration {id}: nothing to roll back.");
+        return Ok(0);
+    }
+    let pm2 = if apps.iter().any(|(_, m)| m.pm2_stopped) {
+        Some(Pm2 {
+            bin: find_pm2(opts.pm2)?,
+            home: backup.manifest.pm2_home.clone(),
+        })
+    } else {
+        None
+    };
+    if !opts.yes && !std::io::stdin().is_terminal() {
+        return Err("not a terminal: pass --yes to confirm the rollback".into());
+    }
+    let mut journal = Journal::open(&backup.dir)?;
+    println!("Rolling back migration {id}");
+    for (name, moved) in apps {
+        let what = if moved.pm2_stopped {
+            "delete from Vexor, start under PM2 again"
+        } else {
+            "delete from Vexor (PM2 wasn't running it)"
+        };
+        if !opts.yes && !confirm(&format!("{name}: {what}?")) {
+            println!("Stopped; {name} and the apps after it were left as they are.");
+            return Ok(1);
+        }
+        let mut done = Vec::new();
+        // Any Vexor app by this name is the migrated one: `begin` is only
+        // written after checking Vexor had no app by that name.
+        if vexor_apps(home)?.iter().any(|a| a.name == name) {
+            vexor_ok(
+                home,
+                &Request::Delete {
+                    target: Target::Name(name.clone()),
+                },
+            )
+            .map_err(|e| format!("{name}: cannot delete from Vexor: {e}"))?;
+            done.push("deleted from Vexor");
+        }
+        if moved.pm2_stopped {
+            let p = pm2.as_ref().expect("pm2 found");
+            if let Err(e) = p
+                .run(&["start", &name])
+                .and_then(|()| p.wait_online(&name, opts.timeout))
+            {
+                println!(
+                    "{name}: {}failed to start under PM2",
+                    done.iter().map(|d| format!("{d}, ")).collect::<String>()
+                );
+                journal.write(&name, Step::Failed, Some(format!("rollback: {e}")))?;
+                eprintln!(
+                    "vexor: {name}: {e}. It is not running under Vexor either: check `pm2 ls`."
+                );
+                return Ok(1);
+            }
+            done.push("online under PM2");
+        }
+        if done.is_empty() {
+            done.push("nothing to undo");
+        }
+        println!("{name}: {}", done.join(", "));
+        journal.write(&name, Step::RolledBack, Some("rollback".into()))?;
+    }
+    println!(
+        "Rolled back. If you ran `pm2 unstartup`, run `pm2 startup` again; `vexor unstartup` \
+         if Vexor no longer runs anything."
+    );
+    Ok(0)
+}
+
+// ------------------------------------------------------------------ status
+
+pub fn status(home: &Path, id: Option<&str>, json: bool) -> u8 {
+    let root = migrate::migrations_dir(home);
+    let ids: Vec<String> = match id {
+        Some(i) => vec![i.to_owned()],
+        None => {
+            let mut v: Vec<String> = std::fs::read_dir(&root)
+                .map(|d| {
+                    d.filter_map(Result::ok)
+                        .map(|e| e.file_name().to_string_lossy().into_owned())
+                        .filter(|n| !n.starts_with('.'))
+                        .collect()
+                })
+                .unwrap_or_default();
+            v.sort();
+            v
+        }
+    };
+    let mut out = Vec::new();
+    for i in &ids {
+        let backup = match find_backup(home, Some(i)) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("vexor: {e}");
+                return 1;
+            }
+        };
+        let journal = match read_journal(&backup.dir) {
+            Ok(j) => j,
+            Err(e) => {
+                eprintln!("vexor: {e}");
+                return 1;
+            }
+        };
+        let apps: BTreeMap<String, &Entry> = journal.iter().map(|e| (e.app.clone(), e)).collect();
+        out.push(serde_json::json!({
+            "id": backup.manifest.id,
+            "created_at": backup.manifest.created_at,
+            "dir": backup.dir,
+            "pm2_home": backup.manifest.pm2_home,
+            "apps": apps.iter().map(|(a, e)| serde_json::json!({
+                "app": a, "step": e.step, "at": e.ts, "detail": e.detail,
+            })).collect::<Vec<_>>(),
+        }));
+    }
+    if json {
+        println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+        return 0;
+    }
+    if out.is_empty() {
+        println!("No migrations yet (`vexor migrate --from-pm2 --backup` starts one).");
+        return 0;
+    }
+    for m in &out {
+        let apps = m["apps"].as_array().map_or(&[][..], Vec::as_slice);
+        println!(
+            "{}  created {}  {}",
+            m["id"].as_str().unwrap_or("?"),
+            m["created_at"].as_str().unwrap_or("?"),
+            if apps.is_empty() {
+                "backup only (not applied)"
+            } else {
+                ""
+            }
+        );
+        for a in apps {
+            let step = a["step"].as_str().unwrap_or("?");
+            let label = match step {
+                "done" => "migrated",
+                "rolled_back" => "back on PM2",
+                "failed" => "FAILED",
+                _ => "interrupted (run --apply to continue, or --rollback)",
+            };
+            println!(
+                "  {:<20} {label:<12} {}{}",
+                a["app"].as_str().unwrap_or("?"),
+                a["at"].as_str().unwrap_or(""),
+                a["detail"]
+                    .as_str()
+                    .map(|d| format!("  ({d})"))
+                    .unwrap_or_default()
+            );
+        }
+    }
+    0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn e(app: &str, step: Step) -> Entry {
+        Entry {
+            ts: String::new(),
+            app: app.into(),
+            step,
+            detail: None,
+        }
+    }
+
+    #[test]
+    fn rollback_order_and_scope() {
+        use Step::*;
+        let j = [
+            e("a", Begin),
+            e("a", Pm2Stopped),
+            e("a", VexorStarted),
+            e("a", Done),
+            e("b", Begin),
+            e("b", VexorStarted),
+            e("b", Done),
+            e("c", Failed),
+            e("d", Begin),
+            e("d", Pm2Stopped),
+            e("d", VexorStarted),
+            e("d", RolledBack),
+            e("f", Begin),
+            e("f", Pm2Stopped),
+        ];
+        let r = to_roll_back(&j);
+        let names: Vec<&str> = r.iter().map(|(a, _)| a.as_str()).collect();
+        assert_eq!(
+            names,
+            ["f", "b", "a"],
+            "newest first; c never begun, d already back"
+        );
+        assert!(r[0].1.pm2_stopped && !r[1].1.pm2_stopped && r[2].1.pm2_stopped);
+
+        // Rolled back, then applied again: undo the second move.
+        let j = [
+            e("a", Begin),
+            e("a", RolledBack),
+            e("a", Begin),
+            e("a", Done),
+        ];
+        assert_eq!(to_roll_back(&j).len(), 1);
+    }
 
     #[test]
     fn journal_last_step_wins_and_torn_lines_are_ignored() {

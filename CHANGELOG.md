@@ -16,6 +16,9 @@ before 1.0, minor versions may include breaking changes, which are listed here.
   start under Vexor, wait until healthy), puts an unhealthy app back under
   PM2 and stops, journals every step so a rerun resumes, and only applies
   a reviewed plan whose PM2 dump hasn't changed since the backup.
+- `vexor migrate --rollback [ID]`: moves migrated apps back to PM2, newest
+  first, asking before each; `vexor migrate --status` shows where each app
+  stands.
 
 ## 0.1.1 (2026-10-23, prerelease)
 

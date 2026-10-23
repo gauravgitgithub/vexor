@@ -761,7 +761,9 @@ fn logs_follow_keeps_every_line_across_rotation() {
     let env = Env::new();
     let script = env.script(
         "count.sh",
-        "#!/bin/sh\ni=1; while :; do echo \"n $i\"; i=$((i+1)); sleep 0.002; done\n",
+        // Batches of 20 lines (echo is a builtin): the rate doesn't depend on
+        // how fast a busy CI machine can fork `sleep`.
+        "#!/bin/sh\ni=1; while :; do j=0; while [ $j -lt 20 ]; do echo \"n $i\"; i=$((i+1)); j=$((j+1)); done; sleep 0.02; done\n",
     );
     let spec = env.work.path().join("count.json");
     let json = serde_json::json!({
@@ -1096,17 +1098,30 @@ fn migrate_backup_copies_pm2_state_privately_and_never_overwrites() {
     );
 }
 
-/// A stand-in for `pm2` that records its arguments; `pm2 stop` fails while
-/// `<work>/pm2-fail` exists.
+/// A stand-in for `pm2` that records its arguments (except `jlist`); `pm2
+/// stop` fails while `<work>/pm2-fail` exists; `jlist` reports every app
+/// `pm2 start`ed as online.
 fn fake_pm2(env: &Env) -> (PathBuf, PathBuf) {
     let log = env.work.path().join("pm2-calls.log");
     let fail = env.work.path().join("pm2-fail");
+    let started = env.work.path().join("pm2-started");
     let bin = env.script(
         "fake-pm2",
         &format!(
-            "#!/bin/sh\necho \"$*\" >> '{}'\n[ \"$1\" = stop ] && [ -e '{}' ] && {{ echo 'boom' >&2; exit 1; }}\nexit 0\n",
-            log.display(),
-            fail.display()
+            r#"#!/bin/sh
+if [ "$1" = jlist ]; then
+  printf '['; sep=''
+  [ -e '{started}' ] && while read -r n; do printf '%s{{"name":"%s","pm2_env":{{"status":"online"}}}}' "$sep" "$n"; sep=,; done < '{started}'
+  echo ']'; exit 0
+fi
+echo "$*" >> '{log}'
+[ "$1" = stop ] && [ -e '{fail}' ] && {{ echo 'boom' >&2; exit 1; }}
+[ "$1" = start ] && echo "$2" >> '{started}'
+exit 0
+"#,
+            log = log.display(),
+            fail = fail.display(),
+            started = started.display(),
         ),
     );
     (bin, log)
@@ -1214,7 +1229,25 @@ fn migrate_apply_moves_running_apps_and_resumes_idempotently() {
 fn migrate_apply_puts_an_unhealthy_app_back_under_pm2() {
     let env = Env::new();
     env.script("loop.sh", "#!/bin/sh\necho crashing >&2\nexit 3\n");
-    let pm2_home = pm2_home_with_backup(&env);
+    // The health window is min_uptime (at least 1 s). On a loaded machine
+    // the report of an instant crash can take longer than 1 s, so give this
+    // app a window that clearly covers it.
+    let pm2_home = env.work.path().join("pm2home");
+    std::fs::create_dir_all(&pm2_home).expect("mkdir");
+    let dump = pm2_dump(&env);
+    let mut d: Value =
+        serde_json::from_str(&std::fs::read_to_string(&dump).expect("read")).expect("json");
+    for e in d.as_array_mut().expect("array") {
+        e["min_uptime"] = 3000.into();
+    }
+    std::fs::write(pm2_home.join("dump.pm2"), d.to_string()).expect("write");
+    env.ok(&[
+        "migrate",
+        "--from-pm2",
+        "--backup",
+        "--pm2-home",
+        pm2_home.to_str().expect("utf-8"),
+    ]);
     let (pm2, log) = fake_pm2(&env);
     let out = env.run(&[
         "migrate",
@@ -1230,8 +1263,8 @@ fn migrate_apply_puts_an_unhealthy_app_back_under_pm2() {
         "--pm2",
         pm2.to_str().expect("utf-8"),
     ]);
-    assert_eq!(out.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
     assert!(stderr.contains("running under PM2 again"), "{stderr}");
     assert_eq!(pm2_calls(&log), ["stop web", "start web"]);
     assert!(
@@ -1305,4 +1338,79 @@ fn migrate_apply_refuses_unsafe_starts() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("boom"));
     assert!(env.list().iter().all(|a| a["name"] != "web"));
     assert_eq!(pm2_calls(&log), ["stop web"]);
+}
+
+#[test]
+fn migrate_rollback_and_status() {
+    let env = Env::new();
+    let pm2_home = pm2_home_with_backup(&env);
+    let (pm2, log) = fake_pm2(&env);
+    let (ph, pm2) = (
+        pm2_home.to_str().expect("utf-8"),
+        pm2.to_str().expect("utf-8"),
+    );
+    let status = env.ok(&["migrate", "--status"]);
+    assert!(status.contains("backup only (not applied)"), "{status}");
+
+    env.ok(&[
+        "migrate",
+        "--from-pm2",
+        "--apply",
+        "--yes",
+        "--pm2-home",
+        ph,
+        "--pm2",
+        pm2,
+    ]);
+    let status = env.ok(&["migrate", "--status"]);
+    assert!(
+        status.contains("web") && status.contains("migrated"),
+        "{status}"
+    );
+
+    // Not a terminal and no --yes: refused, nothing changed.
+    let out = env.run(&["migrate", "--rollback", "--pm2", pm2]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(env.list().len(), 2);
+
+    let out = env.ok(&["migrate", "--rollback", "--yes", "--pm2", pm2]);
+    assert!(out.contains("idle: deleted from Vexor"), "{out}");
+    assert!(
+        out.contains("web: deleted from Vexor, online under PM2"),
+        "{out}"
+    );
+    // Newest first: idle (never running under PM2, so no pm2 call), then web.
+    assert_eq!(pm2_calls(&log), ["stop web", "start web"]);
+    assert!(env.list().is_empty());
+    let status: Value =
+        serde_json::from_str(&env.ok(&["migrate", "--status", "--json"])).expect("json");
+    let steps: Vec<&str> = status[0]["apps"]
+        .as_array()
+        .expect("apps")
+        .iter()
+        .filter_map(|a| a["step"].as_str())
+        .collect();
+    assert_eq!(steps, ["rolled_back", "rolled_back"]);
+
+    let again = env.ok(&["migrate", "--rollback", "--yes", "--pm2", pm2]);
+    assert!(again.contains("nothing to roll back"), "{again}");
+
+    // Rolled back apps can be migrated again.
+    env.ok(&[
+        "migrate",
+        "--from-pm2",
+        "--apply",
+        "--yes",
+        "--pm2-home",
+        ph,
+        "--pm2",
+        pm2,
+    ]);
+    assert_eq!(env.list().len(), 2);
+
+    // Flags that only make sense when moving apps.
+    assert_eq!(
+        env.run(&["migrate", "--from-pm2", "--yes"]).status.code(),
+        Some(2)
+    );
 }

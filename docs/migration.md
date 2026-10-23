@@ -68,6 +68,14 @@ Cluster apps whose port is held by PM2 can't overlap with Vexor instances, so cu
 
 Once migrated, later Vexor daemon crashes and upgrades don't cause downtime (architecture.md §7).
 
-## Rollback (plan 5.4)
+Health is judged within the `min_uptime` window (at least 1 s). An app that crashes later, or whose crash is reported after the window on a heavily loaded host, counts as migrated; Vexor's restart policy then handles it like any other app, and `--rollback` moves it back.
 
-`--rollback <id>` walks the journal in reverse and asks for confirmation before each disruptive step.
+## Rollback and status
+
+Implemented (plan 5.4).
+
+`vexor migrate --rollback [ID] [--only a,b] [--yes] [--pm2 PATH] [--timeout SECS]` undoes a migration (default: the newest backup). From the journal it takes every app with a `begin` that wasn't rolled back since, newest first, and for each (after confirmation, or `--yes`): deletes the Vexor app by that name (it can only be the migrated one: `begin` is written after checking Vexor had no such app), then, if `pm2 stop` had run, `pm2 start <app>` and waits until every PM2 instance is `online` (`pm2 jlist`). Each app is journaled `rolled_back`; if PM2 can't start it, `failed`, and the rollback stops. Apps refused before `begin` (name taken in Vexor) and apps already rolled back are skipped, so rolling back twice is harmless, and a rolled-back app can be migrated again with `--apply`. Afterwards: run `pm2 startup` again if it was removed.
+
+`vexor migrate --status [ID] [--json]` lists backups and, per app, its last journal step: migrated, back on PM2, failed, or interrupted (continue with `--apply` or undo with `--rollback`).
+
+Measured (PM2 7.1.0, Docker): rolling back the three apps above took under a second; the cluster app's HTTP probe saw 3 of 273 requests fail during the hand-back.

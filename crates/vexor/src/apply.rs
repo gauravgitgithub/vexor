@@ -432,6 +432,7 @@ fn apply(home: &Path, pm2_home: &Path, dump: &Path, opts: Options) -> Result<u8,
     };
     let mut journal = Journal::open(&backup.dir)?;
     let existing: Vec<String> = vexor_apps(home)?.into_iter().map(|a| a.name).collect();
+    let mut left_on_pm2: Vec<String> = Vec::new();
 
     for a in todo {
         let name = a.name.as_str();
@@ -523,7 +524,26 @@ fn apply(home: &Path, pm2_home: &Path, dump: &Path, opts: Options) -> Result<u8,
                     (Some(p), true) => p.run(&["start", name]),
                     _ => Ok(()),
                 });
+                // An app that was already failing under PM2 says nothing
+                // about the move: leave it there and carry on.
+                let failing_before = a
+                    .pm2_status
+                    .iter()
+                    .any(|s| matches!(s.as_str(), "waiting restart" | "errored"));
                 match back {
+                    Ok(()) if failing_before => {
+                        journal.write(
+                            name,
+                            Step::RolledBack,
+                            Some(format!("already failing under PM2; {why}")),
+                        )?;
+                        eprintln!(
+                            "vexor: {name}: it was already failing under PM2 (it keeps exiting); left on PM2, \
+                             continuing with the other apps. Its error log says why."
+                        );
+                        left_on_pm2.push(name.to_owned());
+                        continue;
+                    }
                     Ok(()) => {
                         journal.write(name, Step::RolledBack, Some(why))?;
                         eprintln!(
@@ -548,13 +568,21 @@ fn apply(home: &Path, pm2_home: &Path, dump: &Path, opts: Options) -> Result<u8,
         }
     }
 
-    println!("\nMigration {id} complete.");
+    if left_on_pm2.is_empty() {
+        println!("\nMigration {id} complete.");
+    } else {
+        println!(
+            "\nMigration {id} finished. Left on PM2 because they were already failing there: {}. \
+             Fix them, then run --apply again to move them.",
+            left_on_pm2.join(", ")
+        );
+    }
     println!(
         "Next: run `pm2 unstartup` so PM2 no longer starts these apps at boot (its saved list \
          still has them as running), then `vexor startup`. PM2 keeps them stopped; \
          `pm2 delete` them once you are satisfied."
     );
-    Ok(if blocked.is_empty() {
+    Ok(if blocked.is_empty() && left_on_pm2.is_empty() {
         0
     } else {
         crate::code::PARTIAL

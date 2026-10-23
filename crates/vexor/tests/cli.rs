@@ -1509,3 +1509,50 @@ fn health_check_from_the_command_line() {
         .expect("app");
     assert_eq!(states(&app), ["starting"]);
 }
+
+#[test]
+fn migrate_apply_continues_past_an_app_already_failing_under_pm2() {
+    let env = Env::new();
+    // `web` keeps crashing (and PM2 was restarting it); `idle` is fine.
+    env.script("loop.sh", "#!/bin/sh\necho crashing >&2\nexit 3\n");
+    let pm2_home = env.work.path().join("pm2home");
+    std::fs::create_dir_all(&pm2_home).expect("mkdir");
+    let dump = pm2_dump(&env);
+    let mut d: Value =
+        serde_json::from_str(&std::fs::read_to_string(&dump).expect("read")).expect("json");
+    for e in d.as_array_mut().expect("array") {
+        if e["name"] == "web" {
+            e["status"] = "waiting restart".into();
+            e["min_uptime"] = 3000.into();
+        }
+    }
+    std::fs::write(pm2_home.join("dump.pm2"), d.to_string()).expect("write");
+    let ph = pm2_home.to_str().expect("utf-8");
+    env.ok(&["migrate", "--from-pm2", "--backup", "--pm2-home", ph]);
+    let (pm2, log) = fake_pm2(&env);
+    let out = env.run(&[
+        "migrate",
+        "--from-pm2",
+        "--apply",
+        "--yes",
+        "--timeout",
+        "10",
+        "--pm2-home",
+        ph,
+        "--pm2",
+        pm2.to_str().expect("utf-8"),
+    ]);
+    assert_eq!(out.status.code(), Some(4));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("idle: added to Vexor (stopped)"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("Left on PM2 because they were already failing there: web"),
+        "{stdout}"
+    );
+    assert_eq!(pm2_calls(&log), ["stop web", "start web"]);
+    let names: Vec<Value> = env.list().iter().map(|a| a["name"].clone()).collect();
+    assert_eq!(names, ["idle"]);
+}

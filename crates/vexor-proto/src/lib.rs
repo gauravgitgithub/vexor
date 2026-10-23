@@ -122,6 +122,8 @@ pub enum Request {
     Describe {
         name: String,
     },
+    /// The daemon's version (daemons before 0.3.1 answer with an error).
+    Version,
     /// Stored event history, newest `limit` events, oldest first.
     Events {
         app: Option<String>,
@@ -140,6 +142,9 @@ pub enum Target {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Response {
+    Version {
+        version: String,
+    },
     Ok {
         apps: Vec<AppStatus>,
         /// Problems the operator should know about (e.g. history reset).

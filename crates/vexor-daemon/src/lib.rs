@@ -149,7 +149,11 @@ async fn run_async(home: PathBuf) -> i32 {
             log.write(json!({ "type": "error", "app": name, "error": e }));
         }
     }
-    log.write(json!({ "type": "daemon_started", "pid": std::process::id() }));
+    log.write(json!({
+        "type": "daemon_started",
+        "pid": std::process::id(),
+        "version": env!("CARGO_PKG_VERSION"),
+    }));
     events.record_daemon(None, "daemon_started", json!({ "pid": std::process::id() }));
 
     let server = tokio::spawn(serve(listener, daemon.clone()));
@@ -286,6 +290,9 @@ impl Daemon {
                     .collect();
                 self.ok(apps)
             }
+            Request::Version => Response::Version {
+                version: env!("CARGO_PKG_VERSION").to_owned(),
+            },
             Request::Save => self.save().await,
             Request::Resurrect => self.resurrect().await,
             Request::Describe { name } => {

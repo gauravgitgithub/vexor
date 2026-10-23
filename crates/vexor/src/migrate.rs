@@ -225,6 +225,10 @@ fn plan_app(a: &DumpApp, pm2_home: &Path) -> AppPlan {
         }
     };
     if let Some(t) = &translated {
+        // What the daemon would refuse (e.g. a name it can't use).
+        if let Err(e) = vexor_shim::validate(&t.spec) {
+            notes.push(note(&a.name, "name", Severity::Fatal, e));
+        }
         notes.extend(check_paths(t, &cwd));
         if let Some(n) = check_node_version(t, a.node_version.as_deref()) {
             notes.push(n);

@@ -14,6 +14,13 @@ const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(5);
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(300);
 
 pub fn request(home: &Path, req: &Request) -> Result<Response, String> {
+    if *req != Request::Version {
+        ensure_current_daemon(home);
+    }
+    send(home, req)
+}
+
+fn send(home: &Path, req: &Request) -> Result<Response, String> {
     let mut stream = connect_or_start(home)?;
     stream
         .set_read_timeout(Some(RESPONSE_TIMEOUT))
@@ -37,6 +44,77 @@ pub fn request(home: &Path, req: &Request) -> Result<Response, String> {
         return Err("the daemon closed the connection without answering".into());
     }
     serde_json::from_slice(&buf).map_err(|e| format!("unreadable answer from the daemon: {e}"))
+}
+
+/// A daemon left running by another version of Vexor (e.g. before an
+/// upgrade) may not understand this CLI's requests. Once per run: if the
+/// daemon answers with a different version, or predates the question,
+/// stop it gracefully so a current one starts. Apps keep running: they
+/// belong to their shims, which the new daemon reconnects to.
+fn ensure_current_daemon(home: &Path) {
+    static CHECKED: std::sync::Once = std::sync::Once::new();
+    CHECKED.call_once(|| {
+        let socket = home.join(vexor_daemon::SOCKET);
+        if UnixStream::connect(&socket).is_err() {
+            return; // None running: the one we start is current.
+        }
+        let mine = env!("CARGO_PKG_VERSION");
+        let theirs = match send(home, &Request::Version) {
+            Ok(Response::Version { version }) if version == mine => return,
+            Ok(Response::Version { version }) => version,
+            Ok(_) => "an older version".to_owned(),
+            Err(_) => return,
+        };
+        let Some(pid) = daemon_pid(home) else {
+            eprintln!(
+                "vexor: warning: the background daemon is {theirs}, this is {mine}; restart it to avoid errors"
+            );
+            return;
+        };
+        if let Some(p) = rustix::process::Pid::from_raw(pid) {
+            let _ = rustix::process::kill_process(p, rustix::process::Signal::TERM);
+        }
+        // Wait until it has let go of its lock.
+        let lock = home.join(vexor_daemon::LOCK);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < deadline {
+            if matches!(vexor_shim::try_lock(&lock), Ok(Some(_))) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        eprintln!(
+            "vexor: the background daemon was {theirs}; restarted it as {mine} (apps keep running)"
+        );
+        // Let the new daemon reconnect to the running apps' shims, so the
+        // answer to this command shows them as they are.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            match send(home, &Request::List) {
+                Ok(Response::Ok { apps, .. })
+                    if apps.iter().all(|a| {
+                        a.desired == vexor_proto::Desired::Stopped || !a.snapshot.is_empty()
+                    }) =>
+                {
+                    break;
+                }
+                Err(_) => break,
+                _ => std::thread::sleep(Duration::from_millis(100)),
+            }
+        }
+    });
+}
+
+/// The running daemon's PID, from its log.
+fn daemon_pid(home: &Path) -> Option<i32> {
+    let log = std::fs::read_to_string(home.join("daemon.log")).ok()?;
+    log.lines()
+        .rev()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| v["type"] == "daemon_started")
+        .and_then(|v| v["pid"].as_i64())
+        .and_then(|p| i32::try_from(p).ok())
+        .filter(|p| *p > 1)
 }
 
 fn connect_or_start(home: &Path) -> Result<UnixStream, String> {

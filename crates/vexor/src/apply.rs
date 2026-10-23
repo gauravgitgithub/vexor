@@ -244,6 +244,23 @@ fn vexor_apps(home: &Path) -> Result<Vec<AppStatus>, String> {
     }
 }
 
+/// Delete an app from Vexor; one that isn't there counts as deleted.
+fn vexor_delete(home: &Path, name: &str) -> Result<(), String> {
+    match crate::client::request(
+        home,
+        &Request::Delete {
+            target: Target::Name(name.to_owned()),
+        },
+    )? {
+        Response::Error {
+            code: vexor_proto::ErrorCode::NotFound,
+            ..
+        } => Ok(()),
+        Response::Error { message, .. } => Err(message),
+        _ => Ok(()),
+    }
+}
+
 fn vexor_ok(home: &Path, req: &Request) -> Result<(), String> {
     match crate::client::request(home, req)? {
         Response::Error { message, .. } => Err(message),
@@ -535,16 +552,19 @@ fn apply(home: &Path, pm2_home: &Path, dump: &Path, opts: Options) -> Result<u8,
                     crate::ui::fail_mark()
                 );
                 eprintln!("vexor: {name}: {why}");
-                let back = vexor_ok(
-                    home,
-                    &Request::Delete {
-                        target: Target::Name(name.to_owned()),
-                    },
-                )
-                .and_then(|()| match (&pm2, a.running) {
+                // Put it back under PM2 whatever happens on the Vexor side:
+                // if Vexor never added it (the start was refused), there is
+                // nothing to delete, but PM2 must still start it again.
+                let deleted = vexor_delete(home, name);
+                let restarted = match (&pm2, a.running) {
                     (Some(p), true) => p.run(&["start", name]),
                     _ => Ok(()),
-                });
+                };
+                let back = match (deleted, restarted) {
+                    (Ok(()), Ok(())) => Ok(()),
+                    (Err(e), Ok(())) => Err(format!("{e} (it is running under PM2 again)")),
+                    (_, Err(e)) => Err(e),
+                };
                 // An app that was already failing under PM2 says nothing
                 // about the move: leave it there and carry on.
                 let failing_before = a

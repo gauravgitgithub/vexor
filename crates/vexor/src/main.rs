@@ -528,6 +528,10 @@ fn send(home: &std::path::Path, req: Request, json: bool) -> ExitCode {
         }
     };
     match response {
+        Response::Version { version } => {
+            println!("{version}");
+            ExitCode::SUCCESS
+        }
         Response::Describe {
             status,
             spec,
@@ -622,7 +626,7 @@ fn run_plan(home: &std::path::Path, plan: spec::Plan, allow_unsupported: bool) -
                 failed += 1;
                 eprintln!("vexor: {message}");
             }
-            Ok(Response::Events { .. } | Response::Describe { .. }) => {}
+            Ok(Response::Events { .. } | Response::Describe { .. } | Response::Version { .. }) => {}
             Err(e) => {
                 eprintln!("vexor: {e}");
                 return ExitCode::from(code::DAEMON_UNREACHABLE);
@@ -1057,7 +1061,6 @@ fn usage(pids: &[u64]) -> std::collections::HashMap<u64, (f64, u64)> {
 
 fn print_table(apps: &[AppStatus]) {
     let now = describe::now_ms();
-    ui::assign_app_colors(apps.iter().map(|a| a.name.as_str()));
     let pids: Vec<u64> = apps
         .iter()
         .flat_map(|a| a.snapshot.iter().filter_map(|s| s["pid"].as_u64()))
@@ -1087,7 +1090,7 @@ fn print_table(apps: &[AppStatus]) {
                 other += 1;
             }
             t.row(vec![
-                ui::app(&app.name),
+                app.name.clone(),
                 mode,
                 "-".into(),
                 ui::state(status),
@@ -1122,7 +1125,7 @@ fn print_table(apps: &[AppStatus]) {
             let restarts = s["restarts"].as_u64().unwrap_or(0);
             t.row(vec![
                 if i == 0 {
-                    ui::app(&app.name)
+                    app.name.clone()
                 } else {
                     ui::dim(if ui::fancy() { "  └" } else { "" })
                 },

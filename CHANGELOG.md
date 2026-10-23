@@ -3,6 +3,21 @@
 All notable changes to Vexor. Versions follow [Semantic Versioning](https://semver.org/);
 before 1.0, minor versions may include breaking changes, which are listed here.
 
+## Unreleased
+
+### Fixed
+- A daemon left running by another Vexor version (e.g. after an upgrade)
+  refused new settings ("unknown field `timestamps`"), so a migration
+  failed. The CLI now asks the daemon its version and restarts a
+  different one gracefully; apps keep running.
+- When Vexor refused an app during `migrate --apply`, the app was left
+  stopped under PM2. It is now always started again under PM2.
+- The migration dry run flags apps Vexor would refuse (e.g. names longer
+  than 64 characters) as blocked.
+
+### Changed
+- `vexor ls` shows app names without colour.
+
 ## 0.3.0 (2026-10-23, prerelease)
 
 A modern CLI (colours, tables, one log timeline with timestamps), HTTP/TCP

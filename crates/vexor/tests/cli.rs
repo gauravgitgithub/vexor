@@ -1597,3 +1597,60 @@ fn migrate_apply_continues_past_an_app_already_failing_under_pm2() {
     let names: Vec<Value> = env.list().iter().map(|a| a["name"].clone()).collect();
     assert_eq!(names, ["idle"]);
 }
+
+#[test]
+fn migrate_puts_an_app_vexor_refuses_back_under_pm2() {
+    let env = Env::new();
+    let pm2_home = env.work.path().join("pm2home");
+    std::fs::create_dir_all(&pm2_home).expect("mkdir");
+    let dump = pm2_dump(&env);
+    std::fs::rename(&dump, pm2_home.join("dump.pm2")).expect("move");
+    let ph = pm2_home.to_str().expect("utf-8");
+    env.ok(&["migrate", "--from-pm2", "--backup", "--pm2-home", ph]);
+    // Vexor refuses the start after `pm2 stop`: here, a Vexor app by the
+    // same name appears in between (as an incompatible daemon would refuse).
+    let (pm2, log) = fake_pm2(&env);
+    let shim = env.script(
+        "stop-then-block",
+        &format!(
+            "#!/bin/sh\n'{}' \"$@\"\n[ \"$1\" = stop ] && '{}' --home '{}' start '{}' --name web --env X=1 >/dev/null 2>&1\nexit 0\n",
+            pm2.display(),
+            env!("CARGO_BIN_EXE_vexor"),
+            env.home.path().display(),
+            env.work.path().join("loop.sh").display()
+        ),
+    );
+    let out = env.run(&[
+        "migrate",
+        "--from-pm2",
+        "--apply",
+        "--yes",
+        "--only",
+        "web",
+        "--pm2-home",
+        ph,
+        "--pm2",
+        shim.to_str().expect("utf-8"),
+    ]);
+    assert_eq!(out.status.code(), Some(1));
+    // Whatever Vexor did, PM2 was asked to start the app again.
+    assert_eq!(pm2_calls(&log), ["stop web", "start web"]);
+}
+
+#[test]
+fn migrate_dry_run_blocks_names_vexor_cannot_use() {
+    let env = Env::new();
+    let dump = pm2_dump(&env);
+    let mut d: Value =
+        serde_json::from_str(&std::fs::read_to_string(&dump).expect("read")).expect("json");
+    d[2]["name"] = "x".repeat(70).into();
+    std::fs::write(&dump, d.to_string()).expect("write");
+    let out = env.run(&[
+        "migrate",
+        "--from-pm2",
+        "--dump",
+        dump.to_str().expect("utf-8"),
+    ]);
+    assert_eq!(out.status.code(), Some(4));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("blocked: name"));
+}

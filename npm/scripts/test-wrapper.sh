@@ -81,7 +81,10 @@ out=$(VEXOR_BINARY=/bin/echo "$V" hello 2>&1)
 [ "$out" = "hello" ] && pass "VEXOR_BINARY override" || fail "VEXOR_BINARY override" "$out"
 
 # Launcher alone (platform package missing): actionable error, exit 1.
+# Global installs ignore --omit=optional and fetch the platform package from
+# the registry once it is published there, so remove it after installing.
 npm install -g --prefix "$T/bare" --no-audit --no-fund --no-optional --omit=optional --loglevel=error "$wrapper" >/dev/null 2>&1
+rm -rf "$T"/bare/lib/node_modules/vexord/node_modules/vexord-* "$T"/bare/lib/node_modules/vexord-*
 out=$("$T/bare/bin/vexor" --version 2>&1); code=$?
 case "$out" in
   *"is not installed"*) [ "$code" = 1 ] && pass "missing platform package" || fail "missing platform package" "exit $code" ;;

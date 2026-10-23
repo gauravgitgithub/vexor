@@ -3,7 +3,7 @@
 All notable changes to Vexor. Versions follow [Semantic Versioning](https://semver.org/);
 before 1.0, minor versions may include breaking changes, which are listed here.
 
-## 0.1.1 (unreleased)
+## 0.1.1 (2026-10-23, prerelease)
 
 Fixes found by running the same ecosystem files under PM2 7.1.0 and Vexor
 (`tests/conformance`).

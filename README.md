@@ -3,7 +3,7 @@
 A Rust-native process manager for production Node.js apps, designed as a
 PM2-compatible alternative.
 
-> **Status: prerelease (0.1.0).** Usable for evaluation, not yet recommended
+> **Status: prerelease (0.1.1).** Usable for evaluation, not yet recommended
 > for production: PM2 migration, memory/watch/cron restarts and published
 > benchmarks are still missing. See [CHANGELOG.md](CHANGELOG.md) and
 > [docs/plan.md](docs/plan.md).

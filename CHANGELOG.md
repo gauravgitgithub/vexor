@@ -11,6 +11,12 @@ before 1.0, minor versions may include breaking changes, which are listed here.
   is restarted after repeated failures; cluster apps are reloaded instead.
   Loopback targets only.
 
+### Changed
+- `vexor migrate --from-pm2` report: findings common to all apps are said
+  once; environments are summarised (shared set once, per-app
+  differences); the table gives the blocking reason; apps PM2 keeps
+  restarting are flagged. `--env-names` lists every variable name.
+
 ## 0.2.0 (2026-10-23, prerelease)
 
 Moving from PM2: a migration that plans, backs up, moves apps one at a

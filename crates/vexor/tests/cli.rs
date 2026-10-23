@@ -939,9 +939,19 @@ fn migrate_dry_run_reports_and_changes_nothing() {
     assert!(out.contains("brief (stop, then start)"), "{out}");
     assert!(out.contains("none (not running)"), "{out}");
     assert!(out.contains("'a b'"), "{out}");
-    assert!(out.contains("API_KEY"), "{out}");
-    assert!(!out.contains("s3cr3t-value"), "env value printed: {out}");
-    assert!(!out.contains("PM2_HOME"), "PM2's own variables kept: {out}");
+    // Both apps share one environment: summarised once, names on request.
+    assert!(
+        out.contains("2 of 2 apps have the same 2 variables"),
+        "{out}"
+    );
+    assert!(out.contains("env:  the shared 2 variables"), "{out}");
+    assert!(!out.contains("API_KEY"), "{out}");
+    let named = env.ok(&["migrate", "--from-pm2", "--dump", dump, "--env-names"]);
+    assert!(named.contains("API_KEY"), "{named}");
+    for o in [&out, &named] {
+        assert!(!o.contains("s3cr3t-value"), "env value printed: {o}");
+        assert!(!o.contains("PM2_HOME"), "PM2's own variables kept: {o}");
+    }
     assert!(out.contains("All 2 apps can be migrated"), "{out}");
     // A dry run doesn't start the daemon or create Vexor state.
     assert!(!env.home.path().join("daemon.sock").exists());
@@ -977,6 +987,7 @@ fn migrate_blocked_apps_exit_4_and_missing_dump_explains() {
     assert_eq!(out.status.code(), Some(4));
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("uid"), "{stdout}");
+    assert!(stdout.contains("blocked: uid"), "{stdout}");
     assert!(stdout.contains("1 of 2 apps can be migrated"), "{stdout}");
 
     let out = env.run(&[

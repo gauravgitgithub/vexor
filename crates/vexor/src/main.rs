@@ -197,6 +197,10 @@ enum Command {
         /// Machine-readable output.
         #[arg(long)]
         json: bool,
+        /// Dry run: list every environment variable name of every app
+        /// (values are never shown).
+        #[arg(long)]
+        env_names: bool,
     },
     /// Run the supervisor daemon in the foreground. Other commands start it
     /// in the background automatically.
@@ -368,6 +372,7 @@ fn main() -> ExitCode {
             pm2_home,
             dump,
             json,
+            env_names,
         } => {
             let moving = apply || rollback.is_some();
             if !moving && (only.is_some() || yes || pm2.is_some() || timeout.is_some()) {
@@ -414,7 +419,7 @@ fn main() -> ExitCode {
                     },
                 ))
             } else {
-                migrate_cmd(&home, pm2_home, dump, backup, json)
+                migrate_cmd(&home, pm2_home, dump, backup, json, env_names)
             }
         }
         Command::Events {
@@ -1008,6 +1013,7 @@ fn migrate_cmd(
     dump: Option<PathBuf>,
     backup: bool,
     json: bool,
+    env_names: bool,
 ) -> ExitCode {
     let pm2_home = pm2_home.unwrap_or_else(migrate::default_pm2_home);
     let dump = dump.unwrap_or_else(|| pm2_home.join("dump.pm2"));
@@ -1052,7 +1058,7 @@ fn migrate_cmd(
             Err(e) => return fail(&e.to_string()),
         }
     } else {
-        migrate::print(&report);
+        migrate::print(&report, env_names);
     }
     if report.blocked() > 0 {
         ExitCode::from(code::PARTIAL)

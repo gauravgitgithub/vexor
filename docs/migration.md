@@ -26,7 +26,9 @@ How the dump is read (checked against dumps written by PM2 7.1.0):
 - Environment: the dump's `env` holds the shell environment `pm2` was started from as well as the app's own variables, and PM2 can't tell them apart either. All of it is kept (minus PM2's own `PM2_*`, `unique_id`, `PWD`, `SHLVL` and the instance variable), so apps see what they see under PM2. The migrating shell's environment is not added. The report lists variable names only, never values.
 - `username`: PM2 records its own user in every entry. An error only when it differs from the user running the migration.
 
-Per app, the report shows the command line Vexor would run (absolute interpreter path), working directory, log files, environment variable names, every finding (error / warning / note), and the downtime class:
+Per app, the report shows the command line Vexor would run (absolute interpreter path), working directory, log files, its environment, every finding (error / warning / note), and the downtime class (in the table, with the first blocking reason, e.g. `blocked: script missing`). Findings that apply to every app (the Node.js interpreter, captured shell environment) are said once at the top. Environments are summarised: when apps share one variable set (typical when one shell started `pm2` for all of them), the top says so once and each app lists only its differences (`+ added; − missing`); names that look like they come from the terminal, shell or npm (`SSH_AUTH_SOCK`, `TERM_SESSION_ID`, `npm_*`, …) are counted. `--env-names` lists every name of every app; values are never shown. Apps PM2 is restarting over and over (`waiting restart`) or has given up on (`errored`) get a warning, since they will behave the same under Vexor.
+
+Downtime classes:
 
 - `none`: not running under PM2 (stopped or errored), so nothing is interrupted.
 - `brief`: running; stopped under PM2 then started under Vexor, so down for about the app's startup time.

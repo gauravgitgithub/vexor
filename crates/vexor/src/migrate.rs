@@ -54,6 +54,12 @@ pub struct Report {
     pub processes: usize,
     /// Findings about the PM2 installation as a whole.
     pub warnings: Vec<String>,
+    /// Environment variable names most apps share (empty when no two apps
+    /// share one): the report lists each app's differences from it.
+    pub shared_env: Vec<String>,
+    /// Names that look like they come from the interactive shell or npm that
+    /// started `pm2`, rather than from the app's configuration.
+    pub session_env: Vec<String>,
     pub apps: Vec<AppPlan>,
 }
 
@@ -134,18 +140,58 @@ pub fn plan(dump_path: &Path, pm2_home: &Path) -> Result<Report, String> {
         warnings.push(
             "PM2 saved the shell environment `pm2` was started from with each app's own \
              variables, and can't tell them apart; all of them are kept so apps see what they \
-             see under PM2. Check the variable names below"
+             see under PM2 (names: --env-names)"
                 .into(),
         );
     }
 
-    let apps = dump.apps.iter().map(|a| plan_app(a, pm2_home)).collect();
+    let mut apps: Vec<AppPlan> = dump.apps.iter().map(|a| plan_app(a, pm2_home)).collect();
+
+    // Said once for the whole dump instead of once per app.
+    let generic = |n: &Note| n.field == "interpreter" && n.message.starts_with("PM2 runs");
+    let mut nodes: Vec<String> = Vec::new();
+    for a in &mut apps {
+        if a.notes.iter().any(generic) {
+            a.notes.retain(|n| !generic(n));
+            if let Some(exec) = a.full_spec.as_ref().map(|s| s.exec.display().to_string())
+                && !nodes.contains(&exec)
+            {
+                nodes.push(exec);
+            }
+        }
+    }
+    if !nodes.is_empty() {
+        let found: Vec<String> = nodes
+            .iter()
+            .map(|n| match node_version(Path::new(n)) {
+                Some(v) => format!("{n} (Node.js {v})"),
+                None => n.clone(),
+            })
+            .collect();
+        warnings.push(format!(
+            "PM2 runs Node.js apps with the Node.js that runs PM2 itself; Vexor uses the `node` on each app's saved PATH: {}",
+            found.join(", ")
+        ));
+    }
+
+    let shared_env = shared_env(&apps);
+    let mut session_env: Vec<String> = apps
+        .iter()
+        .flat_map(|a| a.env_keys.iter())
+        .filter(|k| is_session_var(k))
+        .cloned()
+        .collect();
+    session_env.sort();
+    session_env.dedup();
+
     Ok(Report {
         dump: dump_path.to_path_buf(),
         pm2_version: dump.pm2_version,
         dump_age_secs,
         processes: dump.processes,
         warnings,
+        shared_env,
+        session_env,
         apps,
     })
 }
@@ -189,6 +235,21 @@ fn plan_app(a: &DumpApp, pm2_home: &Path) -> AppPlan {
         .any(|n| n.field == "interpreter" && n.message.starts_with("PM2 ran"))
     {
         notes.retain(|n| !(n.field == "interpreter" && n.message.starts_with("PM2 runs")));
+    }
+    if a.statuses.iter().any(|s| s == "waiting restart") {
+        notes.push(note(
+            &a.name,
+            "status",
+            Severity::Partial,
+            "PM2 is restarting this app over and over (it keeps exiting); check its error log, it will do the same under Vexor".into(),
+        ));
+    } else if a.statuses.iter().any(|s| s == "errored") {
+        notes.push(note(
+            &a.name,
+            "status",
+            Severity::Partial,
+            "PM2 gave up restarting this app (errored); it is added to Vexor stopped".into(),
+        ));
     }
     notes.sort_by_key(|n| std::cmp::Reverse(n.severity));
     let blocked = translated.is_none() || notes.iter().any(|n| n.severity == Severity::Fatal);
@@ -311,6 +372,137 @@ fn check_node_version(t: &Translated, recorded: Option<&str>) -> Option<Note> {
     ))
 }
 
+fn node_version(exec: &Path) -> Option<String> {
+    let out = Command::new(exec).arg("-v").output().ok()?;
+    let v = String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .trim_start_matches('v')
+        .to_owned();
+    (!v.is_empty()).then_some(v)
+}
+
+/// The variable-name set shared by the most apps, when at least two share
+/// it.
+fn shared_env(apps: &[AppPlan]) -> Vec<String> {
+    let mut counts: Vec<(&Vec<String>, usize)> = Vec::new();
+    for a in apps.iter().filter(|a| !a.env_keys.is_empty()) {
+        match counts.iter_mut().find(|(k, _)| *k == &a.env_keys) {
+            Some((_, n)) => *n += 1,
+            None => counts.push((&a.env_keys, 1)),
+        }
+    }
+    counts
+        .into_iter()
+        .filter(|(_, n)| *n >= 2)
+        .max_by_key(|(k, n)| (*n, k.len()))
+        .map(|(k, _)| k.clone())
+        .unwrap_or_default()
+}
+
+/// Variables an interactive shell, terminal or npm sets, which end up in
+/// PM2's saved environment when `pm2` is started from a terminal.
+pub fn is_session_var(name: &str) -> bool {
+    const EXACT: &[&str] = &[
+        "SSH_AUTH_SOCK",
+        "SSH_AGENT_PID",
+        "SSH_CONNECTION",
+        "SSH_CLIENT",
+        "SSH_TTY",
+        "TERM",
+        "TERM_PROGRAM",
+        "TERM_PROGRAM_VERSION",
+        "TERM_SESSION_ID",
+        "COLORTERM",
+        "COLOR",
+        "OLDPWD",
+        "SHLVL",
+        "INIT_CWD",
+        "EDITOR",
+        "VISUAL",
+        "PAGER",
+        "OSLogRateLimit",
+        "ITERM_SESSION_ID",
+        "ITERM_PROFILE",
+        "LC_TERMINAL",
+        "LC_TERMINAL_VERSION",
+        "TMUX",
+        "TMUX_PANE",
+        "STY",
+        "WINDOWID",
+        "DISPLAY",
+        "XPC_FLAGS",
+        "XPC_SERVICE_NAME",
+        "MANPATH",
+        "INFOPATH",
+        "FPATH",
+        "NODE",
+        "_",
+    ];
+    const PREFIXES: &[&str] = &[
+        "npm_",
+        "__CF",
+        "STARSHIP_",
+        "ZSH_",
+        "FNM_",
+        "NVM_",
+        "HOMEBREW_",
+        "VSCODE_",
+        "P9K_",
+        "POWERLEVEL",
+        "WARP_",
+        "GHOSTTY_",
+        "KITTY_",
+        "ALACRITTY_",
+    ];
+    EXACT.contains(&name) || PREFIXES.iter().any(|p| name.starts_with(p))
+}
+
+/// `+A, B − C` relative to `shared`, at most `limit` names per side.
+fn env_diff(keys: &[String], shared: &[String], limit: usize) -> String {
+    let added: Vec<&str> = keys
+        .iter()
+        .filter(|k| !shared.contains(k))
+        .map(String::as_str)
+        .collect();
+    let removed: Vec<&str> = shared
+        .iter()
+        .filter(|k| !keys.contains(k))
+        .map(String::as_str)
+        .collect();
+    let side = |sign: &str, names: &[&str]| {
+        let mut s = format!(
+            "{sign} {}",
+            names
+                .iter()
+                .take(limit)
+                .copied()
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        if names.len() > limit {
+            s.push_str(&format!(" and {} more", names.len() - limit));
+        }
+        s
+    };
+    let mut parts = Vec::new();
+    if !added.is_empty() {
+        parts.push(side("+", &added));
+    }
+    if !removed.is_empty() {
+        parts.push(side("−", &removed));
+    }
+    parts.join("; ")
+}
+
+/// Short reason for the table, from the first error.
+fn blocked_reason(a: &AppPlan) -> String {
+    match a.notes.iter().find(|n| n.severity == Severity::Fatal) {
+        Some(n) if n.message.ends_with("does not exist") => format!("blocked: {} missing", n.field),
+        Some(n) => format!("blocked: {}", n.field),
+        None => "blocked".into(),
+    }
+}
+
 /// PM2's boot service, if installed (`pm2 startup`).
 fn pm2_startup_unit(user: Option<&str>) -> Option<PathBuf> {
     let user = user?;
@@ -347,7 +539,7 @@ fn quote(a: &str) -> String {
     }
 }
 
-pub fn print(r: &Report) {
+pub fn print(r: &Report, env_names: bool) {
     println!(
         "PM2 dump: {} ({}{} processes, {} apps{})",
         r.dump.display(),
@@ -363,6 +555,39 @@ pub fn print(r: &Report) {
     );
     for w in &r.warnings {
         println!("warning: {w}");
+    }
+    let sharing = r
+        .apps
+        .iter()
+        .filter(|a| !r.shared_env.is_empty() && a.env_keys == r.shared_env)
+        .count();
+    if sharing >= 2 {
+        println!(
+            "Environment: {sharing} of {} apps have the same {} variables; below, each app lists only its differences{}.",
+            r.apps.len(),
+            r.shared_env.len(),
+            if env_names {
+                ""
+            } else {
+                " (--env-names lists every name)"
+            }
+        );
+        if env_names {
+            println!("  shared: {}", r.shared_env.join(", "));
+        }
+    }
+    if !r.session_env.is_empty() {
+        let shown: Vec<&str> = r.session_env.iter().take(8).map(String::as_str).collect();
+        println!(
+            "Environment: {} variables look like they come from the terminal, shell or npm that started `pm2` ({}{}); they are kept, as PM2 passes them.",
+            r.session_env.len(),
+            shown.join(", "),
+            if r.session_env.len() > shown.len() {
+                ", …"
+            } else {
+                ""
+            }
+        );
     }
     println!();
     let mut rows = vec![[
@@ -381,11 +606,10 @@ pub fn print(r: &Report) {
             a.instances.to_string(),
             st.join(","),
             match a.downtime {
-                Downtime::None => "none (not running)",
-                Downtime::Brief => "brief (stop, then start)",
-                Downtime::Blocked => "blocked",
-            }
-            .to_owned(),
+                Downtime::None => "none (not running)".to_owned(),
+                Downtime::Brief => "brief (stop, then start)".to_owned(),
+                Downtime::Blocked => blocked_reason(a),
+            },
         ]);
     }
     crate::print_rows(&rows);
@@ -410,11 +634,22 @@ pub fn print(r: &Report) {
             );
         }
         if !a.env_keys.is_empty() {
-            println!(
-                "  env:  {} variables (values not shown): {}",
-                a.env_keys.len(),
-                a.env_keys.join(", ")
-            );
+            let n = a.env_keys.len();
+            if env_names {
+                println!(
+                    "  env:  {n} variables (values not shown): {}",
+                    a.env_keys.join(", ")
+                );
+            } else if !r.shared_env.is_empty() && a.env_keys == r.shared_env {
+                println!("  env:  the shared {n} variables");
+            } else if !r.shared_env.is_empty() {
+                println!(
+                    "  env:  {n} variables: the shared set {}",
+                    env_diff(&a.env_keys, &r.shared_env, 10)
+                );
+            } else {
+                println!("  env:  {n} variables (values not shown)");
+            }
         }
         for n in &a.notes {
             let level = match n.severity {
@@ -456,6 +691,38 @@ mod tests {
         assert_eq!(quote("high prio"), "'high prio'");
         assert_eq!(quote("it's"), "'it'\\''s'");
         assert_eq!(quote(""), "''");
+    }
+
+    #[test]
+    fn env_differences_are_short() {
+        let shared: Vec<String> = ["A", "B", "C"].map(String::from).to_vec();
+        let keys: Vec<String> = ["A", "C", "D", "E"].map(String::from).to_vec();
+        assert_eq!(env_diff(&keys, &shared, 10), "+ D, E; − B");
+        assert_eq!(env_diff(&keys, &shared, 1), "+ D and 1 more; − B");
+        assert_eq!(env_diff(&shared, &shared, 10), "");
+    }
+
+    #[test]
+    fn session_variables() {
+        for v in [
+            "SSH_AUTH_SOCK",
+            "TERM_SESSION_ID",
+            "npm_lifecycle_event",
+            "__CF_USER_TEXT_ENCODING",
+            "STARSHIP_SHELL",
+        ] {
+            assert!(is_session_var(v), "{v}");
+        }
+        for v in [
+            "PATH",
+            "HOME",
+            "NODE_ENV",
+            "PORT",
+            "DATABASE_URL",
+            "NODE_OPTIONS",
+        ] {
+            assert!(!is_session_var(v), "{v}");
+        }
     }
 
     #[test]

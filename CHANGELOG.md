@@ -6,6 +6,10 @@ before 1.0, minor versions may include breaking changes, which are listed here.
 ## Unreleased
 
 ### Added
+- `max_memory_restart` (ecosystem files, `vexor start --max-memory-restart
+  200M`): an instance whose resident memory goes above the limit is
+  restarted gracefully; checked every 5 s and recorded as a
+  `memory_restart` event.
 - `vexor migrate --from-pm2 --dry-run`: reads PM2's `dump.pm2` and shows
   how each app would run under Vexor, every unsupported setting, and the
   expected downtime. Changes nothing (no PM2 command, no Vexor state).

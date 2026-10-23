@@ -527,7 +527,7 @@ module.exports = {
   apps: [
     { name: 'a', script: './loop.sh', env: { MODE: 'dev' }, env_production: { MODE: 'prod' } },
     { name: 'b', script: 'loop.sh', instances: 2, merge_logs: true, autostart: false },
-    { name: 'm', script: 'loop.sh', max_memory_restart: '300M' },
+    { name: 'm', script: 'loop.sh', cron_restart: '0 3 * * *' },
   ],
 };
 ";
@@ -570,7 +570,7 @@ fn ecosystem_check_reports_without_starting() {
             .as_array()
             .expect("notes")
             .iter()
-            .any(|n| n["field"] == "max_memory_restart" && n["severity"] == "fatal")
+            .any(|n| n["field"] == "cron_restart" && n["severity"] == "fatal")
     );
     assert!(
         !env.home.path().join("daemon.sock").exists(),

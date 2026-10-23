@@ -819,3 +819,111 @@ fn cluster_worker_without_ready_fails_readiness() {
         assert_eq!(states(&done.events, i), ["starting", "stopping", "errored"]);
     }
 }
+
+#[test]
+fn max_memory_restart_restarts_an_instance_over_the_limit() {
+    let shim = Shim::new();
+    // The shell holds a 40 MB string, so its resident memory passes 20 MiB.
+    let script = r"echo started; x=$(head -c 40000000 /dev/zero | tr '\0' a); echo grown; while :; do sleep 0.05; done";
+    let extra = json!({
+        "policy": { "max_memory_bytes": 20 << 20, "memory_check_interval_ms": 200 }
+    });
+    let child = shim.start(&shim.spec("/bin/sh", &["-c", script], extra));
+    let started = Instant::now();
+    let deadline = started + TIMEOUT;
+    while shim.out_log().matches("started").count() < 3 {
+        assert!(
+            Instant::now() < deadline,
+            "no memory restarts: {}",
+            shim.out_log()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    kill(child.id(), "TERM");
+    let done = finish(child, started);
+    let restarts: Vec<&Value> = done
+        .events
+        .iter()
+        .filter(|e| e["type"] == "memory_restart")
+        .collect();
+    assert!(restarts.len() >= 2, "{:?}", done.events);
+    for r in &restarts {
+        assert_eq!(r["limit_bytes"], 20 << 20);
+        assert!(r["rss_bytes"].as_u64().expect("rss") > 20 << 20, "{r}");
+    }
+    // A memory restart is a restart, not a crash: no crash-loop error.
+    assert!(
+        done.events.iter().all(|e| e["error"].is_null()),
+        "{:?}",
+        done.events
+    );
+}
+
+#[test]
+fn max_memory_restart_leaves_an_app_under_the_limit_alone() {
+    let shim = Shim::new();
+    let extra = json!({
+        "policy": { "max_memory_bytes": 1u64 << 30, "memory_check_interval_ms": 100 }
+    });
+    let child = shim.start(&shim.spec(
+        "/bin/sh",
+        &["-c", "echo started; while :; do sleep 0.05; done"],
+        extra,
+    ));
+    let started = Instant::now();
+    shim.wait_for_output("started");
+    std::thread::sleep(Duration::from_millis(1000));
+    kill(child.id(), "TERM");
+    let done = finish(child, started);
+    assert_eq!(shim.out_log().matches("started").count(), 1);
+    assert!(done.events.iter().all(|e| e["type"] != "memory_restart"));
+}
+
+#[test]
+fn max_memory_restart_checks_each_cluster_worker() {
+    let Some(node) = node() else { return };
+    let shim = Shim::new();
+    // Only instance 1 grows past the limit.
+    let app = "
+var big = process.env.NODE_APP_INSTANCE === '1' ? Buffer.alloc(150 * 1024 * 1024, 1) : null;
+console.log('worker ' + process.env.NODE_APP_INSTANCE + ' ' + (big ? 'big' : 'small'));
+process.send('ready');
+setInterval(function () {}, 1000);
+";
+    std::fs::write(shim.path("mem.js"), app).expect("write app");
+    let spec = shim.spec(
+        &node,
+        &[],
+        json!({
+            "instances": 2,
+            "node_ipc": true,
+            "policy": {
+                "ready_timeout_ms": 10000,
+                "max_memory_bytes": 120u64 << 20,
+                "memory_check_interval_ms": 200
+            },
+            "cluster": { "script": shim.path("mem.js") },
+        }),
+    );
+    let child = shim.start(&spec);
+    let started = Instant::now();
+    let deadline = started + TIMEOUT;
+    while shim.out_log().matches("worker 1 big").count() < 2 {
+        assert!(Instant::now() < deadline, "{}", shim.out_log());
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    kill(child.id(), "TERM");
+    let done = finish(child, started);
+    let restarted: std::collections::BTreeSet<u64> = done
+        .events
+        .iter()
+        .filter(|e| e["type"] == "memory_restart")
+        .filter_map(|e| e["instance"].as_u64())
+        .collect();
+    assert_eq!(restarted, [1].into(), "{:?}", done.events);
+    assert_eq!(
+        shim.out_log().matches("worker 0 small").count(),
+        1,
+        "instance 0 untouched"
+    );
+}

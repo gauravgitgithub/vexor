@@ -76,6 +76,7 @@ pub fn start_plan(args: &StartArgs, home: &Path) -> Result<Plan, String> {
             || !args.env.is_empty()
             || !args.args.is_empty()
             || args.only.is_some()
+            || args.max_memory_restart.is_some()
         {
             return Err(format!(
                 "{target:?} is not a file; options like --name/-i/--env/--only only apply when starting a file"
@@ -98,9 +99,14 @@ pub fn start_plan(args: &StartArgs, home: &Path) -> Result<Plan, String> {
 }
 
 fn ecosystem_plan(args: &StartArgs, path: &Path, home: &Path) -> Result<Plan, String> {
-    if args.name.is_some() || args.instances.is_some() || args.fork || !args.args.is_empty() {
+    if args.name.is_some()
+        || args.instances.is_some()
+        || args.fork
+        || !args.args.is_empty()
+        || args.max_memory_restart.is_some()
+    {
         return Err(
-            "--name, -i and app arguments don't apply to ecosystem files; set them in the file"
+            "--name, -i, --max-memory-restart and app arguments don't apply to ecosystem files; set them in the file"
                 .into(),
         );
     }
@@ -232,7 +238,19 @@ fn build(args: &StartArgs, script: &Path, home: &Path) -> Result<AppSpec, String
         instance_var: "NODE_APP_INSTANCE".to_owned(),
         node_ipc,
         treekill: true,
-        policy: PolicySpec::default(),
+        policy: PolicySpec {
+            max_memory_bytes: match &args.max_memory_restart {
+                Some(m) => Some(
+                    vexor_pm2::parse_memory(&serde_json::Value::String(m.clone()))
+                        .filter(|b| *b > 0)
+                        .ok_or_else(|| {
+                            format!("--max-memory-restart: expected bytes or a size like 200M, got {m:?}")
+                        })?,
+                ),
+                None => None,
+            },
+            ..PolicySpec::default()
+        },
         cluster,
     })
 }

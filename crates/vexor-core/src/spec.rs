@@ -175,6 +175,11 @@ pub struct PolicySpec {
     /// Signal for a graceful stop (stop, restart, retiring after reload).
     /// SIGINT by default, as PM2.
     pub kill_signal: KillSignal,
+    /// Restart an instance whose resident memory (RSS) is above this many
+    /// bytes when checked (PM2 `max_memory_restart`).
+    pub max_memory_bytes: Option<u64>,
+    /// How often memory is checked while `max_memory_bytes` is set.
+    pub memory_check_interval_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -258,6 +263,8 @@ impl Default for PolicySpec {
             reload_strategy: ReloadStrategy::Auto,
             reload_timeout_ms: None,
             kill_signal: KillSignal::Int,
+            max_memory_bytes: None,
+            memory_check_interval_ms: 5_000,
         }
     }
 }

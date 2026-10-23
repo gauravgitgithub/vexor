@@ -15,6 +15,7 @@ mod control;
 mod identity;
 mod instance;
 mod logs;
+mod memory;
 mod orphan;
 mod output;
 mod process;

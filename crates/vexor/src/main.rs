@@ -247,12 +247,16 @@ pub struct StartArgs {
     /// that changes how the app behaves (they are listed first).
     #[arg(long)]
     pub allow_unsupported: bool,
+    /// Restart an instance whose resident memory goes above this size
+    /// (bytes, or K/M/G, e.g. 200M), as PM2.
+    #[arg(long, value_name = "SIZE")]
+    pub max_memory_restart: Option<String>,
     /// Pass this shell's whole environment to the app (PM2 behaviour).
     /// By default only a small allowlist is passed (see docs/security.md T2).
     #[arg(long)]
     pub inherit_env: bool,
     /// Start from a complete app spec file (JSON) instead of a script.
-    #[arg(long, conflicts_with_all = ["target", "name", "instances", "interpreter", "cwd", "env", "inherit_env"])]
+    #[arg(long, conflicts_with_all = ["target", "name", "instances", "interpreter", "cwd", "env", "inherit_env", "max_memory_restart"])]
     pub spec: Option<PathBuf>,
     /// Arguments for the app, after `--`.
     #[arg(last = true)]
@@ -574,6 +578,7 @@ fn check(
         inherit_env: false,
         spec: None,
         args: Vec::new(),
+        max_memory_restart: None,
         only,
         allow_unsupported: false,
     };
@@ -828,6 +833,13 @@ pub(crate) fn print_events(events: &[serde_json::Value]) {
         }
         if let Some(s) = e["signal"].as_str() {
             detail.push(format!("signal={s}"));
+        }
+        if let (Some(r), Some(l)) = (e["rss_bytes"].as_u64(), e["limit_bytes"].as_u64()) {
+            detail.push(format!(
+                "rss={} limit={}",
+                describe::bytes(r),
+                describe::bytes(l)
+            ));
         }
         if let Some(err) = e["error"].as_str() {
             detail.push(err.to_owned());

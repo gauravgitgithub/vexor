@@ -22,6 +22,7 @@ use vexor_core::{AppSpec, Ctx, Effect, Event, ExitStatus, Instance, Millis, Stat
 use crate::cluster::{Cluster, WorkerEvent, WorkerMsg};
 use crate::identity::Identity;
 use crate::logs::Sink;
+use crate::memory;
 use crate::orphan::{self, Managed};
 use crate::output::{Output, ShimEvent};
 use crate::process::{self, IpcChannel, IpcMessage};
@@ -86,6 +87,8 @@ pub struct Runner {
     queue: VecDeque<Event>,
     rand: std::collections::hash_map::RandomState,
     rand_counter: u64,
+    /// Periodic memory check, while `max_memory_bytes` is set.
+    memory_check: Option<tokio::time::Interval>,
 }
 
 impl Runner {
@@ -128,6 +131,7 @@ impl Runner {
             queue: VecDeque::new(),
             rand: std::collections::hash_map::RandomState::new(),
             rand_counter: 0,
+            memory_check: None,
         }
     }
 
@@ -141,6 +145,12 @@ impl Runner {
         exit_when_idle: bool,
     ) -> State {
         self.queue.push_back(Event::Start);
+        if self.spec.policy.max_memory_bytes.is_some() {
+            let period = Duration::from_millis(self.spec.policy.memory_check_interval_ms.max(100));
+            let mut tick = tokio::time::interval_at(Instant::now() + period, period);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            self.memory_check = Some(tick);
+        }
         let mut shutting_down = false;
         let mut control_open = true;
         loop {
@@ -200,6 +210,9 @@ impl Runner {
                         self.queue.push_back(Event::Stop);
                     }
                 }
+                () = memory_tick(&mut self.memory_check), if self.memory_check.is_some() && !shutting_down => {
+                    self.check_memory();
+                }
                 c = control.recv(), if control_open && !shutting_down => match c {
                     Ok(Control::Restart) => self.queue.push_back(Event::Restart),
                     Ok(Control::Reload) => self.queue.push_back(Event::Reload),
@@ -222,6 +235,38 @@ impl Runner {
         self.cur_fork
             .map(|f| f.pid)
             .or_else(|| self.cur_worker.and_then(|w| w.pid))
+    }
+
+    /// Restart the instance if its process uses more memory than allowed
+    /// (PM2 `max_memory_restart`). Only an online process that isn't being
+    /// reloaded is checked.
+    fn check_memory(&mut self) {
+        let Some(limit) = self.spec.policy.max_memory_bytes else {
+            return;
+        };
+        if self.inst.state() != State::Online || self.inst.reloading() {
+            return;
+        }
+        let (Some(pid), Some(id)) = (self.current_pid(), self.current_identity()) else {
+            return;
+        };
+        // The PID must still be the process we started.
+        if !id.is_alive() {
+            return;
+        }
+        let Ok(rss) = memory::rss_bytes(pid) else {
+            return;
+        };
+        if rss > limit {
+            self.out.emit(&ShimEvent::MemoryRestart {
+                app: &self.spec.name,
+                instance: self.index,
+                pid,
+                rss_bytes: rss,
+                limit_bytes: limit,
+            });
+            self.queue.push_back(Event::Restart);
+        }
     }
 
     fn current_identity(&self) -> Option<Identity> {
@@ -675,6 +720,15 @@ async fn wait_child(child: &mut Option<tokio::process::Child>) -> ExitStatus {
             eprintln!("vexor shim: wait failed: {e}");
             ExitStatus::default()
         }
+    }
+}
+
+async fn memory_tick(tick: &mut Option<tokio::time::Interval>) {
+    match tick {
+        Some(t) => {
+            t.tick().await;
+        }
+        None => std::future::pending().await,
     }
 }
 

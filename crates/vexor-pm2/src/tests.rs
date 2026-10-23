@@ -122,7 +122,6 @@ fn interpreter_none_runs_script_directly_and_bare_commands_use_path() {
 fn behaviour_changing_fields_are_fatal() {
     let t = tr(json!({
         "name": "a", "script": "/bin/sleep",
-        "max_memory_restart": "300M",
         "cron_restart": "0 * * * *",
         "watch": true,
         "uid": "www",
@@ -138,7 +137,6 @@ fn behaviour_changing_fields_are_fatal() {
             "cron_restart",
             "exec_mode",
             "increment_var",
-            "max_memory_restart",
             "shutdown_with_message",
             "uid",
             "watch"
@@ -470,4 +468,44 @@ fn load_errors_are_explained() {
     let yaml = dir.path().join("p.yml");
     std::fs::write(&yaml, "apps: []").expect("write");
     assert!(load(&yaml, None).expect_err("yaml").contains("YAML"));
+}
+
+#[test]
+fn max_memory_restart_sizes() {
+    assert_eq!(parse_memory(&json!(1024)), Some(1024));
+    assert_eq!(parse_memory(&json!("1024")), Some(1024));
+    assert_eq!(parse_memory(&json!("200M")), Some(200 << 20));
+    assert_eq!(parse_memory(&json!("1G")), Some(1 << 30));
+    assert_eq!(parse_memory(&json!("512K")), Some(512 << 10));
+    assert_eq!(parse_memory(&json!("150m")), Some(150 << 20));
+    assert_eq!(parse_memory(&json!("1.5G")), None);
+    assert_eq!(parse_memory(&json!("200MB")), None);
+    assert_eq!(parse_memory(&json!("lots")), None);
+    assert_eq!(parse_memory(&json!(true)), None);
+}
+
+#[test]
+fn max_memory_restart_translates() {
+    let dir = tempfile::tempdir().expect("dir");
+    let t = translate(
+        &serde_json::json!({"name": "a", "script": "/bin/sh", "max_memory_restart": "200M"}),
+        &ctx(dir.path()),
+    )
+    .expect("translates");
+    assert_eq!(t.spec.policy.max_memory_bytes, Some(200 << 20));
+    assert!(
+        t.notes.iter().all(|n| n.field != "max_memory_restart"),
+        "{:?}",
+        t.notes
+    );
+    let bad = translate(
+        &serde_json::json!({"name": "a", "script": "/bin/sh", "max_memory_restart": "200MB"}),
+        &ctx(dir.path()),
+    )
+    .expect("translates");
+    assert!(
+        bad.notes
+            .iter()
+            .any(|n| n.field == "max_memory_restart" && n.severity == Severity::Fatal)
+    );
 }

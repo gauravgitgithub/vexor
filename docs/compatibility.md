@@ -81,7 +81,7 @@ Exit codes: 0 ok, 1 command failed, 2 usage error, 3 daemon unreachable, 4 parti
 
 Implemented in `crates/vexor-pm2` (4.1). `vexor check ecosystem.config.js` prints every finding without starting anything; `vexor start` refuses to start while any `fatal` finding remains, unless `--allow-unsupported`. Current classification (supersedes the table below where they differ):
 
-- **fatal** (until implemented): `exec_mode: cluster` on a non-Node script, `watch: true`, `max_memory_restart`, `cron_restart`, `uid`/`gid`/`username`, `increment_var`, `shutdown_with_message`, `.ts`/`.coffee` without `interpreter`, function/RegExp values, `wait_ready` on a non-Node app, malformed values.
+- **fatal** (until implemented): `exec_mode: cluster` on a non-Node script, `watch: true`, `cron_restart`, `uid`/`gid`/`username`, `increment_var`, `shutdown_with_message`, `.ts`/`.coffee` without `interpreter`, function/RegExp values, `wait_ready` on a non-Node app, malformed values.
 - **partial**: `merge_logs` (instances always share log files), `log_file` (no combined log), `listen_timeout` without `wait_ready`.
 - **ignored** (reported): PM2 Plus/monitoring fields, `namespace`, `pid_file`, `kill_retry_time`, `force`, `log_type`, `time`, `log_date_format`, `filter_env`, `windowsHide`, unknown fields.
 - `instances` without `exec_mode` runs N fork-mode processes (they can't share a port). `args`/`node_args` strings are split shell-style (quotes, backslashes) with no expansion. Environment: caller allowlist (or `--inherit-env`), then `env`, then `env_<NAME>`. Relative `cwd` resolves against the ecosystem file's directory and `script` against `cwd` (to confirm against PM2 in the conformance suite).
@@ -106,6 +106,7 @@ Implemented in `crates/vexor-pm2` (4.1). `vexor check ecosystem.config.js` print
 - `listen_timeout` expiry without a ready signal is a failed start (stopped, counted as unstable, restarted with backoff). PM2 marks the app online anyway.
 - `max_restarts: N` means at most N runs in a row that end before `min_uptime`, then errored, as in PM2 7 (verified by the conformance harness). `max_restarts: 0` in an ecosystem file means PM2's default, 16.
 - Graceful stop sends **SIGINT** by default, as PM2 does (verified); set `kill_signal` (e.g. `"SIGTERM"`) to change it. Leftover processes after a crash still get SIGTERM, then SIGKILL.
+- `max_memory_restart` (bytes, or K/M/G as in PM2): memory is checked every 5 s (PM2: every 30 s), so a leaking app is restarted sooner. As in PM2, the resident memory (RSS) of the instance's own process is measured (one worker in cluster mode), not its children, and one reading above the limit triggers a graceful restart. Each is recorded as a `memory_restart` event with the measured size. `vexor start --max-memory-restart 200M` for scripts.
 - `@pm2/io` metrics/actions are not collected.
 - Log rotation is built in and on by default: 10 MiB per file, 5 rotated files (PM2 needs `pm2-logrotate`, whose defaults are 10 MB and 30 files).
 - When an app writes output faster than the disk can take it, Vexor discards the excess by default and says so in the log and in a `log_dropped` event, so the app never waits on logging. `logs.overflow: block` makes the app wait instead (nothing lost).

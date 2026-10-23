@@ -230,10 +230,6 @@ const IGNORED: &[(&str, &str)] = &[
 /// Fields whose absence changes behaviour.
 const FATAL: &[(&str, &str)] = &[
     (
-        "max_memory_restart",
-        "memory-based restarts are not implemented yet (plan Phase 6)",
-    ),
-    (
         "cron_restart",
         "scheduled restarts are not implemented yet (plan Phase 6)",
     ),
@@ -288,6 +284,7 @@ const HANDLED: &[&str] = &[
     "append_env_to_name",
     "kill_signal",
     "name_prefix",
+    "max_memory_restart",
 ];
 
 /// Translate one PM2 app definition.
@@ -564,6 +561,17 @@ pub fn translate(app: &Value, ctx: &Context) -> Result<Translated, Vec<Note>> {
         },
         Some(_) => c.note("kill_signal", Severity::Fatal, "expected a signal name such as \"SIGTERM\""),
     }
+    match obj.get("max_memory_restart") {
+        None | Some(Value::Null) => {}
+        Some(v) => match parse_memory(v) {
+            Some(0) | None => c.note(
+                "max_memory_restart",
+                Severity::Fatal,
+                format!("expected bytes or a size like \"200M\" (K, M, G), got {v}"),
+            ),
+            Some(bytes) => policy.max_memory_bytes = Some(bytes),
+        },
+    }
     let wait_ready = obj.get("wait_ready").and_then(Value::as_bool) == Some(true);
     let listen_timeout = duration_ms(obj.get("listen_timeout"), "listen_timeout", &mut c);
     if wait_ready {
@@ -774,6 +782,25 @@ fn duration_ms(v: Option<&Value>, field: &str, c: &mut Ctx) -> Option<u64> {
             }
         },
         other => number(other, field, c),
+    }
+}
+
+/// PM2 memory sizes: bytes as a number or string, or a number followed by
+/// K, M or G (powers of 1024), e.g. "200M".
+pub fn parse_memory(v: &Value) -> Option<u64> {
+    match v {
+        Value::Number(n) => n.as_u64(),
+        Value::String(s) => {
+            let s = s.trim();
+            let (num, mult) = match s.chars().last()?.to_ascii_uppercase() {
+                'K' => (&s[..s.len() - 1], 1u64 << 10),
+                'M' => (&s[..s.len() - 1], 1 << 20),
+                'G' => (&s[..s.len() - 1], 1 << 30),
+                _ => (s, 1),
+            };
+            num.trim().parse::<u64>().ok()?.checked_mul(mult)
+        }
+        _ => None,
     }
 }
 

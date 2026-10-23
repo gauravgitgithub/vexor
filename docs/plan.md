@@ -63,6 +63,14 @@ Phase 5 done: dry run, backup, apply and rollback.
 ## Phase 6: hardening
 HTTP/TCP health checks, readiness-gated reload, max_memory_restart, watch, cron_restart, metrics endpoint, `doctor`, fault-injection suite, uid/gid review, Windows feasibility study.
 
+First the three settings that block migrations (and `vexor start` of ecosystem files) today:
+
+6.1 ✅ `max_memory_restart`: the shim reads each instance's resident memory (Linux `/proc/<pid>/statm`, macOS `proc_pidinfo`) every 5 s (`memory_check_interval_ms`) while it is online and not reloading, after checking the PID is still the process it started; above the limit, a graceful restart (counted as a restart, not a crash) and a `memory_restart` event with the measured size. Ecosystem `max_memory_restart` (bytes or K/M/G) is now supported; `vexor start --max-memory-restart`; shown in `describe` and `events`. Tested: RSS reader unit tests, size parsing and translation tests, shim tests (restarts over the limit repeatedly without a crash-loop error; leaves an app under the limit alone; cluster mode restarts only the worker over the limit).
+
+6.2 `cron_restart`.
+
+6.3 `watch`.
+
 ## Phase 6b: observability and alerting
 
 Goal: an advanced, self-hosted `pm2 monit`. Admins get warning, danger, and

@@ -175,6 +175,16 @@ pub fn print(status: &AppStatus, spec: &AppSpec, events: &[Value], show_env: boo
             }
         ),
     );
+    if let Some(limit) = p.max_memory_bytes {
+        row(
+            "Memory",
+            format!(
+                "restart above {} resident (checked every {})",
+                bytes(limit),
+                ms(p.memory_check_interval_ms)
+            ),
+        );
+    }
     row(
         "Readiness",
         match p.ready_timeout_ms {
@@ -258,5 +268,32 @@ mod tests {
         .expect("spec");
         assert_eq!(spec_json(&spec, false)["env"]["TOKEN"], "<redacted>");
         assert_eq!(spec_json(&spec, true)["env"]["TOKEN"], "secret");
+    }
+}
+
+/// Bytes in the largest whole binary unit: 200 MiB, 1.5 GiB.
+pub fn bytes(b: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
+    #[allow(clippy::cast_precision_loss)]
+    let mut v = b as f64;
+    let mut u = 0;
+    while v >= 1024.0 && u < UNITS.len() - 1 {
+        v /= 1024.0;
+        u += 1;
+    }
+    if u == 0 || (v.fract()).abs() < 0.05 {
+        format!("{v:.0} {}", UNITS[u])
+    } else {
+        format!("{v:.1} {}", UNITS[u])
+    }
+}
+
+#[cfg(test)]
+mod bytes_tests {
+    #[test]
+    fn sizes_read_naturally() {
+        assert_eq!(super::bytes(512), "512 B");
+        assert_eq!(super::bytes(200 << 20), "200 MiB");
+        assert_eq!(super::bytes(3 << 29), "1.5 GiB");
     }
 }

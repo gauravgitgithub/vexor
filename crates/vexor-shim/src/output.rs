@@ -65,6 +65,15 @@ pub enum ShimEvent<'a> {
         instance: u32,
         outcome: &'static str,
     },
+    /// The instance's resident memory was above `max_memory_bytes`; it is
+    /// being restarted.
+    MemoryRestart {
+        app: &'a str,
+        instance: u32,
+        pid: u32,
+        rss_bytes: u64,
+        limit_bytes: u64,
+    },
     SpawnError {
         app: &'a str,
         instance: u32,

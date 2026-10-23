@@ -888,7 +888,8 @@ fn max_memory_restart_checks_each_cluster_worker() {
 var big = process.env.NODE_APP_INSTANCE === '1' ? Buffer.alloc(150 * 1024 * 1024, 1) : null;
 console.log('worker ' + process.env.NODE_APP_INSTANCE + ' ' + (big ? 'big' : 'small'));
 process.send('ready');
-setInterval(function () {}, 1000);
+// Keep using the buffer, or the garbage collector frees it.
+setInterval(function () { if (big) { big[0] = big[1]; } }, 100);
 ";
     std::fs::write(shim.path("mem.js"), app).expect("write app");
     let spec = shim.spec(

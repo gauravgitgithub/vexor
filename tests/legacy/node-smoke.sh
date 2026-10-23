@@ -26,7 +26,7 @@ spec() {
   cat > "$D/$1.json" <<EOF
 {"name":"$1","exec":"$NODE","args":["-e","$2","arg one"],"cwd":"$D",
  "env":{"FOO":"bar baz"},"node_ipc":true,
- "logs":{"out":"$D/$1.out","err":"$D/$1.err"},"policy":$3 ${4:-}}
+ "logs":{"out":"$D/$1.out","err":"$D/$1.err","timestamps":false},"policy":$3 ${4:-}}
 EOF
 }
 
@@ -95,7 +95,7 @@ setInterval(function () {}, 1000);
 WORKER_END
 cat > "$D/cluster.json" <<CLUSTER_END
 {"name":"cl","exec":"$NODE","cwd":"$D","instances":2,"node_ipc":true,
- "logs":{"out":"$D/cl.out","err":"$D/cl.err"},"policy":{"ready_timeout_ms":5000},
+ "logs":{"out":"$D/cl.out","err":"$D/cl.err","timestamps":false},"policy":{"ready_timeout_ms":5000},
  "cluster":{"script":"$D/worker.js"}}
 CLUSTER_END
 "$VEXOR" shim --spec "$D/cluster.json" > "$D/cl.events" 2>&1 & pid=$!

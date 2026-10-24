@@ -1658,3 +1658,48 @@ fn migrate_dry_run_blocks_names_vexor_cannot_use() {
     assert_eq!(out.status.code(), Some(4));
     assert!(String::from_utf8_lossy(&out.stdout).contains("blocked: name"));
 }
+
+/// PM2 `sendSignal`, `flush` and `kill`.
+#[test]
+fn signal_flush_and_kill() {
+    let env = Env::new();
+    env.script(
+        "sig.sh",
+        "#!/bin/sh\ntrap 'echo got usr1' USR1\necho started\nwhile :; do sleep 0.1; done\n",
+    );
+    env.ok(&["start", "sig.sh", "--name", "sig"]);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !env
+        .ok(&["logs", "sig", "--raw", "--out"])
+        .contains("started")
+    {
+        assert!(Instant::now() < deadline, "never started");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let out = env.ok(&["signal", "USR1", "sig"]);
+    assert!(out.contains("sent USR1"), "{out}");
+    while !env
+        .ok(&["logs", "sig", "--raw", "--out"])
+        .contains("got usr1")
+    {
+        assert!(Instant::now() < deadline, "signal not received");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(env.run(&["signal", "BOGUS", "sig"]).status.code(), Some(1));
+
+    let out = env.ok(&["flush", "sig"]);
+    assert!(out.contains("flushed"), "{out}");
+    assert!(
+        !env.ok(&["logs", "sig", "--raw", "--out"])
+            .contains("got usr1")
+    );
+
+    env.ok(&["kill"]);
+    assert_eq!(env.app("sig")["desired"], "stopped");
+    // The daemon is gone: its socket stops answering.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while env.count("daemon_stopped") == 0 {
+        assert!(Instant::now() < deadline, "daemon still running");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}

@@ -1029,3 +1029,49 @@ fn crash_loop_alert_is_delivered_to_a_signed_webhook() {
     assert!(!shown.contains("s3cret-key"), "{shown}");
     assert!(shown.contains("<redacted>"), "{shown}");
 }
+
+/// Plan step 6b.7: settings.json turns on a Prometheus endpoint on
+/// loopback, which shows each instance; other paths are 404.
+#[test]
+fn prometheus_endpoint_serves_instance_metrics() {
+    let mut home = Home::new();
+    let port = free_port();
+    std::fs::write(
+        home.path("settings.json"),
+        json!({ "prometheus": { "listen": format!("127.0.0.1:{port}") } }).to_string(),
+    )
+    .expect("settings");
+    home.add_app(
+        "sleepy",
+        "/bin/sh",
+        &["-c", "exec sleep 60"],
+        json!({ "instances": 2, "policy": { "metrics_interval_ms": 200 } }),
+    );
+    home.start_daemon();
+    let addr: SocketAddr = ([127, 0, 0, 1], port).into();
+    let fetch = |path: &str| -> Option<String> {
+        let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).ok()?;
+        s.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+        write!(s, "GET {path} HTTP/1.1\r\nHost: t\r\n\r\n").ok()?;
+        let mut resp = String::new();
+        s.read_to_string(&mut resp).ok()?;
+        Some(resp)
+    };
+    let deadline = Instant::now() + TIMEOUT;
+    let body = loop {
+        if let Some(r) = fetch("/metrics")
+            && r.contains(r#"vexor_instance_memory_bytes{app="sleepy",instance="1"}"#)
+        {
+            break r;
+        }
+        assert!(Instant::now() < deadline, "endpoint never showed the app");
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    assert!(body.starts_with("HTTP/1.1 200 OK"), "{body}");
+    assert!(
+        body.contains(r#"vexor_instance_up{app="sleepy",instance="0"} 1"#),
+        "{body}"
+    );
+    assert!(body.contains("text/plain; version=0.0.4"), "{body}");
+    assert!(fetch("/").expect("response").starts_with("HTTP/1.1 404"));
+}

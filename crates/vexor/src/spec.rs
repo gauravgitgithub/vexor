@@ -287,6 +287,8 @@ fn build(args: &StartArgs, script: &Path, home: &Path) -> Result<AppSpec, String
         env,
         instances: args.instances.unwrap_or(1),
         instance_var: "NODE_APP_INSTANCE".to_owned(),
+        increment_var: None,
+        shutdown_with_message: false,
         node_ipc,
         treekill: true,
         policy,

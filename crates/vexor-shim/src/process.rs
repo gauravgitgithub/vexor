@@ -54,6 +54,9 @@ pub fn spawn_with(
         .envs(&spec.env);
     if let Some(i) = index {
         cmd.env(&spec.instance_var, i.to_string());
+        if let Some((var, value)) = spec.incremented(i) {
+            cmd.env(var, value);
+        }
     }
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -155,6 +158,16 @@ impl IpcChannel {
             reader: BufReader::new(stream),
             buf: Vec::new(),
         }
+    }
+
+    /// Send the message `'shutdown'` (PM2 `shutdown_with_message`). False
+    /// if it could not be written at once (channel closed or full).
+    pub fn send_shutdown(&self) -> bool {
+        const MSG: &[u8] = b"\"shutdown\"\n";
+        self.reader
+            .get_ref()
+            .try_write(MSG)
+            .is_ok_and(|n| n == MSG.len())
     }
 
     /// Next message, or `None` once the app closes the channel.

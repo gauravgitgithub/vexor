@@ -195,6 +195,9 @@ pub enum Request {
     Alerts,
     /// Send a test alert to every configured channel now (plan 6b.4).
     AlertsTest,
+    /// Stop the daemon (apps are left as they are; `vexor kill` stops them
+    /// first).
+    Shutdown,
     /// Stored resource history of one app (plan 6b.2).
     Metrics {
         app: String,

@@ -191,6 +191,32 @@ fn each_instance_gets_its_index() {
     assert_eq!(lines, ["i=0", "i=1", "i=2"]);
 }
 
+/// PM2 `increment_var`: each instance gets the base value plus its index.
+#[test]
+fn increment_var_raises_the_variable_per_instance() {
+    let shim = Shim::new();
+    let extra = json!({
+        "instances": 3,
+        "env": { "PATH": "/usr/bin:/bin", "PORT": "3000" },
+        "increment_var": "PORT",
+        "policy": { "autorestart": false },
+    });
+    let done = shim.run(&shim.spec("/bin/sh", &["-c", "echo port=$PORT"], extra));
+    assert_eq!(done.code, Some(0), "{}", done.stderr);
+    let mut lines: Vec<_> = shim.out_log().lines().map(str::to_owned).collect();
+    lines.sort();
+    assert_eq!(lines, ["port=3000", "port=3001", "port=3002"]);
+}
+
+#[test]
+fn increment_var_must_name_a_number_in_env() {
+    let shim = Shim::new();
+    let extra = json!({ "env": { "PORT": "web" }, "increment_var": "PORT" });
+    let done = shim.run(&shim.spec("/bin/true", &[], extra));
+    assert_eq!(done.code, Some(2), "{}", done.stderr);
+    assert!(done.stderr.contains("increment_var"), "{}", done.stderr);
+}
+
 #[test]
 fn stderr_goes_to_the_error_log() {
     let shim = Shim::new();
@@ -708,6 +734,76 @@ fn cluster_spec(shim: &Shim, node: &str, port: u16, extra: Value) -> PathBuf {
     });
     merge(&mut base, extra);
     shim.spec(node, &[], base)
+}
+
+/// Cluster mode: the primary passes `increment_var` to each worker.
+#[test]
+fn cluster_workers_get_incremented_variables() {
+    let Some(node) = node() else { return };
+    let shim = Shim::new();
+    std::fs::write(
+        shim.path("slot.js"),
+        "console.log('slot ' + process.env.SLOT); process.send('ready'); setInterval(function () {}, 1000);",
+    )
+    .expect("write app");
+    let spec = shim.spec(
+        &node,
+        &[],
+        json!({
+            "instances": 2,
+            "node_ipc": true,
+            "env": { "PATH": "/usr/bin:/bin", "SLOT": "100" },
+            "increment_var": "SLOT",
+            "policy": { "ready_timeout_ms": 10000 },
+            "cluster": { "script": shim.path("slot.js") },
+        }),
+    );
+    let child = shim.start(&spec);
+    let started = Instant::now();
+    shim.wait_for_output("slot 101");
+    shim.wait_for_output("slot 100");
+    kill(child.id(), "TERM");
+    finish(child, started);
+}
+
+const SHUTDOWN_APP: &str = "process.on('SIGINT', function () { console.log('sigint'); process.exit(0); });
+process.on('message', function (m) { if (m === 'shutdown') { console.log('got shutdown'); process.exit(0); } });
+console.log('up'); process.send('ready'); setInterval(function () {}, 1000);";
+
+/// PM2 `shutdown_with_message`: a stop sends 'shutdown' over IPC, in
+/// fork and in cluster mode, instead of SIGINT.
+#[test]
+fn shutdown_with_message_stops_by_message() {
+    let Some(node) = node() else { return };
+    for cluster in [false, true] {
+        let shim = Shim::new();
+        std::fs::write(shim.path("app.js"), SHUTDOWN_APP).expect("write app");
+        let mut extra = json!({
+            "node_ipc": true,
+            "shutdown_with_message": true,
+            "policy": { "ready_timeout_ms": 10000, "kill_timeout_ms": 5000 },
+        });
+        let script = shim.path("app.js").to_string_lossy().into_owned();
+        let args: Vec<&str> = if cluster {
+            extra["cluster"] = json!({ "script": script });
+            vec![]
+        } else {
+            vec![script.as_str()]
+        };
+        let child = shim.start(&shim.spec(&node, &args, extra));
+        let started = Instant::now();
+        shim.wait_for_output("up");
+        let stopping = Instant::now();
+        kill(child.id(), "TERM");
+        finish(child, started);
+        let log = shim.out_log();
+        assert!(log.contains("got shutdown"), "cluster={cluster}: {log}");
+        assert!(!log.contains("sigint"), "cluster={cluster}: {log}");
+        assert!(
+            stopping.elapsed() < Duration::from_secs(4),
+            "cluster={cluster}: stopped by the message, not by SIGKILL after kill_timeout"
+        );
+    }
 }
 
 #[test]

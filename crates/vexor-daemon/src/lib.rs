@@ -10,6 +10,7 @@ mod events;
 mod follower;
 mod log;
 mod notify;
+mod prometheus;
 mod state;
 
 use std::collections::BTreeMap;
@@ -148,6 +149,7 @@ async fn run_async(home: PathBuf) -> i32 {
         alerts: StdMutex::new(AlertState::default()),
         notifier: notifier(&events, &log),
         host: notify::hostname(),
+        settings_warnings: StdMutex::new(Vec::new()),
     });
     for (name, entry) in entries {
         if let Err(e) = daemon.follow(&name, &entry) {
@@ -163,6 +165,7 @@ async fn run_async(home: PathBuf) -> i32 {
 
     let server = tokio::spawn(serve(listener, daemon.clone()));
     let alerting = tokio::spawn(alert_loop(daemon.clone()));
+    let exporter = tokio::spawn(prometheus_loop(daemon.clone()));
     // Stopping the daemon leaves shims and apps running.
     tokio::select! {
         _ = term.recv() => {}
@@ -170,6 +173,7 @@ async fn run_async(home: PathBuf) -> i32 {
     }
     server.abort();
     alerting.abort();
+    exporter.abort();
     let _ = std::fs::remove_file(home.join(SOCKET));
     log.write(json!({ "type": "daemon_stopped" }));
     exit::OK
@@ -187,6 +191,8 @@ struct Daemon {
     /// Alert delivery; `None` if its thread could not start.
     notifier: Option<notify::Notifier>,
     host: String,
+    /// Problems with settings.json (Prometheus endpoint), for every response.
+    settings_warnings: StdMutex<Vec<String>>,
 }
 
 /// Alert evaluation (plan 6b.3): rules from `alerts.json`, re-read when it
@@ -334,6 +340,117 @@ async fn alert_loop(daemon: Arc<Daemon>) {
             line["app"] = json!(change.key.app);
             daemon.log.write(line);
         }
+    }
+}
+
+/// Serve the Prometheus endpoint configured in settings.json, re-reading
+/// it every few seconds; a listener that could not bind is retried.
+async fn prometheus_loop(daemon: Arc<Daemon>) {
+    let path = daemon.home.join(prometheus::SETTINGS);
+    let mut loaded: Option<Option<std::time::SystemTime>> = None;
+    let mut server: Option<(std::net::SocketAddr, tokio::task::JoinHandle<()>)> = None;
+    let mut tick = tokio::time::interval(ALERT_EVERY);
+    loop {
+        tick.tick().await;
+        let modified = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+        if loaded == Some(modified) {
+            continue;
+        }
+        loaded = Some(modified);
+        let mut warnings = Vec::new();
+        let parsed = match modified {
+            None => Ok(prometheus::Settings::default()),
+            Some(_) => std::fs::read_to_string(&path)
+                .map_err(|e| e.to_string())
+                .and_then(|t| prometheus::Settings::parse(&t)),
+        };
+        let want = match parsed {
+            Ok(s) => s.prometheus.and_then(|p| p.addr().ok()),
+            Err(e) => {
+                warnings.push(format!(
+                    "{} is invalid, keeping the previous settings: {e}",
+                    path.display()
+                ));
+                server.as_ref().map(|s| s.0)
+            }
+        };
+        if server.as_ref().map(|s| s.0) != want {
+            if let Some((_, task)) = server.take() {
+                task.abort();
+            }
+            if let Some(addr) = want {
+                match tokio::net::TcpListener::bind(addr).await {
+                    Ok(l) => {
+                        daemon.log.write(
+                            json!({ "type": "prometheus_listening", "addr": addr.to_string() }),
+                        );
+                        server = Some((addr, tokio::spawn(serve_metrics(l, daemon.clone()))));
+                    }
+                    Err(e) => {
+                        warnings.push(format!("Prometheus endpoint: cannot listen on {addr}: {e}"));
+                        loaded = None;
+                    }
+                }
+            }
+        }
+        if let Some((addr, _)) = &server
+            && !prometheus::is_loopback(addr)
+        {
+            warnings.push(format!(
+                "the Prometheus endpoint listens on {addr}: other machines can read it, without authentication"
+            ));
+        }
+        *daemon
+            .settings_warnings
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = warnings;
+    }
+}
+
+async fn serve_metrics(listener: tokio::net::TcpListener, daemon: Arc<Daemon>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    loop {
+        let Ok((mut stream, _)) = listener.accept().await else {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            continue;
+        };
+        let daemon = daemon.clone();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 8192];
+            let mut len = 0;
+            // The request head, within 5 s and 8 KiB.
+            let read = tokio::time::timeout(REQUEST_TIMEOUT, async {
+                while len < buf.len() {
+                    let n = stream.read(&mut buf[len..]).await.ok()?;
+                    if n == 0 {
+                        break;
+                    }
+                    len += n;
+                    if buf[..len].windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                Some(())
+            })
+            .await;
+            if !matches!(read, Ok(Some(()))) {
+                return;
+            }
+            let head = String::from_utf8_lossy(&buf[..len]);
+            let target = head.lines().next().unwrap_or("");
+            let (status, body) = if target.starts_with("GET /metrics ") || target == "GET /metrics"
+            {
+                ("200 OK", daemon.prometheus_text().await)
+            } else {
+                ("404 Not Found", "Not found: try /metrics\n".to_owned())
+            };
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.shutdown().await;
+        });
     }
 }
 
@@ -533,6 +650,45 @@ impl Daemon {
         out
     }
 
+    async fn prometheus_text(&self) -> String {
+        let apps: Vec<(String, Desired)> = {
+            let store = self.store.lock().await;
+            store
+                .apps()
+                .iter()
+                .map(|(k, v)| (k.clone(), v.desired))
+                .collect()
+        };
+        let views: Vec<prometheus::AppView> = apps
+            .into_iter()
+            .map(|(name, desired)| {
+                let live = self.live(&name).unwrap_or_default();
+                prometheus::AppView {
+                    running: desired == Desired::Running && live.shim_pid().is_some(),
+                    snapshot: live.snapshot(),
+                    metrics: live.metrics(),
+                    name,
+                }
+            })
+            .collect();
+        let open: Vec<(String, String, String)> = {
+            let st = self.alerts.lock().unwrap_or_else(PoisonError::into_inner);
+            st.engine
+                .open()
+                .into_iter()
+                .map(|o| {
+                    let level = if o.level == alerts::Level::Danger {
+                        "danger"
+                    } else {
+                        "warning"
+                    };
+                    (o.key.app, o.key.metric.name().to_owned(), level.to_owned())
+                })
+                .collect()
+        };
+        prometheus::render(&views, &open, describe_now_ms())
+    }
+
     fn alert_of(&self, c: &alerts::Change) -> notify::Alert {
         notify::Alert {
             app: c.key.app.clone(),
@@ -550,6 +706,13 @@ impl Daemon {
     fn alerts_response(&self, recent: Vec<Value>) -> Response {
         let st = self.alerts.lock().unwrap_or_else(PoisonError::into_inner);
         let mut warnings = self.events.warnings();
+        warnings.extend(
+            self.settings_warnings
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .iter()
+                .cloned(),
+        );
         warnings.extend(st.error.clone());
         warnings.extend(st.risks.iter().cloned());
         if let Some(n) = &self.notifier {
@@ -576,10 +739,15 @@ impl Daemon {
     }
 
     fn ok(&self, apps: Vec<AppStatus>) -> Response {
-        Response::Ok {
-            apps,
-            warnings: self.events.warnings(),
-        }
+        let mut warnings = self.events.warnings();
+        warnings.extend(
+            self.settings_warnings
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .iter()
+                .cloned(),
+        );
+        Response::Ok { apps, warnings }
     }
 
     fn ok_one(&self, status: Option<AppStatus>) -> Response {
@@ -680,6 +848,18 @@ impl Daemon {
                     Ok(Err(e)) => error(ErrorCode::Internal, e),
                     Err(e) => error(ErrorCode::Internal, e.to_string()),
                 }
+            }
+            Request::Shutdown => {
+                self.log.write(json!({ "type": "shutdown_requested" }));
+                // After this answer is sent; the signal handler shuts down.
+                tokio::spawn(async {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    let _ = rustix::process::kill_process(
+                        rustix::process::getpid(),
+                        rustix::process::Signal::TERM,
+                    );
+                });
+                self.ok(Vec::new())
             }
             Request::AlertsTest => {
                 let channels = {

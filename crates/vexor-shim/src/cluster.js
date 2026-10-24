@@ -74,6 +74,9 @@
     if (msg.cmd === 'spawn') {
       var env = {};
       env[config.instance_var] = String(msg.instance);
+      if (config.increment) {
+        env[config.increment.var] = String(Number(config.increment.base) + msg.instance);
+      }
       try {
         var w = cluster.fork(env);
         workers[msg.id] = w;
@@ -90,6 +93,15 @@
           // Already gone; its exit event follows.
         }
       }
+    } else if (msg.cmd === 'message') {
+      var w = workers[msg.id];
+      if (w) {
+        try {
+          w.send('shutdown');
+        } catch (e) {
+          // Already gone; its exit event follows.
+        }
+      }
     } else if (msg.cmd === 'retire') {
       // Graceful retirement (reload): stop routing new connections to the
       // worker and let in-flight ones finish (worker.disconnect closes its
@@ -97,7 +109,14 @@
       // kill_timeout.
       var old = workers[msg.id];
       var stopSignal = msg.signal || 'SIGINT';
-      if (old) {
+      if (old && msg.message) {
+        // shutdown_with_message: the app closes its servers itself.
+        try {
+          old.send('shutdown');
+        } catch (e) {
+          old.process.kill(stopSignal);
+        }
+      } else if (old) {
         old.once('disconnect', function () {
           try {
             old.process.kill(stopSignal);

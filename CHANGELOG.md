@@ -3,6 +3,25 @@
 All notable changes to Vexor. Versions follow [Semantic Versioning](https://semver.org/);
 before 1.0, minor versions may include breaking changes, which are listed here.
 
+## Unreleased
+
+### Added
+- PM2 commands: `vexor flush [app]` empties log files, `vexor signal
+  <SIG> <app>` (alias `send-signal`) signals every running instance
+  (identity-checked, so a reused PID is never hit), and `vexor kill`
+  stops every app and then the daemon.
+- PM2 `increment_var`: each instance gets the variable's value plus its
+  index (`PORT=3000` gives 3000, 3001, ...), in fork and cluster mode.
+  Ecosystem files using it no longer stop a migration.
+- PM2 `shutdown_with_message`: stopping, restarting or reloading sends the
+  app the message `'shutdown'` (fork and cluster mode) instead of a
+  signal; SIGKILL still follows after `kill_timeout`.
+- Prometheus endpoint: `{"prometheus": {"listen": "127.0.0.1:9615"}}` in
+  `settings.json` serves per-instance up/state, restarts, uptime, CPU,
+  memory, open files and health, plus open alerts, at `/metrics`. Off by
+  default; warned about when it listens beyond loopback. See
+  docs/prometheus.md.
+
 ## 0.7.0 (2026-10-24, prerelease)
 
 ### Fixed

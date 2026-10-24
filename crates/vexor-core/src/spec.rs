@@ -62,6 +62,25 @@ pub struct AppSpec {
     /// starting counts as ready.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health_check: Option<HealthCheckSpec>,
+    /// PM2 `increment_var`: this variable of `env` (an integer) is raised
+    /// by the instance index in each instance (PORT=3000 gives 3000,
+    /// 3001, ...).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub increment_var: Option<String>,
+    /// PM2 `shutdown_with_message`: a graceful stop sends the message
+    /// `'shutdown'` over the Node IPC channel instead of a signal (SIGKILL
+    /// still follows after `kill_timeout`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub shutdown_with_message: bool,
+}
+
+impl AppSpec {
+    /// `increment_var`'s name and the value instance `index` gets.
+    pub fn incremented(&self, index: u32) -> Option<(&str, String)> {
+        let var = self.increment_var.as_deref()?;
+        let base: u64 = self.env.get(var)?.trim().parse().ok()?;
+        Some((var, (base + u64::from(index)).to_string()))
+    }
 }
 
 /// A health check against the app. Only loopback addresses are allowed.

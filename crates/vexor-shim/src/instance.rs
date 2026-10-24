@@ -513,7 +513,7 @@ impl Runner {
                     }
                 }
             }
-            Effect::SignalStop => self.signal_current(self.kill_signal()),
+            Effect::SignalStop => self.stop_current(),
             Effect::ForceKill => self.signal_current(Signal::KILL),
             Effect::ArmTimer {
                 timer,
@@ -566,8 +566,9 @@ impl Runner {
             }
             self.cur_worker = self.rep_worker.take();
         } else {
+            let old_ipc = self.cur_ipc.take();
             if let (Some(child), Some(old)) = (self.cur_child.take(), self.cur_fork.take()) {
-                self.retire_child(child, old.pid);
+                self.retire_child(child, old.pid, old_ipc);
             }
             self.cur_ipc = self.rep_ipc.take();
             self.cur_child = self.rep_child.take();
@@ -589,9 +590,9 @@ impl Runner {
                 self.abandoned.insert(w.wid);
             }
         }
-        self.rep_ipc = None;
+        let rep_ipc = self.rep_ipc.take();
         if let (Some(child), Some(f)) = (self.rep_child.take(), self.rep_fork.take()) {
-            self.retire_child(child, f.pid);
+            self.retire_child(child, f.pid, rep_ipc);
         }
         self.out.emit(&ShimEvent::Reload {
             app: &self.spec.name,
@@ -600,9 +601,17 @@ impl Runner {
         });
     }
 
-    /// Stop a forked process gracefully in the background: SIGTERM, then
-    /// SIGKILL after `kill_timeout`, then clear its process group.
-    fn retire_child(&mut self, mut child: tokio::process::Child, pid: u32) {
+    /// Stop a forked process gracefully in the background: the stop signal
+    /// (or the `'shutdown'` message), then SIGKILL after `kill_timeout`,
+    /// then clear its process group.
+    fn retire_child(
+        &mut self,
+        mut child: tokio::process::Child,
+        pid: u32,
+        ipc: Option<IpcChannel>,
+    ) {
+        let messaged =
+            self.spec.shutdown_with_message && ipc.as_ref().is_some_and(IpcChannel::send_shutdown);
         let treekill = self.spec.treekill;
         let kill_timeout = self.inst.policy().kill_timeout;
         let stop_signal = self.kill_signal();
@@ -615,7 +624,11 @@ impl Runner {
             };
         };
         self.retiring.push(tokio::spawn(async move {
-            signal(stop_signal);
+            // Keep the channel open while the app shuts down.
+            let _ipc = ipc;
+            if !messaged {
+                signal(stop_signal);
+            }
             if tokio::time::timeout(kill_timeout, child.wait())
                 .await
                 .is_err()
@@ -640,8 +653,9 @@ impl Runner {
         let c = c.clone();
         let kill_timeout = self.inst.policy().kill_timeout;
         let stop_signal = self.kill_signal();
+        let message = self.spec.shutdown_with_message;
         self.retiring.push(tokio::spawn(async move {
-            c.retire(wid, stop_signal);
+            c.retire(wid, stop_signal, message);
             tokio::time::sleep(kill_timeout).await;
             // Ignored by the primary if the worker is already gone.
             c.signal(wid, Signal::KILL);
@@ -683,6 +697,23 @@ impl Runner {
             exec: &self.spec.exec,
             error,
         });
+    }
+
+    /// Graceful stop of the current process: the `'shutdown'` message when
+    /// configured and possible, else the stop signal.
+    fn stop_current(&self) {
+        if self.spec.shutdown_with_message {
+            if let Some((c, _)) = &self.cluster {
+                if let Some(w) = self.cur_worker.filter(|w| w.pid.is_some()) {
+                    c.message_shutdown(w.wid);
+                }
+                return;
+            }
+            if self.cur_ipc.as_ref().is_some_and(IpcChannel::send_shutdown) {
+                return;
+            }
+        }
+        self.signal_current(self.kill_signal());
     }
 
     fn signal_current(&self, sig: Signal) {

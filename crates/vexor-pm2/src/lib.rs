@@ -231,14 +231,6 @@ const FATAL: &[(&str, &str)] = &[
     ("uid", "running as another user is not supported yet"),
     ("gid", "running as another group is not supported yet"),
     ("username", "running as another user is not supported yet"),
-    (
-        "increment_var",
-        "per-instance variable increments are not implemented yet",
-    ),
-    (
-        "shutdown_with_message",
-        "shutdown via process message is not implemented yet; the app would get SIGTERM instead",
-    ),
 ];
 
 /// Every field this translator knows, for unknown-field reporting.
@@ -271,6 +263,8 @@ const HANDLED: &[&str] = &[
     "combine_logs",
     "disable_logs",
     "instance_var",
+    "increment_var",
+    "shutdown_with_message",
     "treekill",
     "watch",
     "ignore_watch",
@@ -586,6 +580,15 @@ pub fn translate(app: &Value, ctx: &Context) -> Result<Translated, Vec<Note>> {
     );
     let wait_ready = obj.get("wait_ready").and_then(Value::as_bool) == Some(true);
     let listen_timeout = duration_ms(obj.get("listen_timeout"), "listen_timeout", &mut c);
+    let shutdown_with_message =
+        obj.get("shutdown_with_message").and_then(Value::as_bool) == Some(true);
+    if shutdown_with_message && !node_ipc {
+        c.note(
+            "shutdown_with_message",
+            Severity::Fatal,
+            "shutdown_with_message needs a Node.js app (it gets process.on('message'))",
+        );
+    }
     if wait_ready {
         if !node_ipc {
             c.note(
@@ -695,6 +698,11 @@ pub fn translate(app: &Value, ctx: &Context) -> Result<Translated, Vec<Note>> {
         cron_restart,
         watch,
         health_check,
+        increment_var: obj
+            .get("increment_var")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        shutdown_with_message,
     };
     let autostart = obj
         .get("autostart")

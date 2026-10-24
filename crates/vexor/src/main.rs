@@ -7,6 +7,7 @@ mod describe;
 mod logs;
 mod metrics;
 mod migrate;
+mod ops;
 mod spec;
 mod startup;
 mod ui;
@@ -118,6 +119,21 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Empty apps' log files and remove rotated ones (PM2 `flush`).
+    Flush {
+        /// One app (default: all).
+        target: Option<String>,
+    },
+    /// Send a signal to every running instance of an app (PM2 `sendSignal`).
+    #[command(visible_alias = "send-signal")]
+    Signal {
+        /// HUP, INT, QUIT, KILL, USR1, USR2, TERM, CONT, STOP or WINCH.
+        signal: String,
+        target: String,
+    },
+    /// Stop every app, then the daemon (PM2 `kill`). `vexor start`
+    /// brings the daemon back.
+    Kill,
     /// Show open alert incidents, recent alerts and the rules in force.
     Alerts {
         #[command(subcommand)]
@@ -460,6 +476,24 @@ fn main() -> ExitCode {
                 ))
             } else {
                 migrate_cmd(&home, pm2_home, dump, backup, json, env_names, verbose)
+            }
+        }
+        Command::Flush { target } => ops::flush(&home, target),
+        Command::Signal { signal, target } => ops::signal(&home, &signal, target),
+        Command::Kill => {
+            let stopped = send(
+                &home,
+                Request::Stop {
+                    target: Target::All,
+                },
+                false,
+            );
+            match client::request(&home, &Request::Shutdown) {
+                Ok(_) => {
+                    println!("{} daemon stopped", ui::ok_mark());
+                    stopped
+                }
+                Err(e) => fail(&e),
             }
         }
         Command::Alerts { action, json } => match action {
@@ -872,7 +906,10 @@ fn check(
 type Described = (AppStatus, Box<vexor_core::AppSpec>, Vec<serde_json::Value>);
 
 /// On failure: (exit code, message).
-fn describe_app(home: &std::path::Path, name: String) -> Result<Described, (u8, String)> {
+pub(crate) fn describe_app(
+    home: &std::path::Path,
+    name: String,
+) -> Result<Described, (u8, String)> {
     match client::request(home, &Request::Describe { name }) {
         Ok(Response::Describe {
             status,
@@ -1398,7 +1435,7 @@ fn migrate_cmd(
     }
 }
 
-fn fail(msg: &str) -> ExitCode {
+pub(crate) fn fail(msg: &str) -> ExitCode {
     eprintln!("vexor: {msg}");
     ExitCode::from(code::FAILED)
 }

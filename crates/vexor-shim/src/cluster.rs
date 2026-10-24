@@ -63,8 +63,11 @@ enum Cmd {
         instance: u32,
     },
     Signal(u32, Signal),
-    /// Graceful retirement: disconnect, then SIGTERM (see cluster.js).
-    Retire(u32, Signal),
+    /// Send worker `wid` the message `'shutdown'`.
+    Message(u32),
+    /// Graceful retirement: disconnect, then the signal; or with the flag,
+    /// the message `'shutdown'` (see cluster.js).
+    Retire(u32, Signal, bool),
     Shutdown(oneshot::Sender<()>),
 }
 
@@ -120,8 +123,13 @@ impl Cluster {
 
     /// Stop routing connections to worker `wid`, let in-flight ones finish,
     /// then SIGTERM it.
-    pub fn retire(&self, wid: u32, sig: Signal) {
-        let _ = self.tx.send(Cmd::Retire(wid, sig));
+    pub fn retire(&self, wid: u32, sig: Signal, message: bool) {
+        let _ = self.tx.send(Cmd::Retire(wid, sig, message));
+    }
+
+    /// Ask worker `wid` to shut down with the message `'shutdown'`.
+    pub fn message_shutdown(&self, wid: u32) {
+        let _ = self.tx.send(Cmd::Message(wid));
     }
 
     /// Stop the primary (its workers must already have been stopped).
@@ -165,8 +173,14 @@ impl Actor {
                     Some(Cmd::Subscribe(id, tx)) => { self.subscribers.insert(id, tx); }
                     Some(Cmd::Spawn { wid, instance }) => self.spawn(wid, instance).await,
                     Some(Cmd::Signal(id, sig)) => self.signal(id, sig).await,
-                    Some(Cmd::Retire(id, sig)) => {
-                        let msg = json!({ "cmd": "retire", "id": id, "signal": signal_name(sig) });
+                    Some(Cmd::Message(id)) => {
+                        let msg = json!({ "cmd": "message", "id": id });
+                        if self.live.contains(&id) && !self.send(&msg).await {
+                            self.primary_gone().await;
+                        }
+                    }
+                    Some(Cmd::Retire(id, sig, message)) => {
+                        let msg = json!({ "cmd": "retire", "id": id, "signal": signal_name(sig), "message": message });
                         if self.live.contains(&id) && !self.send(&msg).await
                         {
                             self.primary_gone().await;
@@ -239,6 +253,7 @@ impl Actor {
             "args": cluster.args,
             "node_args": cluster.node_args,
             "instance_var": self.spec.instance_var,
+            "increment": self.spec.incremented(0).map(|(var, base)| json!({ "var": var, "base": base })),
         });
         let args = vec!["-e".to_owned(), PRIMARY_JS.to_owned(), config.to_string()];
         let s = process::spawn_with(&self.spec, &args, None, true, &self.out, &self.err)?;

@@ -97,6 +97,7 @@ vexor reload app                   # new processes first, then retire the old
 vexor describe app                 # configuration, status, recent events
 vexor metrics app --since 6h       # CPU, memory, restarts over time
 vexor alerts                       # open incidents and alert rules
+vexor signal SIGUSR2 app           # PM2 sendSignal; also flush, kill
 vexor startup                      # start at boot (systemd, launchd)
 ```
 
@@ -234,8 +235,7 @@ without cluster mode or log management.
 
 For most setups, yes: the same ecosystem files and commands work. Run
 `vexor check ecosystem.config.js` to see any setting Vexor handles
-differently or doesn't support; today that is `uid`/`gid`, `increment_var`
-and `shutdown_with_message`. Differences are documented in
+differently or doesn't support; today that is `uid`/`gid`. Differences are documented in
 [docs/compatibility.md](docs/compatibility.md) and checked against PM2 7 in
 [docs/conformance.md](docs/conformance.md).
 

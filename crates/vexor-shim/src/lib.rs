@@ -128,6 +128,16 @@ pub fn validate(spec: &AppSpec) -> Result<(), String> {
     if spec.instance_var.is_empty() || spec.instance_var.contains('=') {
         return Err("`instance_var` must be a non-empty name without '='".into());
     }
+    if let Some(var) = &spec.increment_var
+        && spec.incremented(0).is_none()
+    {
+        return Err(format!(
+            "`increment_var` {var:?} must name a variable of `env` holding a whole number"
+        ));
+    }
+    if spec.shutdown_with_message && !spec.node_ipc && spec.cluster.is_none() {
+        return Err("`shutdown_with_message` needs the Node IPC channel (`node_ipc`)".into());
+    }
     if let Some(c) = &spec.cron_restart {
         cron::parse(c)?;
     }

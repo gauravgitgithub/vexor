@@ -125,14 +125,21 @@ fn behaviour_changing_fields_are_fatal() {
         "uid": "www",
         "exec_mode": "cluster",
         "shutdown_with_message": true,
-        "increment_var": "PORT",
     }));
     let mut f = fatal(&t.notes);
     f.sort_unstable();
-    assert_eq!(
-        f,
-        ["exec_mode", "increment_var", "shutdown_with_message", "uid",]
-    );
+    assert_eq!(f, ["exec_mode", "shutdown_with_message", "uid",]);
+}
+
+#[test]
+fn increment_var_is_translated() {
+    let t = tr(json!({
+        "name": "a", "script": "/bin/sleep", "instances": 3,
+        "env": { "PORT": "3000" }, "increment_var": "PORT",
+    }));
+    assert!(fatal(&t.notes).is_empty(), "{:?}", t.notes);
+    assert_eq!(t.spec.increment_var.as_deref(), Some("PORT"));
+    assert_eq!(t.spec.incremented(2), Some(("PORT", "3002".to_owned())));
 }
 
 #[test]

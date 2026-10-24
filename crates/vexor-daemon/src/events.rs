@@ -949,20 +949,27 @@ mod tests {
         let ev = Events::open(dir.path());
         let now = base();
         let start = now - 24 * 3_600_000 + 60_000;
-        // A day of 5 s samples (17,280), in rounds like the daemon's.
-        for chunk in (0..17_280u64).collect::<Vec<_>>().chunks(500) {
-            for &i in chunk {
-                ev.record_metrics(
-                    "web",
-                    vec![sample(0, 1, start + i * 5_000, Some(1.0), 1 << 20)],
-                );
-            }
-            std::thread::sleep(Duration::from_millis(5));
+        // A day of 5 s samples (17,280), 500 per message so the bounded
+        // queue never drops any.
+        let all: Vec<u64> = (0..17_280).collect();
+        for chunk in all.chunks(500) {
+            let samples = chunk
+                .iter()
+                .map(|&i| sample(0, 1, start + i * 5_000, Some(1.0), 1 << 20))
+                .collect();
+            ev.record_metrics("web", samples);
         }
-        wait_points(&ev, now - 600_000, now, 100);
-        // Wait until the writer has caught up with the last sample.
+        // Wait until the writer has stored the last sample (slow in debug
+        // builds on small CI runners).
         let last = start + 17_279 * 5_000;
-        wait_points(&ev, last, last, 1);
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while ev.metrics("web", last, last).expect("q").1.is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "metrics never arrived"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
         let t = std::time::Instant::now();
         let (width, points) = ev.metrics("web", now - 24 * 3_600_000, now).expect("q");
         let took = t.elapsed();

@@ -3,6 +3,22 @@
 All notable changes to Vexor. Versions follow [Semantic Versioning](https://semver.org/);
 before 1.0, minor versions may include breaking changes, which are listed here.
 
+## Unreleased
+
+### Added
+- Live resource metrics: each shim samples its instances every 5 s
+  (`metrics_interval_ms`, 0 = off): CPU over the interval, memory, open
+  files and the latest health result. `vexor describe` shows them in a new
+  Resources section; `list --json` and `describe --json` include them.
+  Sampling 100 apps costs under 1% of one core.
+
+### Changed
+- `vexor ls` CPU is the load over the last 5 s. Before, on Linux it was the
+  average over the process's whole life, so an app that had been running
+  for a while showed close to 0% even when busy.
+- Shim protocol 2. Shims started by an older Vexor keep working after an
+  upgrade (without metrics; `ls` falls back to `ps` for them).
+
 ## 0.3.1 (2026-10-23, prerelease)
 
 Benchmarked against PM2, OxMgr and forever (results and charts in the

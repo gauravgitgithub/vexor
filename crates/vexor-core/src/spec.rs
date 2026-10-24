@@ -316,6 +316,9 @@ pub struct PolicySpec {
     pub max_memory_bytes: Option<u64>,
     /// How often memory is checked while `max_memory_bytes` is set.
     pub memory_check_interval_ms: u64,
+    /// How often the shim samples CPU, memory and open files of each
+    /// instance for `list`/`describe`; 0 turns sampling off.
+    pub metrics_interval_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -401,6 +404,7 @@ impl Default for PolicySpec {
             kill_signal: KillSignal::Int,
             max_memory_bytes: None,
             memory_check_interval_ms: 5_000,
+            metrics_interval_ms: 5_000,
         }
     }
 }

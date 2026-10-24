@@ -1078,11 +1078,24 @@ fn usage(pids: &[u64]) -> std::collections::HashMap<u64, (f64, u64)> {
 
 fn print_table(apps: &[AppStatus]) {
     let now = describe::now_ms();
+    // The shims' samples (CPU over the last interval); `ps` only for
+    // processes without a full one yet, or under a shim that predates them.
+    let sampled: std::collections::HashMap<u64, &vexor_proto::InstanceMetrics> = apps
+        .iter()
+        .flat_map(|a| a.metrics.iter().map(|m| (u64::from(m.pid), m)))
+        .collect();
     let pids: Vec<u64> = apps
         .iter()
         .flat_map(|a| a.snapshot.iter().filter_map(|s| s["pid"].as_u64()))
+        .filter(|p| sampled.get(p).is_none_or(|m| m.cpu_pct.is_none()))
         .collect();
-    let usage = usage(&pids);
+    let ps = usage(&pids);
+    let usage = |pid: u64| match (sampled.get(&pid), ps.get(&pid)) {
+        (Some(m), _) if m.cpu_pct.is_some() => m.cpu_pct.map(|c| (c, m.rss_bytes)),
+        (Some(m), Some((c, _))) => Some((*c, m.rss_bytes)),
+        (None, Some(u)) => Some(*u),
+        (_, None) => None,
+    };
     let mut t = ui::Table::new(&[
         "App", "Mode", "#", "Status", "PID", "CPU", "Memory", "Uptime", "↺",
     ])
@@ -1135,9 +1148,9 @@ fn print_table(apps: &[AppStatus]) {
                 _ => other += 1,
             }
             let pid = s["pid"].as_u64().filter(|_| !gone);
-            let (cpu, mem) = pid.and_then(|p| usage.get(&p)).map_or_else(
+            let (cpu, mem) = pid.and_then(usage).map_or_else(
                 || (ui::dim("-"), ui::dim("-")),
-                |(c, m)| (format!("{c:.1}%"), describe::bytes(*m)),
+                |(c, m)| (format!("{c:.1}%"), describe::bytes(m)),
             );
             let restarts = s["restarts"].as_u64().unwrap_or(0);
             t.row(vec![

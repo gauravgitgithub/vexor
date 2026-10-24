@@ -84,6 +84,9 @@ fn start_time(_pid: u32) -> io::Result<u64> {
 pub(crate) struct ProcStat {
     pub state: char,
     pub ppid: u32,
+    /// Fields 14 and 15: CPU time in user and kernel mode, in clock ticks.
+    pub utime: u64,
+    pub stime: u64,
     /// Field 22: start time in clock ticks since boot.
     pub start: u64,
 }
@@ -93,13 +96,16 @@ pub(crate) struct ProcStat {
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn proc_stat_fields(stat: &str) -> Option<ProcStat> {
     let rest = &stat[stat.rfind(')')? + 1..];
-    // After ")": field 3 (state) is index 0, field 4 (ppid) is index 1, and
-    // field 22 (start time) is index 19.
-    let mut it = rest.split_whitespace();
-    let state = it.next()?.chars().next()?;
-    let ppid = it.next()?.parse().ok()?;
-    let start = it.nth(17)?.parse().ok()?;
-    Some(ProcStat { state, ppid, start })
+    // After ")": field 3 (state) is index 0, field 4 (ppid) index 1, fields
+    // 14/15 (utime/stime) indexes 11/12, field 22 (start time) index 19.
+    let f: Vec<&str> = rest.split_whitespace().take(20).collect();
+    Some(ProcStat {
+        state: f.first()?.chars().next()?,
+        ppid: f.get(1)?.parse().ok()?,
+        utime: f.get(11)?.parse().ok()?,
+        stime: f.get(12)?.parse().ok()?,
+        start: f.get(19)?.parse().ok()?,
+    })
 }
 
 #[cfg(test)]
@@ -138,6 +144,7 @@ mod tests {
         let stat = "1234 (evil) name (x) S 1 1234 1234 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 98765 1000 100";
         let f = proc_stat_fields(stat).expect("parses");
         assert_eq!((f.state, f.ppid, f.start), ('S', 1, 98765));
+        assert_eq!((f.utime, f.stime), (1, 2));
         assert!(proc_stat_fields("garbage").is_none());
     }
 }

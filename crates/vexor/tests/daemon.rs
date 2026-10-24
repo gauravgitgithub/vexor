@@ -737,3 +737,132 @@ fn fork_start_first_on_a_fixed_port_fails_safely() {
     let err = std::fs::read_to_string(home.path("web.err")).unwrap_or_default();
     assert!(err.contains("EADDRINUSE"), "{err}");
 }
+
+fn metrics(home: &Home) -> Vec<Value> {
+    let out = home.cli(&["list", "--json"]);
+    let apps: Vec<Value> = serde_json::from_slice(&out.stdout).expect("json");
+    apps[0]["metrics"].as_array().cloned().unwrap_or_default()
+}
+
+/// Wait for a sample of instance 0 that satisfies `ok`.
+fn wait_metrics(home: &Home, ok: impl Fn(&Value) -> bool) -> Value {
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let m = metrics(home);
+        if let Some(s) = m.iter().find(|s| s["instance"] == 0 && ok(s)) {
+            return s.clone();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no matching sample; latest: {m:?}\n{}",
+            home.diagnostics("web")
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Plan step 6b.1: the shim samples each instance, the daemon serves the
+/// latest sample, and after a crash the sample is the new process's.
+#[test]
+fn metrics_follow_each_instance_and_its_restarts() {
+    let Some(node) = which("node") else {
+        eprintln!("skipping: node not found on PATH");
+        return;
+    };
+    let mut home = Home::new();
+    let port = free_port();
+    let addr: SocketAddr = ([127, 0, 0, 1], port).into();
+    home.add_app(
+        "web",
+        &node,
+        &["-e", SERVER],
+        json!({
+            "env": { "PORT": port.to_string() },
+            "node_ipc": true,
+            "health_check": { "tcp": format!("127.0.0.1:{port}"), "interval_ms": 200, "timeout_ms": 1000 },
+            "policy": { "ready_timeout_ms": 10000, "metrics_interval_ms": 200 },
+        }),
+    );
+    home.start_daemon();
+    let before = server_pid(&wait_http(addr));
+    let s = wait_metrics(&home, |s| {
+        s["pid"] == before && s["cpu_pct"].is_number() && s["health"]["ok"] == true
+    });
+    assert!(s["rss_bytes"].as_u64().expect("rss") > 1 << 20, "{s}");
+    // stdin, stdout, stderr and the listening socket at least.
+    assert!(s["open_fds"].as_u64().expect("fds") >= 4, "{s}");
+
+    let _ = get(addr, "/crash");
+    let deadline = Instant::now() + TIMEOUT;
+    let after = loop {
+        if let Ok(body) = get(addr, "/") {
+            let pid = server_pid(&body);
+            if pid != before {
+                break pid;
+            }
+        }
+        assert!(Instant::now() < deadline, "app was not restarted");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    wait_metrics(&home, |s| s["pid"] == after && s["cpu_pct"].is_number());
+}
+
+/// A shim started by an older Vexor survives the upgrade and only speaks
+/// protocol 1: the daemon says hello again with 1 and follows it, without
+/// metrics.
+#[test]
+fn daemon_falls_back_to_protocol_1_for_an_older_shim() {
+    use std::io::BufRead;
+    use std::os::unix::net::UnixListener;
+
+    let mut home = Home::new();
+    home.add_app("old", "/bin/sh", &["-c", "sleep 30"], json!({}));
+    std::fs::create_dir_all(home.path("shims")).expect("shims dir");
+    let lock = vexor_shim::try_lock(&home.path("shims/old.lock"))
+        .expect("lock")
+        .expect("free");
+    let listener = UnixListener::bind(home.path("shims/old.sock")).expect("bind");
+    // Stands in for the shim's process (the test cleanup signals it).
+    let mut stand_in = Command::new("sleep").arg("30").spawn().expect("sleep");
+    let pid = stand_in.id();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let s = seen.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut r = std::io::BufReader::new(stream.try_clone().expect("clone"));
+            let mut line = String::new();
+            let _ = r.read_line(&mut line);
+            let hello: Value = serde_json::from_str(&line).unwrap_or_default();
+            s.lock().expect("lock").push(hello["protocol"].clone());
+            if hello["protocol"] != 1 {
+                let refused = json!({ "type": "refused", "reason": "protocol 2 not supported, shim speaks 1" });
+                let _ = writeln!(stream, "{refused}");
+                continue;
+            }
+            let welcome = json!({
+                "type": "welcome", "protocol": 1, "app": "old", "shim_pid": pid,
+                "shim_start": 1, "next_seq": 0,
+                "snapshot": [{ "type": "state", "app": "old", "instance": 0,
+                               "state": "online", "pid": pid, "start": 1, "restarts": 0 }],
+            });
+            let _ = writeln!(stream, "{welcome}");
+            // Hold the connection until the daemon drops it.
+            while r.read_line(&mut line).is_ok_and(|n| n > 0) {}
+        }
+    });
+
+    home.start_daemon();
+    home.wait_count("shim_connected", 1);
+    assert_eq!(*seen.lock().expect("lock"), [json!(2), json!(1)]);
+    assert_eq!(home.count("shim_refused"), 1);
+    let out = home.cli(&["list", "--json"]);
+    let apps: Vec<Value> = serde_json::from_slice(&out.stdout).expect("json");
+    assert_eq!(apps[0]["snapshot"][0]["state"], "online", "{apps:?}");
+    assert!(apps[0].get("metrics").is_none(), "{apps:?}");
+
+    home.kill_daemon();
+    let _ = stand_in.kill();
+    let _ = stand_in.wait();
+    drop(lock);
+}

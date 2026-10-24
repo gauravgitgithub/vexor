@@ -19,6 +19,7 @@ mod identity;
 mod instance;
 mod logs;
 mod memory;
+mod metrics;
 mod orphan;
 mod output;
 mod process;
@@ -166,6 +167,9 @@ pub async fn run(spec: AppSpec, home: Option<PathBuf>) -> i32 {
     }
     let out = output::Output::new(true);
 
+    // Latest resource samples, for the daemon connection.
+    let (metrics_tx, metrics_rx) = watch::channel(Vec::new());
+
     // Daemon-managed mode: lock, control socket, persisted identities.
     let mut presence = None;
     let managed = match &home {
@@ -197,6 +201,7 @@ pub async fn run(spec: AppSpec, home: Option<PathBuf>) -> i32 {
                     Arc::from(spec.name.as_str()),
                     stop_tx.clone(),
                     restart_tx.clone(),
+                    metrics_rx.clone(),
                 ));
                 let managed = orphan::Managed::persisted(paths.pids.clone());
                 presence = Some((lock, server, paths));
@@ -262,6 +267,14 @@ pub async fn run(spec: AppSpec, home: Option<PathBuf>) -> i32 {
                 stop_rx.clone(),
             ))
         });
+    // Samples are only read by the daemon.
+    let sampler = (presence.is_some() && spec.policy.metrics_interval_ms > 0).then(|| {
+        tokio::spawn(metrics::run(
+            out.clone(),
+            std::time::Duration::from_millis(spec.policy.metrics_interval_ms.max(100)),
+            metrics_tx,
+        ))
+    });
     let epoch = tokio::time::Instant::now();
     let mut set = tokio::task::JoinSet::new();
     for index in 0..spec.instances {
@@ -304,6 +317,9 @@ pub async fn run(spec: AppSpec, home: Option<PathBuf>) -> i32 {
     }
     if let Some(h) = app_health {
         h.abort();
+    }
+    if let Some(s) = sampler {
+        s.abort();
     }
     if let Some(c) = &cluster {
         c.shutdown().await;

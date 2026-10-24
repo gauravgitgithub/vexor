@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use serde::Serialize;
 use tokio::sync::Notify;
 use vexor_core::{ErrorReason, ExitStatus, State};
+use vexor_proto::HealthStatus;
 
 /// Events kept for replay. Older ones are dropped, and a reconnecting daemon
 /// that missed them is told so (`FromShim::Gap`).
@@ -114,6 +115,8 @@ struct Inner {
     buffer: VecDeque<(u64, serde_json::Value)>,
     /// Latest `state` event per instance.
     latest: BTreeMap<u32, serde_json::Value>,
+    /// Latest health result per instance (`None`: app-wide, cluster mode).
+    health: BTreeMap<Option<u32>, HealthStatus>,
 }
 
 /// Events after a given point, as returned by [`Output::since`].
@@ -141,10 +144,8 @@ impl Output {
         };
         // When it happened, not when the daemon got it (it may be replayed
         // after a daemon restart).
+        let ts = now_ms();
         if let serde_json::Value::Object(m) = &mut value {
-            let ts = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_millis());
             m.insert("ts_ms".into(), serde_json::json!(ts));
         }
         if self.0.echo_stdout {
@@ -157,8 +158,31 @@ impl Output {
             let mut inner = self.lock();
             let seq = inner.next_seq;
             inner.next_seq += 1;
-            if let ShimEvent::State { instance, .. } = event {
-                inner.latest.insert(*instance, value.clone());
+            match event {
+                ShimEvent::State {
+                    instance, state, ..
+                } => {
+                    // A new process has no health result yet.
+                    if *state == State::Starting {
+                        inner.health.remove(&Some(*instance));
+                    }
+                    inner.latest.insert(*instance, value.clone());
+                }
+                ShimEvent::Health {
+                    instance,
+                    ok,
+                    detail,
+                    action: None,
+                    ..
+                } => {
+                    let status = HealthStatus {
+                        ok: *ok,
+                        detail: detail.clone(),
+                        since_ms: ts,
+                    };
+                    inner.health.insert(*instance, status);
+                }
+                _ => {}
             }
             if inner.buffer.len() == BUFFER_CAPACITY {
                 inner.buffer.pop_front();
@@ -175,6 +199,16 @@ impl Output {
 
     pub fn snapshot(&self) -> Vec<serde_json::Value> {
         self.lock().latest.values().cloned().collect()
+    }
+
+    /// Latest health result of `instance`, else the app-wide one.
+    pub fn health(&self, instance: u32) -> Option<HealthStatus> {
+        let inner = self.lock();
+        inner
+            .health
+            .get(&Some(instance))
+            .or_else(|| inner.health.get(&None))
+            .cloned()
     }
 
     /// Buffered events with sequence number `>= cursor`.
@@ -204,6 +238,13 @@ impl Output {
     fn lock(&self) -> MutexGuard<'_, Inner> {
         self.0.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }
+}
+
+/// Milliseconds since the epoch.
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 #[cfg(test)]
@@ -267,5 +308,32 @@ mod tests {
         assert_eq!(snap.len(), 2);
         assert_eq!(snap[0]["state"], "online");
         assert_eq!(snap[1]["state"], "starting");
+    }
+
+    #[test]
+    fn health_is_kept_per_instance_until_a_new_process_starts() {
+        let out = Output::new(false);
+        let health = |instance, ok| ShimEvent::Health {
+            app: "a",
+            instance,
+            ok,
+            detail: None,
+            action: None,
+        };
+        out.emit(&health(Some(0), false));
+        out.emit(&health(None, true));
+        assert!(!out.health(0).expect("own").ok);
+        assert!(out.health(1).expect("app-wide").ok);
+        out.emit(&ShimEvent::State {
+            app: "a",
+            instance: 0,
+            state: State::Starting,
+            pid: None,
+            start: None,
+            restarts: 1,
+            exit: None,
+            error: None,
+        });
+        assert!(out.health(0).expect("app-wide again").ok);
     }
 }

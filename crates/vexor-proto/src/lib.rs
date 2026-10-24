@@ -13,6 +13,13 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 /// Bumped on any incompatible change.
 pub const PROTOCOL: u32 = 1;
 
+/// Daemon ↔ shim protocol. Shims outlive daemon upgrades (and downgrades),
+/// so a shim accepts every version from [`MIN_SHIM_PROTOCOL`], and a daemon
+/// refused by an older shim says hello again with the minimum.
+/// 2: [`FromShim::Metrics`].
+pub const SHIM_PROTOCOL: u32 = 2;
+pub const MIN_SHIM_PROTOCOL: u32 = 1;
+
 /// Longest accepted message line, in bytes.
 pub const MAX_LINE: usize = 1024 * 1024;
 
@@ -71,6 +78,40 @@ pub enum FromShim {
     Refused {
         reason: String,
     },
+    /// Latest resource sample of every running instance (protocol 2).
+    /// Not an event: not sequenced, buffered or stored; each replaces the last.
+    Metrics {
+        samples: Vec<InstanceMetrics>,
+    },
+}
+
+/// One instance's resources, sampled by its shim. Unknown fields are
+/// accepted so later versions can add measurements.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InstanceMetrics {
+    pub instance: u32,
+    pub pid: u32,
+    /// When sampled, ms since the epoch.
+    pub ts_ms: u64,
+    /// CPU used since the previous sample, in % of one core. Absent on a
+    /// process's first sample.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_pct: Option<f64>,
+    pub rss_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_fds: Option<u64>,
+    /// Latest health-check result (app-wide in cluster mode).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health: Option<HealthStatus>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HealthStatus {
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// When the result last changed, ms since the epoch.
+    pub since_ms: u64,
 }
 
 // ----------------------------------------------------------- CLI ↔ daemon
@@ -196,6 +237,10 @@ pub struct AppStatus {
     /// `cluster` or `fork` (absent from daemons before 0.3).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
+    /// Latest resource sample per running instance (absent from older
+    /// daemons, and for shims started by an older Vexor).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub metrics: Vec<InstanceMetrics>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -324,6 +369,19 @@ mod tests {
         let mut r = BufReader::new(&b"{\"type\":\"launch_missiles\"}\n"[..]);
         let mut buf = Vec::new();
         assert!(recv::<_, ToShim>(&mut r, &mut buf).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn metrics_accept_fields_added_later() {
+        let line = br#"{"type":"metrics","samples":[{"instance":0,"pid":9,"ts_ms":1,"rss_bytes":2,"gpu_pct":5}]}
+"#;
+        let mut r = BufReader::new(&line[..]);
+        let mut buf = Vec::new();
+        let got: FromShim = recv(&mut r, &mut buf).await.expect("recv").expect("msg");
+        let FromShim::Metrics { samples } = got else {
+            panic!("{got:?}");
+        };
+        assert_eq!((samples[0].pid, samples[0].cpu_pct), (9, None));
     }
 
     #[tokio::test]

@@ -14,7 +14,9 @@ use serde_json::{Value, json};
 use tokio::io::BufReader;
 use tokio::net::UnixStream;
 use tokio::sync::{mpsc, watch};
-use vexor_proto::{Desired, FromShim, PROTOCOL, Resume, ToShim};
+use vexor_proto::{
+    Desired, FromShim, InstanceMetrics, MIN_SHIM_PROTOCOL, Resume, SHIM_PROTOCOL, ToShim,
+};
 use vexor_shim::{Identity, Paths};
 
 use crate::events::Events;
@@ -37,6 +39,8 @@ struct LiveInner {
     snapshot: BTreeMap<u64, Value>,
     /// Reload outcomes seen per instance: (succeeded, failed).
     reloads: BTreeMap<u64, (u64, u64)>,
+    /// Latest resource sample per running instance, from the shim.
+    metrics: Vec<InstanceMetrics>,
 }
 
 impl Live {
@@ -48,9 +52,14 @@ impl Live {
         self.lock().snapshot.values().cloned().collect()
     }
 
+    pub fn metrics(&self) -> Vec<InstanceMetrics> {
+        self.lock().metrics.clone()
+    }
+
     fn connected(&self, pid: u32, snapshot: Vec<Value>) {
         let mut l = self.lock();
         l.shim_pid = Some(pid);
+        l.metrics.clear();
         l.snapshot = snapshot
             .into_iter()
             .filter_map(|s| Some((s["instance"].as_u64()?, s)))
@@ -79,8 +88,14 @@ impl Live {
         }
     }
 
+    fn metrics_sample(&self, samples: Vec<InstanceMetrics>) {
+        self.lock().metrics = samples;
+    }
+
     fn disconnected(&self) {
-        self.lock().shim_pid = None;
+        let mut l = self.lock();
+        l.shim_pid = None;
+        l.metrics.clear();
     }
 
     fn lock(&self) -> MutexGuard<'_, LiveInner> {
@@ -107,15 +122,24 @@ impl Follower {
         let mut resume = self.resume.take();
         let mut unreachable_reported = false;
         let mut last_error: Option<String> = None;
+        let mut protocol = SHIM_PROTOCOL;
         loop {
             match UnixStream::connect(&self.paths.socket).await {
                 Ok(stream) => {
                     unreachable_reported = false;
                     last_error = None;
-                    self.follow(stream, &mut resume).await;
+                    let refused = self.follow(stream, &mut resume, protocol).await;
                     self.live.disconnected();
                     self.log
                         .write(json!({ "type": "shim_disconnected", "app": self.name }));
+                    // A shim older than this daemon (it survived the
+                    // upgrade): speak its protocol, without metrics, until
+                    // it is replaced.
+                    if refused && protocol > MIN_SHIM_PROTOCOL {
+                        protocol = MIN_SHIM_PROTOCOL;
+                        continue;
+                    }
+                    protocol = SHIM_PROTOCOL;
                 }
                 Err(_) => match vexor_shim::try_lock(&self.paths.lock) {
                     // Lock free: no shim is running.
@@ -250,22 +274,28 @@ impl Follower {
             .spawn()
     }
 
-    async fn follow(&mut self, stream: UnixStream, resume: &mut Option<Resume>) {
+    /// Returns true if the shim refused the connection.
+    async fn follow(
+        &mut self,
+        stream: UnixStream,
+        resume: &mut Option<Resume>,
+        protocol: u32,
+    ) -> bool {
         if !same_user(&stream) {
             self.log.write(json!({
                 "type": "error",
                 "app": self.name,
                 "error": "shim socket owned by another user",
             }));
-            return;
+            return false;
         }
         let (read, mut write) = stream.into_split();
         let hello = ToShim::Hello {
-            protocol: PROTOCOL,
+            protocol,
             resume: *resume,
         };
         if vexor_proto::send(&mut write, &hello).await.is_err() {
-            return;
+            return false;
         }
 
         // Reading isn't cancel-safe, so it runs in its own task.
@@ -295,29 +325,29 @@ impl Follower {
             if !stop_sent && *self.desired.borrow() == Desired::Stopped {
                 stop_sent = true;
                 if vexor_proto::send(&mut write, &ToShim::Stop).await.is_err() {
-                    return;
+                    return false;
                 }
             }
             tokio::select! {
                 msg = messages.recv() => match msg {
-                    Some(Ok(m)) => if !self.handle(m, resume) { return },
+                    Some(Ok(m)) => if !self.handle(m, resume) { return true },
                     Some(Err(e)) => {
                         self.log.write(json!({
                             "type": "error",
                             "app": self.name,
                             "error": format!("shim protocol: {e}"),
                         }));
-                        return;
+                        return false;
                     }
-                    None => return,
+                    None => return false,
                 },
                 cmd = self.commands.recv() => match cmd {
-                    Some(c) => if vexor_proto::send(&mut write, &c).await.is_err() { return },
-                    None => return,
+                    Some(c) => if vexor_proto::send(&mut write, &c).await.is_err() { return false },
+                    None => return false,
                 },
                 changed = self.desired.changed() => {
                     if changed.is_err() {
-                        return;
+                        return false;
                     }
                     if *self.desired.borrow() == Desired::Running {
                         stop_sent = false;
@@ -327,7 +357,7 @@ impl Follower {
         }
     }
 
-    /// Returns false when the connection should be dropped.
+    /// Returns false when the shim refused the connection.
     fn handle(&self, msg: FromShim, resume: &mut Option<Resume>) -> bool {
         match msg {
             FromShim::Welcome {
@@ -385,6 +415,8 @@ impl Follower {
                     "to": to,
                 }));
             }
+            // Latest-only and frequent: kept in memory, not logged or stored.
+            FromShim::Metrics { samples } => self.live.metrics_sample(samples),
             FromShim::Refused { reason } => {
                 self.log.write(json!({
                     "type": "shim_refused",

@@ -268,6 +268,7 @@ impl Daemon {
             shim_pid: live.shim_pid(),
             instances: entry.spec.instances,
             snapshot: live.snapshot(),
+            metrics: live.metrics(),
             mode: Some(
                 if entry.spec.cluster.is_some() {
                     "cluster"

@@ -121,6 +121,46 @@ pub fn print(status: &AppStatus, spec: &AppSpec, events: &[Value], show_env: boo
         );
     }
 
+    section("Resources");
+    if status.metrics.is_empty() {
+        row(
+            "Sampled",
+            if spec.policy.metrics_interval_ms == 0 {
+                "off (metrics_interval_ms: 0)".into()
+            } else if status.shim_pid.is_none() {
+                "no (shim not connected)".into()
+            } else {
+                format!(
+                    "not yet (every {}; shims started by an older Vexor don't sample)",
+                    ms(spec.policy.metrics_interval_ms)
+                )
+            },
+        );
+    }
+    for m in &status.metrics {
+        let mut parts = vec![
+            m.cpu_pct
+                .map_or_else(|| "CPU -".into(), |c| format!("CPU {c:.1}%")),
+            format!("memory {}", bytes(m.rss_bytes)),
+        ];
+        if let Some(f) = m.open_fds {
+            parts.push(format!("{f} open files"));
+        }
+        if let Some(h) = &m.health {
+            let since = human_duration(now.saturating_sub(h.since_ms));
+            parts.push(match (&h.ok, &h.detail) {
+                (true, _) => format!("health passing for {since}"),
+                (false, Some(d)) => format!("health failing for {since} ({d})"),
+                (false, None) => format!("health failing for {since}"),
+            });
+        }
+        parts.push(ui::dim(&format!(
+            "sampled {} ago",
+            human_duration(now.saturating_sub(m.ts_ms))
+        )));
+        row(&format!("#{}", m.instance), parts.join(" · "));
+    }
+
     section("Process");
     row("Exec", spec.exec.display().to_string());
     match &spec.cluster {

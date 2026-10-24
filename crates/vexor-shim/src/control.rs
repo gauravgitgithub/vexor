@@ -18,7 +18,7 @@ use rustix::fs::{FlockOperation, flock};
 use tokio::io::BufReader;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, mpsc, watch};
-use vexor_proto::{FromShim, PROTOCOL, ToShim};
+use vexor_proto::{FromShim, InstanceMetrics, MIN_SHIM_PROTOCOL, SHIM_PROTOCOL, ToShim};
 
 use crate::identity::Identity;
 use crate::output::Output;
@@ -132,6 +132,7 @@ pub async fn serve(
     app: Arc<str>,
     stop: Arc<watch::Sender<bool>>,
     restart: broadcast::Sender<crate::instance::Control>,
+    metrics: watch::Receiver<Vec<InstanceMetrics>>,
 ) {
     let mut current: Option<tokio::task::JoinHandle<()>> = None;
     loop {
@@ -156,6 +157,7 @@ pub async fn serve(
             app.clone(),
             stop.clone(),
             restart.clone(),
+            metrics.clone(),
         )));
     }
 }
@@ -176,6 +178,7 @@ async fn session(
     app: Arc<str>,
     stop: Arc<watch::Sender<bool>>,
     restart: broadcast::Sender<crate::instance::Control>,
+    mut metrics: watch::Receiver<Vec<InstanceMetrics>>,
 ) {
     let (read, mut write) = stream.into_split();
 
@@ -193,10 +196,15 @@ async fn session(
     });
     let _guard = AbortOnDrop(reader);
 
-    let resume = match tokio::time::timeout(HELLO_TIMEOUT, rx.recv()).await {
-        Ok(Some(ToShim::Hello { protocol, resume })) if protocol == PROTOCOL => resume,
+    let supported = MIN_SHIM_PROTOCOL..=SHIM_PROTOCOL;
+    let (protocol, resume) = match tokio::time::timeout(HELLO_TIMEOUT, rx.recv()).await {
+        Ok(Some(ToShim::Hello { protocol, resume })) if supported.contains(&protocol) => {
+            (protocol, resume)
+        }
         Ok(Some(ToShim::Hello { protocol, .. })) => {
-            let reason = format!("protocol {protocol} not supported, shim speaks {PROTOCOL}");
+            let reason = format!(
+                "protocol {protocol} not supported, shim speaks {MIN_SHIM_PROTOCOL} to {SHIM_PROTOCOL}"
+            );
             let _ = vexor_proto::send(&mut write, &FromShim::Refused { reason }).await;
             return;
         }
@@ -211,7 +219,7 @@ async fn session(
         _ => 0,
     };
     let welcome = FromShim::Welcome {
-        protocol: PROTOCOL,
+        protocol,
         app: app.to_string(),
         shim_pid: me.pid,
         shim_start: me.start,
@@ -221,6 +229,9 @@ async fn session(
     if vexor_proto::send(&mut write, &welcome).await.is_err() {
         return;
     }
+    // Daemons before protocol 2 would reject metrics messages.
+    let mut send_metrics = protocol >= 2;
+    metrics.mark_changed();
 
     loop {
         let changed = out.changed();
@@ -247,6 +258,18 @@ async fn session(
 
         tokio::select! {
             () = &mut changed => {}
+            sampled = metrics.changed(), if send_metrics => {
+                if sampled.is_err() {
+                    send_metrics = false;
+                    continue;
+                }
+                let samples = metrics.borrow_and_update().clone();
+                if !samples.is_empty()
+                    && vexor_proto::send(&mut write, &FromShim::Metrics { samples }).await.is_err()
+                {
+                    return;
+                }
+            }
             msg = rx.recv() => match msg {
                 Some(ToShim::Stop) => { stop.send_replace(true); }
                 Some(ToShim::Restart) => { let _ = restart.send(crate::instance::Control::Restart); }

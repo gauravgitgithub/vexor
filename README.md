@@ -61,6 +61,11 @@ upgraded.
   back on PM2, and can roll everything back.
 - **Runs any Node.js version.** Apps on Node 8 through 24 are tested in CI;
   the supervisor itself needs no Node at all.
+- **Alerts without a SaaS.** Crash loops, restart storms, failing health
+  checks and filling log disks open incidents out of the box; CPU and
+  memory thresholds are one line. Delivered by email or signed webhook
+  (Slack format included), with flap damping. PM2 sells alerting in PM2
+  Plus.
 - **Secure by default.** State and logs are private to your user (0600),
   apps get an allowlisted environment unless you ask for the whole shell's,
   `describe` hides environment values, and release binaries ship with

@@ -193,6 +193,8 @@ pub enum Request {
     /// Open alert incidents, recent alert history and the rules in force
     /// (plan 6b.3).
     Alerts,
+    /// Send a test alert to every configured channel now (plan 6b.4).
+    AlertsTest,
     /// Stored resource history of one app (plan 6b.2).
     Metrics {
         app: String,
@@ -224,6 +226,10 @@ pub enum Response {
         events: Vec<serde_json::Value>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         warnings: Vec<String>,
+    },
+    /// Outcome of `AlertsTest` per channel: `{channel, ok, error}`.
+    AlertsTested {
+        results: Vec<serde_json::Value>,
     },
     Alerts {
         /// Open incidents: metric, app, instance, level, since, value.

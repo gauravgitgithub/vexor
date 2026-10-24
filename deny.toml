@@ -18,6 +18,11 @@ allow = [
     "Unicode-3.0",
     # foldhash (via rusqlite); permissive, attribution-only.
     "Zlib",
+    # ring, rustls-webpki, untrusted (TLS for alert email and webhooks);
+    # permissive, MIT-like.
+    "ISC",
+    # subtle (constant-time comparisons, via rustls); permissive.
+    "BSD-3-Clause",
 ]
 confidence-threshold = 0.9
 

@@ -768,9 +768,13 @@ fn logs_show_the_last_lines_per_stream() {
     let both = env.ok(&["logs", "--lines", "1"]);
     let lines: Vec<&str> = both.lines().collect();
     assert_eq!(lines.len(), 2, "{both}");
-    for (l, want) in lines.iter().zip(["talk | out 20", "talk ! err 20"]) {
+    // The two streams are read and stamped separately: either can come
+    // first.
+    for want in ["talk | out 20", "talk ! err 20"] {
         assert!(
-            l.ends_with(want) && l.as_bytes()[2] == b':' && l.as_bytes()[8] == b'.',
+            lines
+                .iter()
+                .any(|l| l.ends_with(want) && l.as_bytes()[2] == b':' && l.as_bytes()[8] == b'.'),
             "{both}"
         );
     }

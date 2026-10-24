@@ -120,6 +120,8 @@ enum Command {
     },
     /// Show open alert incidents, recent alerts and the rules in force.
     Alerts {
+        #[command(subcommand)]
+        action: Option<AlertsAction>,
         /// Machine-readable output.
         #[arg(long)]
         json: bool,
@@ -310,6 +312,13 @@ pub struct StartArgs {
 }
 
 /// Exit codes (docs/compatibility.md §4).
+#[derive(Debug, Subcommand)]
+enum AlertsAction {
+    /// Send a test alert to every configured channel now and report each
+    /// result.
+    Test,
+}
+
 mod code {
     pub const FAILED: u8 = 1;
     pub const DAEMON_UNREACHABLE: u8 = 3;
@@ -453,7 +462,10 @@ fn main() -> ExitCode {
                 migrate_cmd(&home, pm2_home, dump, backup, json, env_names, verbose)
             }
         }
-        Command::Alerts { json } => send(&home, Request::Alerts, json),
+        Command::Alerts { action, json } => match action {
+            None => send(&home, Request::Alerts, json),
+            Some(AlertsAction::Test) => send(&home, Request::AlertsTest, json),
+        },
         Command::Metrics { name, since, json } => {
             let until_ms = describe::now_ms();
             let since_ms =
@@ -587,6 +599,37 @@ fn send(home: &std::path::Path, req: Request, json: bool) -> ExitCode {
                 print_events(&events);
             }
             ExitCode::SUCCESS
+        }
+        Response::AlertsTested { results } => {
+            if json {
+                match serde_json::to_string_pretty(&results) {
+                    Ok(s) => println!("{s}"),
+                    Err(e) => return fail(&e.to_string()),
+                }
+            }
+            let mut failed = false;
+            for r in &results {
+                let channel = r["channel"].as_str().unwrap_or("?");
+                if r["ok"] == true {
+                    if !json {
+                        println!("{} {channel}: delivered", ui::ok_mark());
+                    }
+                } else {
+                    failed = true;
+                    if !json {
+                        println!(
+                            "{} {channel}: {}",
+                            ui::fail_mark(),
+                            r["error"].as_str().unwrap_or("failed")
+                        );
+                    }
+                }
+            }
+            if failed {
+                ExitCode::from(code::FAILED)
+            } else {
+                ExitCode::SUCCESS
+            }
         }
         Response::Alerts {
             open,
@@ -722,7 +765,8 @@ fn run_plan(home: &std::path::Path, plan: spec::Plan, allow_unsupported: bool) -
                 | Response::Describe { .. }
                 | Response::Version { .. }
                 | Response::Metrics { .. }
-                | Response::Alerts { .. },
+                | Response::Alerts { .. }
+                | Response::AlertsTested { .. },
             ) => {}
             Err(e) => {
                 eprintln!("vexor: {e}");

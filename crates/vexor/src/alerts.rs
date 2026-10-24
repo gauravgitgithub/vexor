@@ -124,9 +124,50 @@ pub fn print(open: &[Value], recent: &[Value], rules: &Value) {
             );
         }
     }
+    println!("\n{}", ui::bold("Channels"));
+    let channels = &rules["channels"];
+    let mut any = false;
+    if let Some(e) = channels["email"].as_object() {
+        any = true;
+        let to: Vec<&str> = e["to"]
+            .as_array()
+            .map_or_else(Vec::new, |a| a.iter().filter_map(Value::as_str).collect());
+        println!(
+            "  {} {} via {}:{} ({})",
+            ui::cyan(&format!("{:<11}", "email")),
+            to.join(", "),
+            e["host"].as_str().unwrap_or("?"),
+            e["port"],
+            e["tls"].as_str().unwrap_or("?")
+        );
+    }
+    for w in channels["webhooks"].as_array().into_iter().flatten() {
+        any = true;
+        let signed = if w["secret"].is_string() {
+            ", signed"
+        } else {
+            ""
+        };
+        println!(
+            "  {} {} ({}{signed})",
+            ui::cyan(&format!("{:<11}", "webhook")),
+            w["url"].as_str().unwrap_or("?"),
+            w["format"].as_str().unwrap_or("json")
+        );
+    }
+    if !any {
+        println!(
+            "  {}",
+            ui::dim(
+                "none: alerts are recorded only (see docs/alerts.md to add email or a webhook)"
+            )
+        );
+    }
     println!(
         "  {}",
-        ui::dim("Change them in alerts.json in the Vexor home (re-read on change).")
+        ui::dim(
+            "Change them in alerts.json in the Vexor home (re-read on change); `vexor alerts test` sends a test."
+        )
     );
 }
 

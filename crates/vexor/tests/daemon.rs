@@ -965,3 +965,67 @@ fn crash_loop_alert_opens_and_recovers() {
             })
     });
 }
+
+/// Plan step 6b.4: an incident is delivered to a webhook, signed with the
+/// configured secret, which never appears in `vexor alerts`.
+#[test]
+fn crash_loop_alert_is_delivered_to_a_signed_webhook() {
+    use std::net::TcpListener;
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            s.set_read_timeout(Some(Duration::from_secs(5))).ok();
+            let mut got = Vec::new();
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = s.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                got.extend_from_slice(&buf[..n]);
+                let text = String::from_utf8_lossy(&got).to_string();
+                if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                    let len: usize = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("Content-Length: "))
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(0);
+                    if body.len() >= len {
+                        break;
+                    }
+                }
+            }
+            let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+            let _ = tx.send(String::from_utf8_lossy(&got).to_string());
+        }
+    });
+
+    let mut home = Home::new();
+    let config = json!({ "channels": { "webhooks": [{
+        "url": format!("http://127.0.0.1:{port}/hook"), "secret": "s3cret-key"
+    }] } });
+    std::fs::write(home.path("alerts.json"), config.to_string()).expect("config");
+    home.add_app(
+        "crashy",
+        "/bin/sh",
+        &["-c", "exit 3"],
+        json!({ "policy": { "max_restarts": 1, "min_uptime_ms": 1000 } }),
+    );
+    home.start_daemon();
+    let request = rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("webhook call");
+    let (head, body) = request.split_once("\r\n\r\n").expect("http request");
+    assert!(head.starts_with("POST /hook HTTP/1.1"), "{head}");
+    assert!(head.contains("X-Vexor-Signature: sha256="), "{head}");
+    let v: Value = serde_json::from_str(body).expect("json body");
+    assert_eq!(v["alert"]["app"], "crashy");
+    assert_eq!(v["alert"]["rule"], "crash_loop");
+    assert_eq!(v["alert"]["level"], "danger");
+
+    let shown = String::from_utf8_lossy(&home.cli(&["alerts", "--json"]).stdout).to_string();
+    assert!(!shown.contains("s3cret-key"), "{shown}");
+    assert!(shown.contains("<redacted>"), "{shown}");
+}

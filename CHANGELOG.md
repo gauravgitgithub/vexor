@@ -3,6 +3,19 @@
 All notable changes to Vexor. Versions follow [Semantic Versioning](https://semver.org/);
 before 1.0, minor versions may include breaking changes, which are listed here.
 
+## Unreleased
+
+### Added
+- Alert delivery by email (any SMTP server; STARTTLS, implicit TLS,
+  AUTH PLAIN/LOGIN) and webhooks (JSON signed with HMAC-SHA256, or Slack
+  format), with retries and per-level filters. `vexor alerts test` sends
+  a test to every channel. Secrets can live in files and are never shown.
+  See docs/alerts.md.
+
+### Changed
+- The release binary grows from 3.4 MB to 4.2 MB (TLS for email and
+  webhooks, without OpenSSL).
+
 ## 0.6.0 (2026-10-24, prerelease)
 
 ### Fixed

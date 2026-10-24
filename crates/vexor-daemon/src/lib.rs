@@ -9,6 +9,7 @@ mod alerts;
 mod events;
 mod follower;
 mod log;
+mod notify;
 mod state;
 
 use std::collections::BTreeMap;
@@ -145,6 +146,8 @@ async fn run_async(home: PathBuf) -> i32 {
         store: Mutex::new(store),
         apps: StdMutex::new(BTreeMap::new()),
         alerts: StdMutex::new(AlertState::default()),
+        notifier: notifier(&events, &log),
+        host: notify::hostname(),
     });
     for (name, entry) in entries {
         if let Err(e) = daemon.follow(&name, &entry) {
@@ -181,6 +184,9 @@ struct Daemon {
     store: Mutex<Store>,
     apps: StdMutex<BTreeMap<String, Handle>>,
     alerts: StdMutex<AlertState>,
+    /// Alert delivery; `None` if its thread could not start.
+    notifier: Option<notify::Notifier>,
+    host: String,
 }
 
 /// Alert evaluation (plan 6b.3): rules from `alerts.json`, re-read when it
@@ -191,6 +197,8 @@ struct AlertState {
     /// Modification time of the file last read; `None` when absent.
     loaded: Option<std::time::SystemTime>,
     error: Option<String>,
+    /// Problems with the file's safety (permissions, weakened TLS).
+    risks: Vec<String>,
     engine: alerts::Engine,
     restarts: alerts::RestartRate,
     /// Latest size of each app's log files, refreshed every minute.
@@ -213,6 +221,17 @@ impl AlertState {
         };
         match parsed {
             Ok(c) => {
+                self.risks = c.channels.risks();
+                let open_to_others = std::fs::metadata(&path).is_ok_and(|m| {
+                    use std::os::unix::fs::PermissionsExt;
+                    m.permissions().mode() & 0o077 != 0
+                });
+                if open_to_others && !c.channels.is_empty() {
+                    self.risks.push(format!(
+                        "{} configures alert channels and is readable by other users; run chmod 600 on it",
+                        path.display()
+                    ));
+                }
                 self.config = c;
                 self.error = None;
                 log.write(json!({ "type": "alerts_loaded", "file": modified.is_some() }));
@@ -230,6 +249,27 @@ impl AlertState {
 }
 
 const ALERT_EVERY: Duration = Duration::from_secs(5);
+
+/// Start the delivery thread; a delivery given up after its retries is
+/// recorded as an event.
+fn notifier(events: &Events, log: &Log) -> Option<notify::Notifier> {
+    let (events, log) = (events.clone(), log.clone());
+    let started = notify::Notifier::start(Box::new(move |channel, alert, error| {
+        let data = json!({
+            "channel": channel,
+            "rule": alert.rule,
+            "level": alert.level,
+            "instance": alert.instance,
+            "error": error,
+        });
+        events.record_daemon(Some(&alert.app), "alert_delivery_failed", data.clone());
+        let mut line = data;
+        line["type"] = json!("alert_delivery_failed");
+        line["app"] = json!(alert.app);
+        log.write(line);
+    }));
+    started.ok()
+}
 
 /// Evaluate alert rules every few seconds, until aborted.
 async fn alert_loop(daemon: Arc<Daemon>) {
@@ -264,7 +304,20 @@ async fn alert_loop(daemon: Arc<Daemon>) {
         } else {
             None
         };
-        for change in daemon.evaluate_alerts(&apps, sizes) {
+        let changes = daemon.evaluate_alerts(&apps, sizes);
+        let channels = daemon
+            .alerts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .config
+            .channels
+            .clone();
+        for change in changes {
+            if change.notify
+                && let Some(n) = &daemon.notifier
+            {
+                n.notify(&channels, &daemon.alert_of(&change));
+            }
             let data = json!({
                 "rule": change.key.metric.name(),
                 "instance": change.key.instance,
@@ -480,10 +533,35 @@ impl Daemon {
         out
     }
 
+    fn alert_of(&self, c: &alerts::Change) -> notify::Alert {
+        notify::Alert {
+            app: c.key.app.clone(),
+            instance: c.key.instance,
+            rule: c.key.metric.name().to_owned(),
+            level: c.kind.to_owned(),
+            value: c.value,
+            threshold: c.threshold,
+            value_text: alerts::value_text(c.key.metric, c.value),
+            ts_ms: describe_now_ms(),
+            host: self.host.clone(),
+        }
+    }
+
     fn alerts_response(&self, recent: Vec<Value>) -> Response {
         let st = self.alerts.lock().unwrap_or_else(PoisonError::into_inner);
         let mut warnings = self.events.warnings();
         warnings.extend(st.error.clone());
+        warnings.extend(st.risks.iter().cloned());
+        if let Some(n) = &self.notifier {
+            let status = n.status.lock().unwrap_or_else(PoisonError::into_inner);
+            for (channel, result) in status.iter() {
+                if let Err(e) = result {
+                    warnings.push(format!("alert delivery ({channel}) is failing: {e}"));
+                }
+            }
+        } else if !st.config.channels.is_empty() {
+            warnings.push("alert delivery could not start; alerts are only recorded".into());
+        }
         Response::Alerts {
             open: st
                 .engine
@@ -601,6 +679,42 @@ impl Daemon {
                     },
                     Ok(Err(e)) => error(ErrorCode::Internal, e),
                     Err(e) => error(ErrorCode::Internal, e.to_string()),
+                }
+            }
+            Request::AlertsTest => {
+                let channels = {
+                    let mut st = self.alerts.lock().unwrap_or_else(PoisonError::into_inner);
+                    st.reload(&self.home, &self.log);
+                    st.config.channels.clone()
+                };
+                if channels.is_empty() {
+                    return error(
+                        ErrorCode::NotFound,
+                        "no alert channels configured (\"channels\" in alerts.json, see docs/alerts.md)",
+                    );
+                }
+                let alert = notify::Alert {
+                    app: "vexor".into(),
+                    instance: None,
+                    rule: "test".into(),
+                    level: "warning".into(),
+                    value: 0.0,
+                    threshold: None,
+                    value_text: "test notification".into(),
+                    ts_ms: describe_now_ms(),
+                    host: self.host.clone(),
+                };
+                let results =
+                    tokio::task::spawn_blocking(move || notify::deliver_now(&channels, &alert))
+                        .await
+                        .unwrap_or_default();
+                Response::AlertsTested {
+                    results: results
+                        .into_iter()
+                        .map(|(channel, r)| {
+                            json!({ "channel": channel, "ok": r.is_ok(), "error": r.err() })
+                        })
+                        .collect(),
                 }
             }
             Request::Alerts => {

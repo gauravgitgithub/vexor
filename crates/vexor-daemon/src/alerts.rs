@@ -145,6 +145,8 @@ struct ConfigFile {
     cooldown: Option<String>,
     #[serde(default)]
     rules: BTreeMap<Metric, RuleFile>,
+    #[serde(default)]
+    channels: crate::notify::ChannelsFile,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -228,6 +230,8 @@ fn parse_duration_ms(s: &str) -> Result<u64, String> {
 pub struct Config {
     pub cooldown_ms: u64,
     pub rules: BTreeMap<Metric, Rule>,
+    /// Where notifications go; secrets are redacted when serialized.
+    pub channels: crate::notify::Channels,
 }
 
 impl Default for Config {
@@ -235,6 +239,7 @@ impl Default for Config {
         Config {
             cooldown_ms: 600_000,
             rules: Metric::ALL.iter().map(|m| (*m, m.default_rule())).collect(),
+            channels: crate::notify::Channels::default(),
         }
     }
 }
@@ -248,6 +253,7 @@ impl Config {
         if let Some(c) = &file.cooldown {
             config.cooldown_ms = parse_duration_ms(c)?;
         }
+        config.channels = file.channels.resolve()?;
         for (metric, r) in file.rules {
             let rule = config
                 .rules
@@ -279,6 +285,31 @@ impl Config {
             }
         }
         Ok(config)
+    }
+}
+
+/// A value in its rule's unit, for notifications: bytes, % of a core,
+/// restarts an hour, or yes/no for the on/off checks.
+pub fn value_text(metric: Metric, v: f64) -> String {
+    match metric {
+        Metric::Memory | Metric::LogDisk => {
+            let units = ["B", "KiB", "MiB", "GiB", "TiB"];
+            let mut x = v;
+            let mut i = 0;
+            while x >= 1024.0 && i < units.len() - 1 {
+                x /= 1024.0;
+                i += 1;
+            }
+            if i == 0 {
+                format!("{x:.0} B")
+            } else {
+                format!("{x:.1} {}", units[i])
+            }
+        }
+        Metric::Cpu => format!("{v:.1}%"),
+        Metric::Restarts => format!("{v}/h"),
+        Metric::CrashLoop | Metric::Unhealthy => if v >= 1.0 { "yes" } else { "no" }.into(),
+        Metric::OpenFiles => format!("{v}"),
     }
 }
 

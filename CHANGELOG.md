@@ -3,7 +3,7 @@
 All notable changes to Vexor. Versions follow [Semantic Versioning](https://semver.org/);
 before 1.0, minor versions may include breaking changes, which are listed here.
 
-## Unreleased
+## 0.7.0 (2026-10-24, prerelease)
 
 ### Added
 - Alert delivery by email (any SMTP server; STARTTLS, implicit TLS,

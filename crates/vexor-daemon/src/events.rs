@@ -11,8 +11,9 @@
 //!   updates its 1-minute and 1-hour buckets in `metrics_rollup` (sums,
 //!   maxima and a count), so averages need no separate rollup pass. Raw
 //!   samples are kept for a day, minutes for a week, hours for 90 days.
-//!   Compact on purpose (integer app ids, seconds, CPU in tenths of a
-//!   percent, memory in KiB): see docs/plan.md 6b.2 for measured sizes.
+//!   Compact on purpose (integer app ids, CPU in tenths of a percent,
+//!   memory in KiB, rollup times in seconds): see docs/plan.md 6b.2 for
+//!   measured sizes.
 //! - A corrupt file is renamed `events.db.corrupt-<ts>` (never deleted) and a
 //!   fresh one is created. If no database can be opened at all, the daemon
 //!   keeps supervising without history and reports that it is degraded.
@@ -28,7 +29,7 @@ use serde_json::{Value, json};
 use vexor_proto::{InstanceMetrics, MetricsPoint, Resume};
 
 pub const FILE: &str = "events.db";
-const SCHEMA_VERSION: i32 = 2;
+const SCHEMA_VERSION: i32 = 3;
 const QUEUE: usize = 10_000;
 /// Default retention.
 pub const MAX_AGE: Duration = Duration::from_secs(30 * 24 * 3600);
@@ -214,19 +215,19 @@ impl Events {
         if span / 5 <= 1_500 && since >= kept_since(RAW_KEEP) {
             let mut stmt = conn
                 .prepare(
-                    "SELECT r.instance, r.ts_s, r.pid, r.cpu, r.rss_kib, r.fds
+                    "SELECT r.instance, r.ts_ms, r.pid, r.cpu, r.rss_kib, r.fds
                      FROM metrics_raw r JOIN metric_apps a ON a.id = r.app
-                     WHERE a.name = ?1 AND r.ts_s >= ?2 AND r.ts_s <= ?3
-                     ORDER BY r.instance, r.ts_s",
+                     WHERE a.name = ?1 AND r.ts_ms >= ?2 AND r.ts_ms <= ?3
+                     ORDER BY r.instance, r.ts_ms",
                 )
                 .map_err(|e| e.to_string())?;
             let rows = stmt
-                .query_map(params![app, since, until], |r| {
+                .query_map(params![app, since * 1000, until * 1000 + 999], |r| {
                     let c: Option<i64> = r.get(3)?;
                     let rss = u(r.get(4)?) * 1024;
                     Ok(MetricsPoint {
                         instance: u32::try_from(r.get::<_, i64>(0)?).unwrap_or(0),
-                        ts_ms: u(r.get(1)?) * 1000,
+                        ts_ms: u(r.get(1)?),
                         pid: u32::try_from(r.get::<_, i64>(2)?).unwrap_or(0),
                         samples: 1,
                         cpu_avg: c.map(cpu),
@@ -448,8 +449,13 @@ fn open_checked(path: &Path) -> Result<Connection, String> {
             )
             .map_err(|e| e.to_string())?;
             migrate_to_2(&conn)?;
+            migrate_to_3(&conn)?;
         }
-        1 => migrate_to_2(&conn)?,
+        1 => {
+            migrate_to_2(&conn)?;
+            migrate_to_3(&conn)?;
+        }
+        2 => migrate_to_3(&conn)?,
         SCHEMA_VERSION => {}
         v => {
             return Err(format!(
@@ -491,6 +497,32 @@ fn migrate_to_2(conn: &Connection) -> Result<(), String> {
            PRIMARY KEY (app, res, instance, ts_s)
          ) WITHOUT ROWID;
          PRAGMA user_version = 2;
+         COMMIT;",
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// Schema 3: raw samples keyed by the millisecond. With second keys, a
+/// replacement process sampled in the same second as the one that just
+/// died overwrote its last sample.
+fn migrate_to_3(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(
+        "BEGIN;
+         ALTER TABLE metrics_raw RENAME TO metrics_raw_v2;
+         CREATE TABLE metrics_raw (
+           app INTEGER NOT NULL,
+           instance INTEGER NOT NULL,
+           ts_ms INTEGER NOT NULL,
+           pid INTEGER NOT NULL,
+           cpu INTEGER,
+           rss_kib INTEGER NOT NULL,
+           fds INTEGER,
+           PRIMARY KEY (app, instance, ts_ms)
+         ) WITHOUT ROWID;
+         INSERT INTO metrics_raw
+           SELECT app, instance, ts_s * 1000, pid, cpu, rss_kib, fds FROM metrics_raw_v2;
+         DROP TABLE metrics_raw_v2;
+         PRAGMA user_version = 3;
          COMMIT;",
     )
     .map_err(|e| e.to_string())
@@ -565,8 +597,8 @@ fn prune_metrics(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
         .collect::<Result<_, _>>()?;
     for (app, instance) in keys {
         tx.execute(
-            "DELETE FROM metrics_raw WHERE app = ?1 AND instance = ?2 AND ts_s < ?3",
-            params![app, instance, now - raw_keep],
+            "DELETE FROM metrics_raw WHERE app = ?1 AND instance = ?2 AND ts_ms < ?3",
+            params![app, instance, (now - raw_keep) * 1000],
         )?;
         for (res, _, keep) in ROLLUPS {
             let keep = i64::try_from(keep.as_secs()).unwrap_or(i64::MAX);
@@ -633,7 +665,7 @@ fn write_batch(conn: &mut Connection, batch: Vec<Write>) -> rusqlite::Result<()>
                     |r| r.get(0),
                 )?;
                 let mut raw = tx.prepare_cached(
-                    "INSERT OR REPLACE INTO metrics_raw (app, instance, ts_s, pid, cpu, rss_kib, fds)
+                    "INSERT OR REPLACE INTO metrics_raw (app, instance, ts_ms, pid, cpu, rss_kib, fds)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 )?;
                 let mut rollup = tx.prepare_cached(
@@ -656,7 +688,8 @@ fn write_batch(conn: &mut Connection, batch: Vec<Write>) -> rusqlite::Result<()>
                     let cpu = m.cpu_pct.map(|c| (c * 10.0).round() as i64);
                     let rss = i64::try_from(m.rss_bytes.div_ceil(1024)).unwrap_or(i64::MAX);
                     let fds = m.open_fds.map(|f| i64::try_from(f).unwrap_or(i64::MAX));
-                    raw.execute(params![id, m.instance, ts, m.pid, cpu, rss, fds])?;
+                    let ts_ms = i64::try_from(m.ts_ms).unwrap_or(i64::MAX);
+                    raw.execute(params![id, m.instance, ts_ms, m.pid, cpu, rss, fds])?;
                     for (res, width, _) in ROLLUPS {
                         rollup.execute(params![
                             id,
@@ -1015,6 +1048,50 @@ mod tests {
         assert_eq!(
             wait_points(&ev, window.0, window.1, 1).1[0].rss_avg,
             3 << 10
+        );
+    }
+
+    #[test]
+    fn a_replacement_sampled_in_the_same_second_keeps_the_last_sample_of_the_old_process() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ev = Events::open(dir.path());
+        let t = base() - base() % 1000;
+        ev.record_metrics("web", vec![sample(0, 7, t + 100, Some(1.0), 1 << 20)]);
+        ev.record_metrics("web", vec![sample(0, 8, t + 300, None, 1 << 20)]);
+        let points = wait_points(&ev, t - 1_000, t + 1_000, 2).1;
+        assert_eq!(points.iter().map(|p| p.pid).collect::<Vec<_>>(), [7, 8]);
+    }
+
+    #[test]
+    fn schema_2_raw_samples_move_to_milliseconds() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let now = base();
+        {
+            let c = Connection::open(dir.path().join(FILE)).expect("open");
+            c.execute_batch(
+                "CREATE TABLE events (id INTEGER PRIMARY KEY, ts_ms INTEGER NOT NULL, app TEXT,
+                   shim_start INTEGER, seq INTEGER, kind TEXT NOT NULL, data TEXT NOT NULL,
+                   UNIQUE (app, shim_start, seq));
+                 CREATE TABLE cursors (app TEXT PRIMARY KEY, shim_start INTEGER NOT NULL,
+                   last_seq INTEGER NOT NULL);
+                 PRAGMA user_version = 1;",
+            )
+            .expect("v1");
+            migrate_to_2(&c).expect("v2");
+            c.execute("INSERT INTO metric_apps (id, name) VALUES (1, 'web')", [])
+                .expect("app");
+            c.execute(
+                "INSERT INTO metrics_raw VALUES (1, 0, ?1, 42, 15, 2048, 9)",
+                params![i64::try_from(now / 1000).expect("fits")],
+            )
+            .expect("row");
+        }
+        let ev = Events::open(dir.path());
+        assert!(ev.warnings().is_empty(), "{:?}", ev.warnings());
+        let p = &ev.metrics("web", now - 60_000, now + 1_000).expect("q").1[0];
+        assert_eq!(
+            (p.pid, p.ts_ms, p.cpu_max, p.rss_max),
+            (42, now / 1000 * 1000, Some(1.5), 2 << 20)
         );
     }
 

@@ -5,6 +5,11 @@ before 1.0, minor versions may include breaking changes, which are listed here.
 
 ## 0.6.0 (2026-10-24, prerelease)
 
+### Fixed
+- Resource history lost the last sample of a process that crashed when
+  its replacement was sampled within the same second (samples are now
+  stored to the millisecond; existing history is migrated).
+
 ### Added
 - Alerts: incidents for crash loops, frequent restarts, failing health
   checks and log files filling the disk, with no configuration; CPU,
@@ -19,7 +24,7 @@ before 1.0, minor versions may include breaking changes, which are listed here.
 - Resource history: `vexor metrics <app> [--since 1h] [--json]` shows CPU
   and memory sparklines, averages, peaks, open files and restarts per
   instance. Samples are kept for 24 hours, per-minute averages for 7 days
-  and per-hour averages for 90 days, in about 0.8 MiB per process.
+  and per-hour averages for 90 days, in about 0.85 MiB per process.
 
 ### Fixed
 - `vexor logs --follow` skipped a whole file when a log rotated twice

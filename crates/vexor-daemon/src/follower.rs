@@ -41,6 +41,8 @@ struct LiveInner {
     reloads: BTreeMap<u64, (u64, u64)>,
     /// Latest resource sample per running instance, from the shim.
     metrics: Vec<InstanceMetrics>,
+    /// Protocol agreed with the connected shim.
+    protocol: u32,
 }
 
 impl Live {
@@ -56,9 +58,16 @@ impl Live {
         self.lock().metrics.clone()
     }
 
-    fn connected(&self, pid: u32, snapshot: Vec<Value>) {
+    /// Protocol of the connected shim (0 when none is connected).
+    pub fn protocol(&self) -> u32 {
+        let l = self.lock();
+        if l.shim_pid.is_some() { l.protocol } else { 0 }
+    }
+
+    fn connected(&self, pid: u32, protocol: u32, snapshot: Vec<Value>) {
         let mut l = self.lock();
         l.shim_pid = Some(pid);
+        l.protocol = protocol;
         l.metrics.clear();
         l.snapshot = snapshot
             .into_iter()
@@ -75,6 +84,12 @@ impl Live {
         let Some(i) = event["instance"].as_u64() else {
             return;
         };
+        if event["type"] == "instance_removed" {
+            let mut l = self.lock();
+            l.snapshot.remove(&i);
+            l.metrics.retain(|m| u64::from(m.instance) != i);
+            return;
+        }
         if event["type"] == "state" {
             self.lock().snapshot.insert(i, event.clone());
         } else if event["type"] == "reload" {
@@ -133,10 +148,10 @@ impl Follower {
                     self.log
                         .write(json!({ "type": "shim_disconnected", "app": self.name }));
                     // A shim older than this daemon (it survived the
-                    // upgrade): speak its protocol, without metrics, until
-                    // it is replaced.
+                    // upgrade): step down until it accepts, and use only
+                    // what that protocol has, until it is replaced.
                     if refused && protocol > MIN_SHIM_PROTOCOL {
-                        protocol = MIN_SHIM_PROTOCOL;
+                        protocol -= 1;
                         continue;
                     }
                     protocol = SHIM_PROTOCOL;
@@ -361,6 +376,7 @@ impl Follower {
     fn handle(&self, msg: FromShim, resume: &mut Option<Resume>) -> bool {
         match msg {
             FromShim::Welcome {
+                protocol,
                 shim_pid,
                 shim_start,
                 next_seq,
@@ -374,7 +390,7 @@ impl Follower {
                         last_seq: next_seq.saturating_sub(1),
                     });
                 }
-                self.live.connected(shim_pid, snapshot.clone());
+                self.live.connected(shim_pid, protocol, snapshot.clone());
                 self.events.record_daemon(
                     Some(&self.name),
                     "shim_connected",

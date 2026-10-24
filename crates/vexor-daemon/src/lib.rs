@@ -849,6 +849,7 @@ impl Daemon {
                     Err(e) => error(ErrorCode::Internal, e.to_string()),
                 }
             }
+            Request::Scale { name, instances } => self.scale(&name, instances).await,
             Request::Shutdown => {
                 self.log.write(json!({ "type": "shutdown_requested" }));
                 // After this answer is sent; the signal handler shuts down.
@@ -983,7 +984,11 @@ impl Daemon {
         let mut store = self.store.lock().await;
         let name = spec.name.clone();
         if let Some(existing) = store.get(&name) {
-            if existing.spec != spec {
+            // Only the instance count differs: scale to it (only the
+            // difference starts or stops), as PM2 does for a re-started file.
+            let mut same = spec.clone();
+            same.instances = existing.spec.instances;
+            if existing.spec != same {
                 return error(
                     ErrorCode::Conflict,
                     format!(
@@ -991,6 +996,13 @@ impl Daemon {
                          `vexor delete {name}` first, or `vexor restart {name}` to restart it as is"
                     ),
                 );
+            }
+            if existing.spec.instances != spec.instances {
+                drop(store);
+                if let resp @ Response::Error { .. } = self.scale(&name, spec.instances).await {
+                    return resp;
+                }
+                store = self.store.lock().await;
             }
             if !start {
                 return self.ok_one(self.status(&store, &name));
@@ -1280,6 +1292,71 @@ impl Daemon {
             h.desired.send_replace(desired);
         }
         Ok(())
+    }
+
+    /// PM2 `scale`: change the instance count, starting or stopping only
+    /// the difference. Persisted, so a relaunched shim runs the new count.
+    async fn scale(&self, name: &str, instances: u32) -> Response {
+        if !(1..=4096).contains(&instances) {
+            return error(
+                ErrorCode::InvalidSpec,
+                "instances must be between 1 and 4096",
+            );
+        }
+        let mut store = self.store.lock().await;
+        let Some(entry) = store.get(name).cloned() else {
+            return error(ErrorCode::NotFound, format!("no app named {name:?}"));
+        };
+        let live = self.live(name).unwrap_or_default();
+        let running = entry.desired == Desired::Running && live.shim_pid().is_some();
+        if running && live.protocol() < 3 {
+            return error(
+                ErrorCode::Conflict,
+                format!(
+                    "{name}'s supervisor was started by an older Vexor and can't scale: \
+                     run `vexor restart {name}` once, then scale"
+                ),
+            );
+        }
+        let mut spec = entry.spec.clone();
+        spec.instances = instances;
+        let json = match serde_json::to_vec_pretty(&spec) {
+            Ok(j) => j,
+            Err(e) => return error(ErrorCode::Internal, e.to_string()),
+        };
+        if let Err(e) = vexor_shim::write_atomic(&self.spec_path(name), &json) {
+            return error(ErrorCode::Internal, format!("cannot write spec: {e}"));
+        }
+        if let Err(e) = store.update(|apps| {
+            if let Some(a) = apps.get_mut(name) {
+                a.spec.instances = instances;
+            }
+        }) {
+            return error(ErrorCode::Internal, format!("cannot save state: {e}"));
+        }
+        self.log
+            .write(json!({ "type": "scale", "app": name, "instances": instances }));
+        if running && let Err(e) = self.send(name, ToShim::Scale { instances }).await {
+            return error(ErrorCode::Internal, e);
+        }
+        drop(store);
+        if running {
+            // Until exactly the new set of instances has settled.
+            let deadline = tokio::time::Instant::now() + START_WAIT;
+            while tokio::time::Instant::now() < deadline {
+                let snap = live.snapshot();
+                let settled = snap.len() == usize::try_from(instances).unwrap_or(usize::MAX)
+                    && snap
+                        .iter()
+                        .all(|s| !matches!(s["state"].as_str(), Some("starting" | "stopping")));
+                if settled {
+                    break;
+                }
+                tokio::time::sleep(POLL).await;
+            }
+        }
+        let store = self.store.lock().await;
+        self.ok_one(self.status(&store, name))
     }
 
     async fn send(&self, name: &str, msg: ToShim) -> Result<(), String> {

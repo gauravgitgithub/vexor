@@ -3,6 +3,24 @@
 All notable changes to Vexor. Versions follow [Semantic Versioning](https://semver.org/);
 before 1.0, minor versions may include breaking changes, which are listed here.
 
+## Unreleased
+
+### Added
+- `vexor monit`: a live view of every app (PM2 `monit`): CPU and memory
+  bars, restarts, uptime and health per instance, the open alerts, and
+  the latest log lines of all apps, redrawn every second.
+- `vexor scale <app> <N|+N|-N>` (PM2 `scale`): only the difference is
+  started or stopped; running instances are untouched. The new count is
+  kept across restarts.
+- Starting an existing app with only a different instance count (a
+  changed `instances` in the ecosystem file, or `-i`) scales it instead
+  of reporting a conflict.
+
+### Changed
+- Shim protocol 3 (scaling). A daemon refused by an older shim steps
+  down one version at a time, so shims from 0.4–0.8 keep their metrics;
+  scaling an app supervised by a pre-0.9 shim asks for one restart first.
+
 ## 0.8.0 (2026-10-24, prerelease)
 
 ### Added

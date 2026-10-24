@@ -87,6 +87,10 @@ pub enum ShimEvent<'a> {
         #[serde(skip_serializing_if = "Option::is_none")]
         action: Option<&'static str>,
     },
+    /// The app now runs `instances` instances (`vexor scale`).
+    Scaled { app: &'a str, instances: u32 },
+    /// A scale-down stopped this instance; it is no longer part of the app.
+    InstanceRemoved { app: &'a str, instance: u32 },
     /// A watched file changed: every instance is being restarted.
     WatchRestart { app: &'a str, path: &'a Path },
     /// `cron_restart` fired: every instance is being restarted.
@@ -199,6 +203,13 @@ impl Output {
 
     pub fn snapshot(&self) -> Vec<serde_json::Value> {
         self.lock().latest.values().cloned().collect()
+    }
+
+    /// Drop what is kept about an instance a scale-down removed.
+    pub fn forget_instance(&self, instance: u32) {
+        let mut inner = self.lock();
+        inner.latest.remove(&instance);
+        inner.health.remove(&Some(instance));
     }
 
     /// Latest health result of `instance`, else the app-wide one.

@@ -106,6 +106,9 @@ locally; no SaaS.
 
 6b.7 Prometheus ✅ (docs/prometheus.md): `settings.json` `{"prometheus": {"listen": "127.0.0.1:9615"}}` turns on `GET /metrics` (text format 0.0.4) served by the daemon; re-read every 5 s and rebound on change, a failed bind retried; any non-loopback address warned about on every command (security.md T11); only `GET /metrics` answers, with a 5 s / 8 KiB request limit. Families: per instance up, state (label), restarts (counter), uptime, CPU, memory, open files, health; open alerts by rule and level; build info. Label values escaped. Tested: rendering (escaping, missing samples omitted, alert counts), settings validation, loopback check; daemon test: a 2-instance app shows up on the endpoint, other paths 404. Not yet: OTLP ingestion.
 
+
+PM2 parity (0.8–0.9): `vexor flush`, `signal` (`send-signal`), `kill`, `monit` (live view, single frame without a terminal) and `scale` (shim protocol 3: per-instance stop channels, `instance_removed` events, an instance scaled back up while stopping is restarted; the count is persisted; a `start` that differs only in instance count scales to it instead of conflicting). Tested: CLI tests for signal/flush/kill and monit; daemon tests for scale (PIDs kept on scale-up, only instance 0 left after scaling to 1, count survives a daemon restart, re-starting the original spec scales back without restarting instance 0, 0 refused) and protocol step-down (a protocol-1 shim is reached after refusals at 3 and 2; scaling it is refused with advice).
+
 Decisions and limits:
 - **Storage: SQLite, not DuckDB, inside the supervisor.** The workload is
   frequent small, crash-safe writes, plus range queries per process.

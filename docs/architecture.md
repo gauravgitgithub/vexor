@@ -227,8 +227,9 @@ How it works:
   child relationships are preserved by exec, and state plus fds are handed over
   through an inherited fd, so apps aren't restarted. Until that lands, a version
   skew between shim and daemon is supported for N-1 protocol versions and
-  flagged by `doctor`. Implemented for shim protocol 2 (metrics): shims accept
-  1 and 2, and a daemon refused by an older shim says hello again with 1.
+  flagged by `doctor`. Implemented: protocol 2 added metrics, 3 added scaling;
+  shims accept every version from 1, and a daemon refused by an older shim
+  says hello again one version lower until it is accepted.
 - If a shim itself dies (it is small and does little), its children re-parent
   to the daemon (subreaper), which adopts them identity-checked and starts a
   replacement shim at the app's next restart. Logs stop for those children

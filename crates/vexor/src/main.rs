@@ -7,6 +7,7 @@ mod describe;
 mod logs;
 mod metrics;
 mod migrate;
+mod monit;
 mod ops;
 mod spec;
 mod startup;
@@ -118,6 +119,16 @@ enum Command {
         /// Machine-readable output.
         #[arg(long)]
         json: bool,
+    },
+    /// Live view of every app: CPU and memory, restarts, health, open
+    /// alerts and the latest logs (PM2 `monit`).
+    Monit,
+    /// Change an app's instance count: `4`, or `+2` / `-1` relative to now
+    /// (PM2 `scale`). Only the difference is started or stopped.
+    Scale {
+        name: String,
+        #[arg(allow_hyphen_values = true)]
+        count: String,
     },
     /// Empty apps' log files and remove rotated ones (PM2 `flush`).
     Flush {
@@ -477,6 +488,29 @@ fn main() -> ExitCode {
             } else {
                 migrate_cmd(&home, pm2_home, dump, backup, json, env_names, verbose)
             }
+        }
+        Command::Monit => monit::run(&home),
+        Command::Scale { name, count } => {
+            let current = match client::request(&home, &Request::List) {
+                Ok(Response::Ok { apps, .. }) => {
+                    apps.iter().find(|a| a.name == name).map(|a| a.instances)
+                }
+                Ok(Response::Error { message, .. }) => return fail(&message),
+                Ok(_) => return fail("unexpected answer from the daemon"),
+                Err(e) => {
+                    eprintln!("vexor: {e}");
+                    return ExitCode::from(code::DAEMON_UNREACHABLE);
+                }
+            };
+            let Some(current) = current else {
+                return fail(&format!("no app named {name:?}"));
+            };
+            let Some(instances) = scale_target(&count, current) else {
+                return fail(&format!(
+                    "invalid count {count:?}: use a number like 4, or +2 / -1"
+                ));
+            };
+            send(&home, Request::Scale { name, instances }, false)
         }
         Command::Flush { target } => ops::flush(&home, target),
         Command::Signal { signal, target } => ops::signal(&home, &signal, target),
@@ -1435,6 +1469,19 @@ fn migrate_cmd(
     }
 }
 
+/// `4`, `+2`, `-1` → the new instance count (at least 1).
+fn scale_target(count: &str, current: u32) -> Option<u32> {
+    let c = count.trim();
+    let n = if let Some(d) = c.strip_prefix('+') {
+        current.checked_add(d.parse().ok()?)?
+    } else if let Some(d) = c.strip_prefix('-') {
+        current.saturating_sub(d.parse().ok()?)
+    } else {
+        c.parse().ok()?
+    };
+    (n >= 1).then_some(n)
+}
+
 pub(crate) fn fail(msg: &str) -> ExitCode {
     eprintln!("vexor: {msg}");
     ExitCode::from(code::FAILED)
@@ -1446,6 +1493,16 @@ fn exit_code(code: i32) -> ExitCode {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn scale_counts() {
+        assert_eq!(super::scale_target("4", 2), Some(4));
+        assert_eq!(super::scale_target("+2", 2), Some(4));
+        assert_eq!(super::scale_target("-1", 2), Some(1));
+        assert_eq!(super::scale_target("-5", 2), None);
+        assert_eq!(super::scale_target("0", 2), None);
+        assert_eq!(super::scale_target("lots", 2), None);
+    }
+
     use super::*;
 
     #[test]

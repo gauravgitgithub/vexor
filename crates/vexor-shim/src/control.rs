@@ -124,16 +124,17 @@ pub fn write_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
+/// What a daemon connection can drive in the shim.
+#[derive(Clone)]
+pub struct Links {
+    pub stop: Arc<watch::Sender<bool>>,
+    pub restart: broadcast::Sender<crate::instance::Control>,
+    pub metrics: watch::Receiver<Vec<InstanceMetrics>>,
+    pub scale: mpsc::UnboundedSender<u32>,
+}
+
 /// Accept daemon connections until the task is aborted.
-pub async fn serve(
-    listener: UnixListener,
-    out: Output,
-    me: Identity,
-    app: Arc<str>,
-    stop: Arc<watch::Sender<bool>>,
-    restart: broadcast::Sender<crate::instance::Control>,
-    metrics: watch::Receiver<Vec<InstanceMetrics>>,
-) {
+pub async fn serve(listener: UnixListener, out: Output, me: Identity, app: Arc<str>, links: Links) {
     let mut current: Option<tokio::task::JoinHandle<()>> = None;
     loop {
         let stream = match listener.accept().await {
@@ -155,9 +156,7 @@ pub async fn serve(
             out.clone(),
             me,
             app.clone(),
-            stop.clone(),
-            restart.clone(),
-            metrics.clone(),
+            links.clone(),
         )));
     }
 }
@@ -171,15 +170,13 @@ fn same_user(stream: &UnixStream) -> bool {
     }
 }
 
-async fn session(
-    stream: UnixStream,
-    out: Output,
-    me: Identity,
-    app: Arc<str>,
-    stop: Arc<watch::Sender<bool>>,
-    restart: broadcast::Sender<crate::instance::Control>,
-    mut metrics: watch::Receiver<Vec<InstanceMetrics>>,
-) {
+async fn session(stream: UnixStream, out: Output, me: Identity, app: Arc<str>, links: Links) {
+    let Links {
+        stop,
+        restart,
+        mut metrics,
+        scale,
+    } = links;
     let (read, mut write) = stream.into_split();
 
     // Reading isn't cancel-safe (a partial line would be lost), so it runs
@@ -274,6 +271,7 @@ async fn session(
                 Some(ToShim::Stop) => { stop.send_replace(true); }
                 Some(ToShim::Restart) => { let _ = restart.send(crate::instance::Control::Restart); }
                 Some(ToShim::Reload) => { let _ = restart.send(crate::instance::Control::Reload); }
+                Some(ToShim::Scale { instances }) => { let _ = scale.send(instances); }
                 Some(ToShim::Hello { .. }) => {}
                 None => return,
             },

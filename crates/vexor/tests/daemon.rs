@@ -859,7 +859,8 @@ fn daemon_falls_back_to_protocol_1_for_an_older_shim() {
             let hello: Value = serde_json::from_str(&line).unwrap_or_default();
             s.lock().expect("lock").push(hello["protocol"].clone());
             if hello["protocol"] != 1 {
-                let refused = json!({ "type": "refused", "reason": "protocol 2 not supported, shim speaks 1" });
+                let refused =
+                    json!({ "type": "refused", "reason": "protocol not supported, shim speaks 1" });
                 let _ = writeln!(stream, "{refused}");
                 continue;
             }
@@ -877,12 +878,21 @@ fn daemon_falls_back_to_protocol_1_for_an_older_shim() {
 
     home.start_daemon();
     home.wait_count("shim_connected", 1);
-    assert_eq!(*seen.lock().expect("lock"), [json!(2), json!(1)]);
-    assert_eq!(home.count("shim_refused"), 1);
+    // Steps down one version at a time until the shim accepts.
+    assert_eq!(*seen.lock().expect("lock"), [json!(3), json!(2), json!(1)]);
+    assert_eq!(home.count("shim_refused"), 2);
     let out = home.cli(&["list", "--json"]);
     let apps: Vec<Value> = serde_json::from_slice(&out.stdout).expect("json");
     assert_eq!(apps[0]["snapshot"][0]["state"], "online", "{apps:?}");
     assert!(apps[0].get("metrics").is_none(), "{apps:?}");
+    // Scaling needs protocol 3: refused, with what to do instead.
+    let out = home.cli(&["scale", "old", "2"]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("vexor restart old"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     home.kill_daemon();
     let _ = stand_in.kill();
@@ -1074,4 +1084,70 @@ fn prometheus_endpoint_serves_instance_metrics() {
     );
     assert!(body.contains("text/plain; version=0.0.4"), "{body}");
     assert!(fetch("/").expect("response").starts_with("HTTP/1.1 404"));
+}
+
+/// PM2 `scale`: only the difference is started or stopped, and the new
+/// count survives a daemon restart.
+#[test]
+fn scale_starts_and_stops_only_the_difference() {
+    let mut home = Home::new();
+    home.add_app(
+        "s",
+        "/bin/sh",
+        &["-c", "exec sleep 60"],
+        json!({ "instances": 2 }),
+    );
+    home.start_daemon();
+    let pids = |home: &Home| -> Vec<u64> {
+        let out = home.cli(&["list", "--json"]);
+        let apps: Vec<Value> = serde_json::from_slice(&out.stdout).expect("json");
+        apps[0]["snapshot"]
+            .as_array()
+            .expect("snapshot")
+            .iter()
+            .filter(|s| s["state"] == "online")
+            .filter_map(|s| s["pid"].as_u64())
+            .collect()
+    };
+    let deadline = Instant::now() + TIMEOUT;
+    while pids(&home).len() < 2 {
+        assert!(Instant::now() < deadline, "never online");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let before = pids(&home);
+
+    assert!(home.cli(&["scale", "s", "+2"]).status.success());
+    let after = pids(&home);
+    assert_eq!(after.len(), 4, "{after:?}");
+    assert!(
+        before.iter().all(|p| after.contains(p)),
+        "{before:?} -> {after:?}"
+    );
+
+    assert!(home.cli(&["scale", "s", "1"]).status.success());
+    assert_eq!(
+        pids(&home),
+        before[..1],
+        "instance 0 kept, the rest removed"
+    );
+
+    // Persisted: a new daemon reports the scaled count.
+    home.kill_daemon();
+    home.start_daemon();
+    let out = home.cli(&["list", "--json"]);
+    let apps: Vec<Value> = serde_json::from_slice(&out.stdout).expect("json");
+    assert_eq!(apps[0]["instances"], 1, "{apps:?}");
+    assert!(!home.cli(&["scale", "s", "0"]).status.success());
+    // Starting the original spec (2 instances) again scales back to it,
+    // without restarting instance 0.
+    let spec = home.path("specs/s.json");
+    let again = home.cli(&["start", "--spec", &spec.to_string_lossy()]);
+    assert!(
+        again.status.success(),
+        "{}",
+        String::from_utf8_lossy(&again.stderr)
+    );
+    let now = pids(&home);
+    assert_eq!(now.len(), 2, "{now:?}");
+    assert!(now.contains(&before[0]), "{before:?} -> {now:?}");
 }

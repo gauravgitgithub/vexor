@@ -263,9 +263,12 @@ fn errors_have_messages_and_exit_codes() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("no file by that name"));
 
     env.ok(&["start", "loop.sh"]);
-    let out = env.run(&["start", "loop.sh", "-i", "3"]);
+    let out = env.run(&["start", "loop.sh", "--max-memory-restart", "1G"]);
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("different configuration"));
+    // Only the instance count differs: that is a scale, not a conflict.
+    env.ok(&["start", "loop.sh", "-i", "3", "--fork"]);
+    assert_eq!(env.app("loop")["instances"], 3);
 
     let out = env.run(&["start", "--name", "x", "loop"]);
     assert_eq!(out.status.code(), Some(1));
@@ -1701,5 +1704,32 @@ fn signal_flush_and_kill() {
     while env.count("daemon_stopped") == 0 {
         assert!(Instant::now() < deadline, "daemon still running");
         std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// PM2 `monit`: without a terminal, one frame with every instance, the
+/// alerts and the latest logs.
+#[test]
+fn monit_prints_one_frame_without_a_terminal() {
+    let env = Env::new();
+    env.script(
+        "hi.sh",
+        "#!/bin/sh\necho hello monit\nwhile :; do sleep 0.1; done\n",
+    );
+    env.ok(&["start", "hi.sh", "--name", "hi", "-i", "2", "--fork"]);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let out = env.ok(&["monit"]);
+        if out.contains("hello monit") {
+            assert!(out.contains("No open alerts"), "{out}");
+            let rows = out
+                .lines()
+                .filter(|l| l.starts_with("hi ") && l.contains("online"))
+                .count();
+            assert_eq!(rows, 2, "{out}");
+            break;
+        }
+        assert!(Instant::now() < deadline, "{out}");
+        std::thread::sleep(Duration::from_millis(100));
     }
 }

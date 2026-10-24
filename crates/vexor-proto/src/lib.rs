@@ -16,8 +16,8 @@ pub const PROTOCOL: u32 = 1;
 /// Daemon ↔ shim protocol. Shims outlive daemon upgrades (and downgrades),
 /// so a shim accepts every version from [`MIN_SHIM_PROTOCOL`], and a daemon
 /// refused by an older shim says hello again with the minimum.
-/// 2: [`FromShim::Metrics`].
-pub const SHIM_PROTOCOL: u32 = 2;
+/// 2: [`FromShim::Metrics`]. 3: [`ToShim::Scale`].
+pub const SHIM_PROTOCOL: u32 = 3;
 pub const MIN_SHIM_PROTOCOL: u32 = 1;
 
 /// Longest accepted message line, in bytes.
@@ -41,6 +41,9 @@ pub enum ToShim {
     /// Reload every instance: start-first where the app's reload policy
     /// allows it, otherwise a restart.
     Reload,
+    /// Run this many instances, starting or stopping only the difference
+    /// (protocol 3).
+    Scale { instances: u32 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -198,6 +201,12 @@ pub enum Request {
     /// Stop the daemon (apps are left as they are; `vexor kill` stops them
     /// first).
     Shutdown,
+    /// Run `instances` instances of the app, starting or stopping only the
+    /// difference (PM2 `scale`).
+    Scale {
+        name: String,
+        instances: u32,
+    },
     /// Stored resource history of one app (plan 6b.2).
     Metrics {
         app: String,

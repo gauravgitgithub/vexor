@@ -98,6 +98,8 @@ vexor describe app                 # configuration, status, recent events
 vexor metrics app --since 6h       # CPU, memory, restarts over time
 vexor alerts                       # open incidents and alert rules
 vexor signal SIGUSR2 app           # PM2 sendSignal; also flush, kill
+vexor scale app +2                 # PM2 scale: only the difference starts or stops
+vexor monit                        # live view: CPU, memory, health, alerts, logs
 vexor startup                      # start at boot (systemd, launchd)
 ```
 

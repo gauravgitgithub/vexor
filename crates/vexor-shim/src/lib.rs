@@ -179,6 +179,8 @@ pub async fn run(spec: AppSpec, home: Option<PathBuf>) -> i32 {
 
     // Latest resource samples, for the daemon connection.
     let (metrics_tx, metrics_rx) = watch::channel(Vec::new());
+    // `ToShim::Scale` from the daemon connection: the new instance count.
+    let (scale_tx, mut scale_rx) = tokio::sync::mpsc::unbounded_channel::<u32>();
 
     // Daemon-managed mode: lock, control socket, persisted identities.
     let mut presence = None;
@@ -209,9 +211,12 @@ pub async fn run(spec: AppSpec, home: Option<PathBuf>) -> i32 {
                     out.clone(),
                     me,
                     Arc::from(spec.name.as_str()),
-                    stop_tx.clone(),
-                    restart_tx.clone(),
-                    metrics_rx.clone(),
+                    control::Links {
+                        stop: stop_tx.clone(),
+                        restart: restart_tx.clone(),
+                        metrics: metrics_rx.clone(),
+                        scale: scale_tx.clone(),
+                    },
                 ));
                 let managed = orphan::Managed::persisted(paths.pids.clone());
                 presence = Some((lock, server, paths));
@@ -286,8 +291,18 @@ pub async fn run(spec: AppSpec, home: Option<PathBuf>) -> i32 {
         ))
     });
     let epoch = tokio::time::Instant::now();
+    // Standalone, the shim ends once every instance has stopped, unless a
+    // schedule or a file change can start them again.
+    let exit_when_idle = home.is_none() && spec.cron_restart.is_none() && spec.watch.is_none();
     let mut set = tokio::task::JoinSet::new();
-    for index in 0..spec.instances {
+    // Each instance's own stop: set for all on a global stop, and for the
+    // ones a scale-down removes.
+    let mut stops: std::collections::BTreeMap<u32, watch::Sender<bool>> = Default::default();
+    let spawn = |index: u32,
+                 set: &mut tokio::task::JoinSet<(u32, State)>,
+                 stops: &mut std::collections::BTreeMap<u32, watch::Sender<bool>>| {
+        let (tx, rx) = watch::channel(*stop_rx.borrow());
+        stops.insert(index, tx);
         let runner = instance::Runner::new(
             spec.clone(),
             index,
@@ -297,23 +312,62 @@ pub async fn run(spec: AppSpec, home: Option<PathBuf>) -> i32 {
             (logs.out.clone(), logs.err.clone()),
             cluster.clone(),
         );
-        // Standalone, the shim ends once every instance has stopped, unless
-        // a schedule or a file change can start them again.
-        let exit_when_idle = home.is_none() && spec.cron_restart.is_none() && spec.watch.is_none();
-        set.spawn(runner.run(stop_rx.clone(), restart_tx.subscribe(), exit_when_idle));
+        let control = restart_tx.subscribe();
+        set.spawn(async move { (index, runner.run(rx, control, exit_when_idle).await) });
+    };
+    for index in 0..spec.instances {
+        spawn(index, &mut set, &mut stops);
     }
 
+    let mut wanted = spec.instances;
+    let mut global_stop = stop_rx.clone();
     let mut states = Vec::with_capacity(set.len());
     loop {
         tokio::select! {
             joined = set.join_next() => match joined {
-                Some(Ok(state)) => states.push(state),
+                Some(Ok((index, state))) => {
+                    stops.remove(&index);
+                    let stopping = *stop_rx.borrow();
+                    if index >= wanted && !stopping {
+                        // Scaled down: the instance is gone, not stopped.
+                        out.forget_instance(index);
+                        out.emit(&output::ShimEvent::InstanceRemoved { app: &spec.name, instance: index });
+                    } else if index < wanted && !stopping && home.is_some() {
+                        // Scaled back up while it was stopping.
+                        spawn(index, &mut set, &mut stops);
+                    } else {
+                        states.push(state);
+                    }
+                }
                 Some(Err(e)) => {
                     eprintln!("vexor shim: instance task failed: {e}");
                     states.push(State::Errored);
                 }
                 None => break,
             },
+            Ok(()) = global_stop.changed() => {
+                if *global_stop.borrow() {
+                    for tx in stops.values() {
+                        tx.send_replace(true);
+                    }
+                }
+            }
+            Some(n) = scale_rx.recv() => {
+                let n = n.max(1);
+                if !*stop_rx.borrow() {
+                    for i in wanted.min(n)..wanted.max(n) {
+                        if i >= n {
+                            if let Some(tx) = stops.get(&i) {
+                                tx.send_replace(true);
+                            }
+                        } else if !stops.contains_key(&i) {
+                            spawn(i, &mut set, &mut stops);
+                        }
+                    }
+                    wanted = n;
+                    out.emit(&output::ShimEvent::Scaled { app: &spec.name, instances: n });
+                }
+            }
             _ = term.recv() => { stop_tx.send_replace(true); }
             _ = int.recv() => { stop_tx.send_replace(true); }
         }

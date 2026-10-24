@@ -232,23 +232,27 @@ mod tests {
                 .spawn()
                 .expect("spawn")
         };
-        let mut plain = spawn("exec sleep 30");
-        let mut more = spawn(
-            "exec 3</dev/null 4</dev/null 5</dev/null 6</dev/null 7</dev/null \
-             8</dev/null 9</dev/null; exec 10</dev/null 11</dev/null 12</dev/null; exec sleep 30",
-        );
-        let fds = |pid| usage(pid).expect("usage").open_fds.expect("fds");
+        // Both close 3-9 (a CI runner may pass extra descriptors down;
+        // any above 9 are the same in both), then one reopens all seven.
+        // Single digits only: dash doesn't take more.
+        let close = "exec 3<&- 4<&- 5<&- 6<&- 7<&- 8<&- 9<&-";
+        let mut plain = spawn(&format!("{close}; exec sleep 30"));
+        let mut more = spawn(&format!(
+            "{close}; exec 3</dev/null 4</dev/null 5</dev/null 6</dev/null \
+             7</dev/null 8</dev/null 9</dev/null; exec sleep 30"
+        ));
+        let fds = |pid| usage(pid).ok().and_then(|u| u.open_fds);
         // Wait until both have exec'd sleep (`sh` may hold extra files).
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         let (p, m) = loop {
             std::thread::sleep(Duration::from_millis(50));
             let (p, m) = (fds(plain.id()), fds(more.id()));
-            if m == p + 10 || std::time::Instant::now() > deadline {
+            if p.zip(m).is_some_and(|(p, m)| m == p + 7) || std::time::Instant::now() > deadline {
                 break (p, m);
             }
         };
         let _ = (plain.kill(), more.kill(), plain.wait(), more.wait());
-        assert_eq!(m, p + 10, "{p} vs {m}");
+        assert_eq!(m, p.map(|p| p + 7), "{p:?} vs {m:?}");
     }
 
     #[test]

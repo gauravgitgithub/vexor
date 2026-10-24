@@ -18,15 +18,23 @@ const LOG_LINES: usize = 8;
 /// Specs (log paths) change rarely: re-read this often.
 const SPEC_REFRESH: Duration = Duration::from_secs(10);
 
-/// A bar of `width` cells for `fraction` (0..=1).
+/// A bar of `width` cells for `fraction` (0..=1): thin, so bars in
+/// adjacent rows stay apart; anything above zero shows at least one cell.
 pub fn bar(fraction: f64, width: usize) -> String {
     #[allow(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
         clippy::cast_precision_loss
     )]
-    let filled = ((fraction.clamp(0.0, 1.0) * width as f64).round() as usize).min(width);
-    format!("{}{}", "█".repeat(filled), "·".repeat(width - filled))
+    let mut filled = ((fraction.clamp(0.0, 1.0) * width as f64).round() as usize).min(width);
+    if fraction > 0.0 && filled == 0 && width > 0 {
+        filled = 1;
+    }
+    format!(
+        "{}{}",
+        "━".repeat(filled),
+        ui::dim(&"─".repeat(width - filled))
+    )
 }
 
 fn frame(apps: &[AppStatus], alerts: &[Value], log_lines: &[String]) -> String {
@@ -189,8 +197,9 @@ mod tests {
 
     #[test]
     fn bars_fill_in_proportion() {
-        assert_eq!(bar(0.0, 4), "····");
-        assert_eq!(bar(0.5, 4), "██··");
-        assert_eq!(bar(2.0, 4), "████");
+        assert_eq!(bar(0.0, 4), "────");
+        assert_eq!(bar(0.5, 4), "━━──");
+        assert_eq!(bar(0.01, 4), "━───", "visible above zero");
+        assert_eq!(bar(2.0, 4), "━━━━");
     }
 }

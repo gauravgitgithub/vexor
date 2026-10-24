@@ -19,6 +19,8 @@ npm install -g vexord
 
 [Why Vexor](#why-vexor) · [Benchmarks](#benchmarks) · [Compare](#vexor-vs-pm2-oxmgr-and-forever) · [Migrate from PM2](#migrate-from-pm2-in-four-commands) · [FAQ](#faq)
 
+<img src="docs/demo/demo-vexor.gif" alt="Vexor demo: a 4-worker cluster survives a killed worker, reloads with zero downtime, scales out, then vexor monit and vexor doctor" width="900">
+
 </div>
 
 ## What is Vexor?

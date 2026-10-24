@@ -3,6 +3,15 @@
 All notable changes to Vexor. Versions follow [Semantic Versioning](https://semver.org/);
 before 1.0, minor versions may include breaking changes, which are listed here.
 
+## Unreleased
+
+### Changed
+- `vexor monit` draws thin bars, and any CPU above zero shows at least
+  one cell (bars of similar size used to merge into a solid block).
+
+### Added
+- A demo GIF in the README (`docs/demo/demo.tape`, recorded with VHS).
+
 ## 0.10.0 (2026-10-24, prerelease)
 
 ### Added

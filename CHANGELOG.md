@@ -5,6 +5,13 @@ before 1.0, minor versions may include breaking changes, which are listed here.
 
 ## 0.7.0 (2026-10-24, prerelease)
 
+### Security
+- Webhook URLs are treated as secrets (Slack's carries its token): only
+  the scheme and host are ever shown or logged.
+- Email header values are stripped of line breaks and control characters.
+- An SMTP server can't hold a delivery open: replies are capped at 100
+  lines and a whole delivery at 60 s.
+
 ### Added
 - Alert delivery by email (any SMTP server; STARTTLS, implicit TLS,
   AUTH PLAIN/LOGIN) and webhooks (JSON signed with HMAC-SHA256, or Slack

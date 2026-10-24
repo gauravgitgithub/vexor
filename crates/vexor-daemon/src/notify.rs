@@ -84,7 +84,11 @@ pub enum Format {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Webhook {
-    pub url: String,
+    /// Often the credential itself (Slack puts the token in the path):
+    /// never shown; `target` is what is displayed.
+    pub url: Secret,
+    /// Scheme and host of `url`, for display.
+    pub target: String,
     pub format: Format,
     pub secret: Option<Secret>,
     pub ca_file: Option<PathBuf>,
@@ -235,7 +239,12 @@ impl ChannelsFile {
         let mut webhooks = Vec::new();
         for (i, w) in self.webhooks.into_iter().enumerate() {
             let what = format!("channels.webhooks[{i}]");
-            Url::parse(&w.url).map_err(|e| format!("{what}.url: {e}"))?;
+            let parsed = Url::parse(&w.url).map_err(|e| format!("{what}.url: {e}"))?;
+            let target = format!(
+                "{}://{}",
+                if parsed.https { "https" } else { "http" },
+                parsed.host
+            );
             check_levels(&w.levels, &what)?;
             webhooks.push(Webhook {
                 secret: secret(
@@ -243,7 +252,8 @@ impl ChannelsFile {
                     w.secret_file.as_deref(),
                     &format!("{what}.secret"),
                 )?,
-                url: w.url,
+                url: Secret(w.url),
+                target,
                 format: w.format,
                 ca_file: w.ca_file,
                 levels: w.levels,
@@ -316,10 +326,7 @@ impl Channel {
     fn name(&self) -> String {
         match self {
             Channel::Email(e) => format!("email to {}", e.to.join(", ")),
-            Channel::Webhook(w) => format!(
-                "webhook {}",
-                Url::parse(&w.url).map_or_else(|_| w.url.clone(), |u| u.host)
-            ),
+            Channel::Webhook(w) => format!("webhook {}", w.target),
         }
     }
 
@@ -616,13 +623,22 @@ impl Write for Conn {
 
 struct Smtp {
     r: BufReader<Conn>,
+    deadline: Instant,
 }
+
+const MAX_REPLY_LINES: usize = 100;
+/// A whole email delivery, however the server paces its replies.
+const DELIVERY_DEADLINE: Duration = Duration::from_secs(60);
 
 impl Smtp {
     /// Read one (possibly multi-line) reply: its code and text lines.
     fn reply(&mut self) -> Result<(u16, Vec<String>), String> {
         let mut lines = Vec::new();
         loop {
+            // A broken or hostile server must not keep a delivery going.
+            if lines.len() >= MAX_REPLY_LINES || Instant::now() > self.deadline {
+                return Err("SMTP server reply too long or too slow".into());
+            }
             let mut line = String::new();
             let n = self
                 .r
@@ -678,8 +694,10 @@ pub fn send_email(e: &Email, alert: &Alert) -> Result<(), String> {
         Tls::Implicit => Conn::tls(stream, &e.host, config()?)?,
         _ => Conn::Plain(stream),
     };
+    let deadline = Instant::now() + DELIVERY_DEADLINE;
     let mut s = Smtp {
         r: BufReader::new(conn),
+        deadline,
     };
     s.expect(&[220], "greeting")?;
     let me = hostname();
@@ -694,6 +712,7 @@ pub fn send_email(e: &Email, alert: &Alert) -> Result<(), String> {
         };
         s = Smtp {
             r: BufReader::new(Conn::tls(plain, &e.host, config()?)?),
+            deadline,
         };
         caps = s.cmd(&format!("EHLO {me}"), &[250], "EHLO")?;
     }
@@ -727,6 +746,13 @@ pub fn send_email(e: &Email, alert: &Alert) -> Result<(), String> {
     Ok(())
 }
 
+/// A header value without line breaks or other control characters.
+fn header(v: &str) -> String {
+    v.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
+}
+
 fn email_message(e: &Email, a: &Alert) -> String {
     let body = format!(
         "{}\r\n\r\nApp:       {}\r\nInstance:  {}\r\nRule:      {}\r\nLevel:     {}\r\nValue:     {}\r\nThreshold: {}\r\nHost:      {}\r\n\r\n`vexor alerts` on {} shows open incidents.\r\n",
@@ -742,10 +768,10 @@ fn email_message(e: &Email, a: &Alert) -> String {
     );
     format!(
         "From: {}\r\nTo: {}\r\nSubject: [vexor] {}\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: 8bit\r\nX-Vexor-Rule: {}\r\n\r\n{body}",
-        e.from,
-        e.to.join(", "),
-        a.summary(),
-        a.rule,
+        header(&e.from),
+        header(&e.to.join(", ")),
+        header(&a.summary()),
+        header(&a.rule),
     )
 }
 
@@ -803,19 +829,17 @@ impl Url {
         } else if let Some(r) = url.strip_prefix("http://") {
             (false, r)
         } else {
-            return Err(format!("{url:?} is not an http:// or https:// URL"));
+            return Err("not an http:// or https:// URL".into());
         };
         let (authority, path) = rest
             .find('/')
             .map_or((rest, "/"), |i| (&rest[..i], &rest[i..]));
         if authority.is_empty() || authority.contains('@') {
-            return Err(format!(
-                "{url:?}: missing host (credentials in URLs are not supported)"
-            ));
+            return Err("missing host (credentials in URLs are not supported)".into());
         }
         let (host, port) = match authority.rsplit_once(':') {
             Some((h, p)) if !h.ends_with(']') || h.starts_with('[') => {
-                (h, p.parse().map_err(|_| format!("{url:?}: invalid port"))?)
+                (h, p.parse().map_err(|_| "invalid port".to_owned())?)
             }
             _ => (authority, if https { 443 } else { 80 }),
         };
@@ -864,7 +888,7 @@ pub fn webhook_body(w: &Webhook, a: &Alert) -> String {
 }
 
 pub fn send_webhook(w: &Webhook, alert: &Alert) -> Result<(), String> {
-    let url = Url::parse(&w.url)?;
+    let url = Url::parse(&w.url.0)?;
     let body = webhook_body(w, alert);
     let stream = Conn::connect(&url.host, url.port)?;
     let mut conn = if url.https {
@@ -997,6 +1021,55 @@ mod tests {
     #[test]
     fn dot_stuffing_and_line_endings() {
         assert_eq!(dot_stuff("a\n.b\r\n..c"), "a\r\n..b\r\n...c");
+    }
+
+    #[test]
+    fn webhook_urls_show_only_their_host() {
+        let c = serde_json::from_value::<ChannelsFile>(json!({ "webhooks": [{
+            "url": "https://hooks.slack.com/services/T0/B0/token123", "format": "slack"
+        }] }))
+        .expect("parse")
+        .resolve()
+        .expect("valid");
+        let shown = serde_json::to_string(&c).expect("json");
+        assert!(
+            !shown.contains("token123") && shown.contains("https://hooks.slack.com"),
+            "{shown}"
+        );
+        let bad = serde_json::from_value::<ChannelsFile>(
+            json!({ "webhooks": [{ "url": "ftp://x/secret-path" }] }),
+        )
+        .expect("parse")
+        .resolve()
+        .expect_err("invalid");
+        assert!(!bad.contains("secret-path"), "{bad}");
+    }
+
+    #[test]
+    fn header_values_cannot_break_lines() {
+        let a = Alert {
+            host: "evil\r\nBcc: x@y".into(),
+            ..alert()
+        };
+        let m = email_message(&email(25), &a);
+        let head = m.split("\r\n\r\n").next().expect("head");
+        assert!(!head.lines().any(|l| l.starts_with("Bcc:")), "{head}");
+    }
+
+    #[test]
+    fn endless_smtp_replies_are_cut_off() {
+        let l = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = l.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            let (mut s, _) = l.accept().expect("accept");
+            for _ in 0..1000 {
+                if s.write_all(b"220-still going\r\n").is_err() {
+                    return;
+                }
+            }
+        });
+        let err = send_email(&email(port), &alert()).expect_err("cut off");
+        assert!(err.contains("too long"), "{err}");
     }
 
     #[test]
@@ -1186,7 +1259,8 @@ mod tests {
             requests
         });
         let w = Webhook {
-            url: format!("http://127.0.0.1:{port}/hook"),
+            url: Secret(format!("http://127.0.0.1:{port}/hook")),
+            target: format!("http://127.0.0.1:{port}"),
             format: Format::Json,
             secret: Some(Secret("key".into())),
             ca_file: None,
@@ -1228,7 +1302,8 @@ mod tests {
         let channels = Channels {
             email: None,
             webhooks: vec![Webhook {
-                url: "http://127.0.0.1:1/".into(),
+                url: Secret("http://127.0.0.1:1/".into()),
+                target: "http://127.0.0.1:1".into(),
                 format: Format::Slack,
                 secret: None,
                 ca_file: None,

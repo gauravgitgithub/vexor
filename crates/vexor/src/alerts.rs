@@ -151,7 +151,7 @@ pub fn print(open: &[Value], recent: &[Value], rules: &Value) {
         println!(
             "  {} {} ({}{signed})",
             ui::cyan(&format!("{:<11}", "webhook")),
-            w["url"].as_str().unwrap_or("?"),
+            w["target"].as_str().unwrap_or("?"),
             w["format"].as_str().unwrap_or("json")
         );
     }

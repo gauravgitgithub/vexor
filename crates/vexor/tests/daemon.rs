@@ -889,3 +889,79 @@ fn daemon_falls_back_to_protocol_1_for_an_older_shim() {
     let _ = stand_in.wait();
     drop(lock);
 }
+
+fn alerts(home: &Home) -> Value {
+    let out = home.cli(&["alerts", "--json"]);
+    serde_json::from_slice(&out.stdout).expect("alerts json")
+}
+
+fn wait_alerts(home: &Home, what: &str, ok: impl Fn(&Value) -> bool) -> Value {
+    // Rules are evaluated every 5 s.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let a = alerts(home);
+        if ok(&a) {
+            return a;
+        }
+        assert!(Instant::now() < deadline, "{what}: {a}");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// Plan step 6b.3: a crash loop opens a danger incident, which recovers
+/// once the app runs again; a broken alerts.json is reported and the
+/// previous rules stay in force.
+#[test]
+fn crash_loop_alert_opens_and_recovers() {
+    let mut home = Home::new();
+    let marker = home.path("broken");
+    std::fs::write(&marker, "").expect("marker");
+    let script = format!("[ -f {} ] && exit 3; exec sleep 60", marker.display());
+    home.add_app(
+        "crashy",
+        "/bin/sh",
+        &["-c", &script],
+        json!({ "policy": { "max_restarts": 2, "min_uptime_ms": 1000 } }),
+    );
+    home.start_daemon();
+    let a = wait_alerts(&home, "crash loop incident", |a| {
+        a["open"].as_array().is_some_and(|o| {
+            o.iter()
+                .any(|i| i["key"]["metric"] == "crash_loop" && i["level"] == "danger")
+        })
+    });
+    assert!(
+        a["recent"]
+            .as_array()
+            .expect("recent")
+            .iter()
+            .any(|e| e["rule"] == "crash_loop" && e["level"] == "danger" && e["notify"] == true),
+        "{a}"
+    );
+
+    // Warnings go to stderr; the previous (built-in) rules stay in force.
+    std::fs::write(home.path("alerts.json"), "{ not json").expect("write");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let out = home.cli(&["alerts"]);
+        if String::from_utf8_lossy(&out.stderr).contains("alerts.json is invalid") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "no warning");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert_eq!(
+        alerts(&home)["rules"]["rules"]["crash_loop"]["enabled"],
+        true
+    );
+
+    std::fs::remove_file(&marker).expect("fix the app");
+    assert!(home.cli(&["restart", "crashy"]).status.success());
+    wait_alerts(&home, "recovered", |a| {
+        a["open"].as_array().is_some_and(Vec::is_empty)
+            && a["recent"].as_array().is_some_and(|r| {
+                r.iter()
+                    .any(|e| e["rule"] == "crash_loop" && e["level"] == "recovered")
+            })
+    });
+}

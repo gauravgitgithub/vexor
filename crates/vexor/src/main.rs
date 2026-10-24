@@ -1,5 +1,6 @@
 //! `vexor`: process manager CLI.
 
+mod alerts;
 mod apply;
 mod client;
 mod describe;
@@ -113,6 +114,12 @@ enum Command {
         /// At most this many events.
         #[arg(long, default_value_t = 50)]
         limit: u32,
+        /// Machine-readable output.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show open alert incidents, recent alerts and the rules in force.
+    Alerts {
         /// Machine-readable output.
         #[arg(long)]
         json: bool,
@@ -446,6 +453,7 @@ fn main() -> ExitCode {
                 migrate_cmd(&home, pm2_home, dump, backup, json, env_names, verbose)
             }
         }
+        Command::Alerts { json } => send(&home, Request::Alerts, json),
         Command::Metrics { name, since, json } => {
             let until_ms = describe::now_ms();
             let since_ms =
@@ -580,6 +588,24 @@ fn send(home: &std::path::Path, req: Request, json: bool) -> ExitCode {
             }
             ExitCode::SUCCESS
         }
+        Response::Alerts {
+            open,
+            recent,
+            rules,
+            warnings,
+        } => {
+            print_warnings(&warnings);
+            if json {
+                let out = serde_json::json!({ "open": open, "recent": recent, "rules": rules });
+                match serde_json::to_string_pretty(&out) {
+                    Ok(s) => println!("{s}"),
+                    Err(e) => return fail(&e.to_string()),
+                }
+            } else {
+                alerts::print(&open, &recent, &rules);
+            }
+            ExitCode::SUCCESS
+        }
         Response::Metrics {
             resolution_ms,
             points,
@@ -695,7 +721,8 @@ fn run_plan(home: &std::path::Path, plan: spec::Plan, allow_unsupported: bool) -
                 Response::Events { .. }
                 | Response::Describe { .. }
                 | Response::Version { .. }
-                | Response::Metrics { .. },
+                | Response::Metrics { .. }
+                | Response::Alerts { .. },
             ) => {}
             Err(e) => {
                 eprintln!("vexor: {e}");
@@ -1018,6 +1045,14 @@ pub(crate) fn print_events(events: &[serde_json::Value]) {
         if let Some(err) = e["error"].as_str() {
             detail.push(err.to_owned());
         }
+        if e["type"] == "alert" {
+            let rule = e["rule"].as_str().unwrap_or("?");
+            detail.push(format!(
+                "{rule} {} ({})",
+                e["level"].as_str().unwrap_or("?"),
+                alerts::value(rule, e["value"].as_f64().unwrap_or(0.0))
+            ));
+        }
         let time = e["ts_ms"]
             .as_u64()
             .and_then(|ms| {
@@ -1037,6 +1072,7 @@ pub(crate) fn print_events(events: &[serde_json::Value]) {
             | "orphan" => ui::yellow(&event),
             "health" if e["ok"] == false => ui::yellow(&event),
             "cron_restart" | "watch_restart" | "health" => ui::cyan(&event),
+            "alert" => alerts::level(e["level"].as_str().unwrap_or("alert")),
             _ => event.clone(),
         };
         t.row(vec![

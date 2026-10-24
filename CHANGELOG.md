@@ -3,6 +3,16 @@
 All notable changes to Vexor. Versions follow [Semantic Versioning](https://semver.org/);
 before 1.0, minor versions may include breaking changes, which are listed here.
 
+## Unreleased
+
+### Added
+- Alerts: incidents for crash loops, frequent restarts, failing health
+  checks and log files filling the disk, with no configuration; CPU,
+  memory and open-file thresholds in `alerts.json`. Levels must hold for
+  a while before an incident opens, it notifies once per level and when
+  it recovers, and flapping incidents go quiet. `vexor alerts` shows open
+  incidents, the last week of alerts and the rules. See docs/alerts.md.
+
 ## 0.5.0 (2026-10-24, prerelease)
 
 ### Added

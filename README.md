@@ -91,6 +91,7 @@ vexor logs -f                      # one timeline of every app's logs
 vexor reload app                   # new processes first, then retire the old
 vexor describe app                 # configuration, status, recent events
 vexor metrics app --since 6h       # CPU, memory, restarts over time
+vexor alerts                       # open incidents and alert rules
 vexor startup                      # start at boot (systemd, launchd)
 ```
 

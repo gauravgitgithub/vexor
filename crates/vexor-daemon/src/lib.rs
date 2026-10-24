@@ -5,6 +5,7 @@
 //! shim in line with its desired state. Killing or restarting the daemon
 //! leaves shims and apps untouched; a new daemon reconnects.
 
+mod alerts;
 mod events;
 mod follower;
 mod log;
@@ -143,6 +144,7 @@ async fn run_async(home: PathBuf) -> i32 {
         events: events.clone(),
         store: Mutex::new(store),
         apps: StdMutex::new(BTreeMap::new()),
+        alerts: StdMutex::new(AlertState::default()),
     });
     for (name, entry) in entries {
         if let Err(e) = daemon.follow(&name, &entry) {
@@ -157,12 +159,14 @@ async fn run_async(home: PathBuf) -> i32 {
     events.record_daemon(None, "daemon_started", json!({ "pid": std::process::id() }));
 
     let server = tokio::spawn(serve(listener, daemon.clone()));
+    let alerting = tokio::spawn(alert_loop(daemon.clone()));
     // Stopping the daemon leaves shims and apps running.
     tokio::select! {
         _ = term.recv() => {}
         _ = int.recv() => {}
     }
     server.abort();
+    alerting.abort();
     let _ = std::fs::remove_file(home.join(SOCKET));
     log.write(json!({ "type": "daemon_stopped" }));
     exit::OK
@@ -176,6 +180,132 @@ struct Daemon {
     /// serializes them (docs/architecture.md §9).
     store: Mutex<Store>,
     apps: StdMutex<BTreeMap<String, Handle>>,
+    alerts: StdMutex<AlertState>,
+}
+
+/// Alert evaluation (plan 6b.3): rules from `alerts.json`, re-read when it
+/// changes; a bad file keeps the previous rules and is reported.
+#[derive(Default)]
+struct AlertState {
+    config: alerts::Config,
+    /// Modification time of the file last read; `None` when absent.
+    loaded: Option<std::time::SystemTime>,
+    error: Option<String>,
+    engine: alerts::Engine,
+    restarts: alerts::RestartRate,
+    /// Latest size of each app's log files, refreshed every minute.
+    log_disk: BTreeMap<String, u64>,
+}
+
+impl AlertState {
+    fn reload(&mut self, home: &Path, log: &Log) {
+        let path = home.join(alerts::FILE);
+        let modified = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+        if modified == self.loaded {
+            return;
+        }
+        self.loaded = modified;
+        let parsed = match modified {
+            None => Ok(alerts::Config::default()),
+            Some(_) => std::fs::read_to_string(&path)
+                .map_err(|e| e.to_string())
+                .and_then(|t| alerts::Config::parse(&t)),
+        };
+        match parsed {
+            Ok(c) => {
+                self.config = c;
+                self.error = None;
+                log.write(json!({ "type": "alerts_loaded", "file": modified.is_some() }));
+            }
+            Err(e) => {
+                let msg = format!(
+                    "{} is invalid, keeping the previous rules: {e}",
+                    path.display()
+                );
+                log.write(json!({ "type": "error", "error": msg }));
+                self.error = Some(msg);
+            }
+        }
+    }
+}
+
+const ALERT_EVERY: Duration = Duration::from_secs(5);
+
+/// Evaluate alert rules every few seconds, until aborted.
+async fn alert_loop(daemon: Arc<Daemon>) {
+    let mut tick = tokio::time::interval(ALERT_EVERY);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut round = 0u64;
+    loop {
+        tick.tick().await;
+        round = round.wrapping_add(1);
+        let apps: Vec<(String, AppEntry)> = {
+            let store = daemon.store.lock().await;
+            store
+                .apps()
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        };
+        // Log sizes need a few stat calls per app: once a minute, off the
+        // runtime thread.
+        let sizes = if round % 12 == 1 {
+            let logs: Vec<(String, vexor_core::LogSpec)> = apps
+                .iter()
+                .map(|(n, e)| (n.clone(), e.spec.logs.clone()))
+                .collect();
+            tokio::task::spawn_blocking(move || {
+                logs.into_iter()
+                    .map(|(n, l)| (n, log_disk_bytes(&l)))
+                    .collect::<BTreeMap<_, _>>()
+            })
+            .await
+            .ok()
+        } else {
+            None
+        };
+        for change in daemon.evaluate_alerts(&apps, sizes) {
+            let data = json!({
+                "rule": change.key.metric.name(),
+                "instance": change.key.instance,
+                "level": change.kind,
+                "value": change.value,
+                "threshold": change.threshold,
+                "notify": change.notify,
+            });
+            daemon
+                .events
+                .record_daemon(Some(&change.key.app), "alert", data.clone());
+            let mut line = data;
+            line["type"] = json!("alert");
+            line["app"] = json!(change.key.app);
+            daemon.log.write(line);
+        }
+    }
+}
+
+/// Bytes of an app's log files on disk, rotated ones included.
+fn log_disk_bytes(logs: &vexor_core::LogSpec) -> u64 {
+    let mut total = 0;
+    for base in [&logs.out, &logs.err] {
+        let size = |p: &Path| std::fs::metadata(p).map_or(0, |m| m.len());
+        total += size(base);
+        for i in 1..=logs.retain {
+            total += size(Path::new(&format!("{}.{i}", base.display())));
+        }
+    }
+    total
+}
+
+fn observe(
+    out: &mut Vec<alerts::Change>,
+    engine: &mut alerts::Engine,
+    config: &alerts::Config,
+    key: alerts::Key,
+    value: f64,
+    now: u64,
+) {
+    out.extend(engine.observe(config, key, value, now));
 }
 
 struct Handle {
@@ -230,6 +360,141 @@ impl Daemon {
             old.task.abort();
         }
         Ok(())
+    }
+
+    /// One round of alert evaluation over the apps that should be running.
+    fn evaluate_alerts(
+        &self,
+        apps: &[(String, AppEntry)],
+        sizes: Option<BTreeMap<String, u64>>,
+    ) -> Vec<alerts::Change> {
+        use alerts::{Key, Metric};
+        let now = describe_now_ms();
+        let mut st = self.alerts.lock().unwrap_or_else(PoisonError::into_inner);
+        st.reload(&self.home, &self.log);
+        if let Some(s) = sizes {
+            st.log_disk = s;
+        }
+        let AlertState {
+            config,
+            engine,
+            restarts,
+            log_disk,
+            ..
+        } = &mut *st;
+        let mut out = Vec::new();
+        for (name, entry) in apps {
+            if entry.desired == Desired::Stopped {
+                continue;
+            }
+            let Some(live) = self.live(name).filter(|l| l.shim_pid().is_some()) else {
+                continue;
+            };
+            let samples = live.metrics();
+            // A sample older than three intervals is from a process that
+            // stopped being measured.
+            let stale = entry.spec.policy.metrics_interval_ms.max(5_000) * 3;
+            for s in live.snapshot() {
+                let Some(i) = s["instance"].as_u64().and_then(|i| u32::try_from(i).ok()) else {
+                    continue;
+                };
+                let state = s["state"].as_str().unwrap_or("");
+                let key = |metric| Key {
+                    metric,
+                    app: name.clone(),
+                    instance: Some(i),
+                };
+                let flag = |b: bool| if b { 1.0 } else { 0.0 };
+                observe(
+                    &mut out,
+                    engine,
+                    config,
+                    key(Metric::CrashLoop),
+                    flag(state == "errored"),
+                    now,
+                );
+                let rate = restarts.observe(name, i, s["restarts"].as_u64().unwrap_or(0), now);
+                #[allow(clippy::cast_precision_loss)]
+                observe(
+                    &mut out,
+                    engine,
+                    config,
+                    key(Metric::Restarts),
+                    rate as f64,
+                    now,
+                );
+                let sample = samples
+                    .iter()
+                    .find(|m| m.instance == i && s["pid"].as_u64() == Some(u64::from(m.pid)))
+                    .filter(|m| now.saturating_sub(m.ts_ms) <= stale);
+                let failing = sample
+                    .and_then(|m| m.health.as_ref())
+                    .is_some_and(|h| !h.ok);
+                observe(
+                    &mut out,
+                    engine,
+                    config,
+                    key(Metric::Unhealthy),
+                    flag(state == "unhealthy" || failing),
+                    now,
+                );
+                if let Some(m) = sample {
+                    if let Some(c) = m.cpu_pct {
+                        observe(&mut out, engine, config, key(Metric::Cpu), c, now);
+                    }
+                    #[allow(clippy::cast_precision_loss)]
+                    observe(
+                        &mut out,
+                        engine,
+                        config,
+                        key(Metric::Memory),
+                        m.rss_bytes as f64,
+                        now,
+                    );
+                    if let Some(f) = m.open_fds {
+                        #[allow(clippy::cast_precision_loss)]
+                        observe(
+                            &mut out,
+                            engine,
+                            config,
+                            key(Metric::OpenFiles),
+                            f as f64,
+                            now,
+                        );
+                    }
+                }
+            }
+            if let Some(&bytes) = log_disk.get(name) {
+                let key = Key {
+                    metric: Metric::LogDisk,
+                    app: name.clone(),
+                    instance: None,
+                };
+                #[allow(clippy::cast_precision_loss)]
+                observe(&mut out, engine, config, key, bytes as f64, now);
+            }
+        }
+        // Stopped, deleted or scaled-down instances: incidents end quietly.
+        engine.forget_older_than(now.saturating_sub(60_000));
+        restarts.forget_older_than(now.saturating_sub(60_000));
+        out
+    }
+
+    fn alerts_response(&self, recent: Vec<Value>) -> Response {
+        let st = self.alerts.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut warnings = self.events.warnings();
+        warnings.extend(st.error.clone());
+        Response::Alerts {
+            open: st
+                .engine
+                .open()
+                .iter()
+                .filter_map(|o| serde_json::to_value(o).ok())
+                .collect(),
+            recent,
+            rules: serde_json::to_value(&st.config).unwrap_or(Value::Null),
+            warnings,
+        }
     }
 
     fn ok(&self, apps: Vec<AppStatus>) -> Response {
@@ -337,6 +602,18 @@ impl Daemon {
                     Ok(Err(e)) => error(ErrorCode::Internal, e),
                     Err(e) => error(ErrorCode::Internal, e.to_string()),
                 }
+            }
+            Request::Alerts => {
+                let events = self.events.clone();
+                let since = describe_now_ms().saturating_sub(7 * 24 * 3_600_000);
+                let recent = tokio::task::spawn_blocking(move || {
+                    events.query_kind(None, Some("alert"), Some(since), 50)
+                })
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .unwrap_or_default();
+                self.alerts_response(recent)
             }
             Request::Metrics {
                 app,
@@ -796,6 +1073,12 @@ impl Daemon {
             tokio::time::sleep(POLL).await;
         }
     }
+}
+
+fn describe_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 fn error(code: ErrorCode, message: impl Into<String>) -> Response {

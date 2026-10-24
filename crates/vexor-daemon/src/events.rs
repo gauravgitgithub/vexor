@@ -332,19 +332,30 @@ impl Events {
         since_ms: Option<u64>,
         limit: u32,
     ) -> Result<Vec<Value>, String> {
+        self.query_kind(app, None, since_ms, limit)
+    }
+
+    /// Like [`Events::query`], only events of type `kind` if given.
+    pub fn query_kind(
+        &self,
+        app: Option<&str>,
+        kind: Option<&str>,
+        since_ms: Option<u64>,
+        limit: u32,
+    ) -> Result<Vec<Value>, String> {
         let conn = self.reader().map_err(|e| format!("event history: {e}"))?;
         let since = since_ms.map_or(0, |s| i64::try_from(s).unwrap_or(i64::MAX));
         let mut stmt = conn
             .prepare(
                 "SELECT data, shim_start, seq FROM (
                    SELECT id, ts_ms, data, shim_start, seq FROM events
-                   WHERE (?1 IS NULL OR app = ?1) AND ts_ms >= ?2
+                   WHERE (?1 IS NULL OR app = ?1) AND ts_ms >= ?2 AND (?4 IS NULL OR kind = ?4)
                    ORDER BY ts_ms DESC, id DESC LIMIT ?3
                  ) ORDER BY ts_ms ASC, id ASC",
             )
             .map_err(|e| e.to_string())?;
         let rows = stmt
-            .query_map(params![app, since, i64::from(limit)], |r| {
+            .query_map(params![app, since, i64::from(limit), kind], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, Option<i64>>(1)?,

@@ -190,6 +190,9 @@ pub enum Request {
         since_ms: Option<u64>,
         limit: u32,
     },
+    /// Open alert incidents, recent alert history and the rules in force
+    /// (plan 6b.3).
+    Alerts,
     /// Stored resource history of one app (plan 6b.2).
     Metrics {
         app: String,
@@ -219,6 +222,16 @@ pub enum Response {
     },
     Events {
         events: Vec<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        warnings: Vec<String>,
+    },
+    Alerts {
+        /// Open incidents: metric, app, instance, level, since, value.
+        open: Vec<serde_json::Value>,
+        /// Recent `alert` events, oldest first.
+        recent: Vec<serde_json::Value>,
+        /// Rules in force, per metric.
+        rules: serde_json::Value,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         warnings: Vec<String>,
     },

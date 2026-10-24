@@ -8,7 +8,9 @@ before 1.0, minor versions may include breaking changes, which are listed here.
 ### Added
 - PM2 `uid`, `gid` and `username`: the app runs as that user (name or
   number) and group (default: the user's primary group), without root's
-  other groups. Needs Vexor running as root, as PM2 does. No PM2
+  other groups. Needs Vexor running as root, as PM2 does. A numeric uid
+  with no passwd entry needs an explicit group, and group 0 is refused
+  for a non-root user, so an app never keeps root's group. No PM2
   ecosystem field blocks a migration any more.
 - `vexor doctor [--json]`: checks the home directory (private, not on a
   network filesystem), the daemon and its version, every app's

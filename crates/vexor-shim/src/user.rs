@@ -34,6 +34,26 @@ pub fn resolve(user: Option<&str>, group: Option<&str>) -> Result<Ids, String> {
         Some(g) => Some(group_id(g)?),
         None => primary,
     };
+    // Fail closed: switching the user must never leave the app in root's
+    // group (gid 0), which it would keep from the shim.
+    if let Some(u) = uid
+        && u != 0
+    {
+        match gid {
+            None => {
+                return Err(format!(
+                    "user {} has no passwd entry, so its group is unknown: set `group` (PM2 gid)",
+                    user.unwrap_or("?")
+                ));
+            }
+            Some(0) => {
+                return Err(
+                    "group 0 (root) for a non-root user is refused: set another `group`".into(),
+                );
+            }
+            Some(_) => {}
+        }
+    }
     Ok(Ids { uid, gid })
 }
 
@@ -125,6 +145,17 @@ mod tests {
     fn switching_users_needs_root() {
         if rustix::process::geteuid().is_root() {
             assert!(resolve(Some("root"), None).is_ok());
+            // A uid without a passwd entry needs an explicit, non-root group.
+            let err = resolve(Some("4000123"), None).expect_err("no group");
+            assert!(err.contains("group"), "{err}");
+            assert!(resolve(Some("4000123"), Some("0")).is_err());
+            assert_eq!(
+                resolve(Some("4000123"), Some("4000123")),
+                Ok(Ids {
+                    uid: Some(4_000_123),
+                    gid: Some(4_000_123)
+                })
+            );
             assert!(resolve(Some("no-such-user-vexor"), None).is_err());
             assert!(resolve(None, Some("no-such-group-vexor")).is_err());
         } else {

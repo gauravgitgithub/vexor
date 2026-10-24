@@ -1165,7 +1165,7 @@ checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
 
 [[package]]
 name = "vexor"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "assert_cmd",
  "chrono",
@@ -1184,7 +1184,7 @@ dependencies = [
 
 [[package]]
 name = "vexor-core"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "proptest",
  "serde",
@@ -1193,7 +1193,7 @@ dependencies = [
 
 [[package]]
 name = "vexor-daemon"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "libc",
  "rusqlite",
@@ -1209,7 +1209,7 @@ dependencies = [
 
 [[package]]
 name = "vexor-pm2"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "croner",
  "globset",
@@ -1221,7 +1221,7 @@ dependencies = [
 
 [[package]]
 name = "vexor-proto"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1231,7 +1231,7 @@ dependencies = [
 
 [[package]]
 name = "vexor-shim"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "chrono",
  "command-fds",

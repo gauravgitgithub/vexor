@@ -3,7 +3,7 @@
 All notable changes to Vexor. Versions follow [Semantic Versioning](https://semver.org/);
 before 1.0, minor versions may include breaking changes, which are listed here.
 
-## Unreleased
+## 0.5.0 (2026-10-24, prerelease)
 
 ### Added
 - Resource history: `vexor metrics <app> [--since 1h] [--json]` shows CPU

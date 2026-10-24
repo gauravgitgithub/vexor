@@ -37,7 +37,7 @@ commands several times faster. Each app has its own small supervisor, so your
 apps keep running and stay managed even if the main daemon crashes or is
 upgraded.
 
-> **Status: prerelease (0.4).** Used for evaluation and real migrations;
+> **Status: prerelease (0.5).** Used for evaluation and real migrations;
 > see the [changelog](CHANGELOG.md) and the [known limits](#is-vexor-production-ready).
 
 ## Why Vexor

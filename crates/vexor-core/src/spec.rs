@@ -72,6 +72,14 @@ pub struct AppSpec {
     /// still follows after `kill_timeout`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub shutdown_with_message: bool,
+    /// PM2 `uid`/`username`: run the app as this user (name or number).
+    /// Needs Vexor running as root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    /// PM2 `gid`: run the app with this group (name or number); default:
+    /// the user's primary group.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
 }
 
 impl AppSpec {

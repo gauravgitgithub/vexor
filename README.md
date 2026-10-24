@@ -100,6 +100,7 @@ vexor alerts                       # open incidents and alert rules
 vexor signal SIGUSR2 app           # PM2 sendSignal; also flush, kill
 vexor scale app +2                 # PM2 scale: only the difference starts or stops
 vexor monit                        # live view: CPU, memory, health, alerts, logs
+vexor doctor                       # what's wrong with the setup, and how to fix it
 vexor startup                      # start at boot (systemd, launchd)
 ```
 
@@ -237,7 +238,8 @@ without cluster mode or log management.
 
 For most setups, yes: the same ecosystem files and commands work. Run
 `vexor check ecosystem.config.js` to see any setting Vexor handles
-differently or doesn't support; today that is `uid`/`gid`. Differences are documented in
+differently or doesn't support: every PM2 field is now either supported
+or reported (for example `uid`/`gid` need Vexor running as root, as in PM2). Differences are documented in
 [docs/compatibility.md](docs/compatibility.md) and checked against PM2 7 in
 [docs/conformance.md](docs/conformance.md).
 

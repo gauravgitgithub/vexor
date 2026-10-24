@@ -541,7 +541,7 @@ module.exports = {
   apps: [
     { name: 'a', script: './loop.sh', env: { MODE: 'dev' }, env_production: { MODE: 'prod' } },
     { name: 'b', script: 'loop.sh', instances: 2, merge_logs: true, autostart: false },
-    { name: 'm', script: 'loop.sh', uid: 'www' },
+    { name: 'm', script: 'loop.sh', shutdown_with_message: true },
   ],
 };
 ";
@@ -584,7 +584,7 @@ fn ecosystem_check_reports_without_starting() {
             .as_array()
             .expect("notes")
             .iter()
-            .any(|n| n["field"] == "uid" && n["severity"] == "fatal")
+            .any(|n| n["field"] == "shutdown_with_message" && n["severity"] == "fatal")
     );
     assert!(
         !env.home.path().join("daemon.sock").exists(),
@@ -1023,7 +1023,7 @@ fn migrate_blocked_apps_exit_4_and_missing_dump_explains() {
     let dump = pm2_dump(&env);
     let mut d: Value =
         serde_json::from_str(&std::fs::read_to_string(&dump).expect("read")).expect("json");
-    d[2]["uid"] = "www".into();
+    d[2]["shutdown_with_message"] = true.into();
     std::fs::write(&dump, d.to_string()).expect("write");
     let out = env.run(&[
         "migrate",
@@ -1033,8 +1033,11 @@ fn migrate_blocked_apps_exit_4_and_missing_dump_explains() {
     ]);
     assert_eq!(out.status.code(), Some(4));
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("uid"), "{stdout}");
-    assert!(stdout.contains("blocked: uid"), "{stdout}");
+    assert!(stdout.contains("shutdown_with_message"), "{stdout}");
+    assert!(
+        stdout.contains("blocked: shutdown_with_message"),
+        "{stdout}"
+    );
     assert!(stdout.contains("1 of 2 apps ready to move"), "{stdout}");
     assert!(stdout.contains("Needs attention"), "{stdout}");
 
@@ -1732,4 +1735,39 @@ fn monit_prints_one_frame_without_a_terminal() {
         assert!(Instant::now() < deadline, "{out}");
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+/// `vexor doctor`: findings with fixes; problems set the exit status.
+#[test]
+fn doctor_reports_findings_with_fixes() {
+    let env = Env::new();
+    env.ok(&["start", "loop.sh"]);
+    let out = env.ok(&["doctor", "--json"]);
+    let findings: Vec<Value> = serde_json::from_str(&out).expect("json");
+    assert!(
+        findings.iter().any(|f| f["level"] == "ok"
+            && f["check"]
+                .as_str()
+                .is_some_and(|c| c.contains("is answering"))),
+        "{out}"
+    );
+    std::fs::set_permissions(env.home.path(), std::fs::Permissions::from_mode(0o755))
+        .expect("chmod");
+    let out = env.ok(&["doctor", "--json"]);
+    let findings: Vec<Value> = serde_json::from_str(&out).expect("json");
+    let open = findings
+        .iter()
+        .find(|f| {
+            f["check"]
+                .as_str()
+                .is_some_and(|c| c.contains("readable by other users"))
+        })
+        .expect("permission warning");
+    assert_eq!(open["level"], "warning");
+    assert!(
+        open["fix"]
+            .as_str()
+            .is_some_and(|f| f.starts_with("chmod 700")),
+        "{open}"
+    );
 }

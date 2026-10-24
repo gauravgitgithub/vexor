@@ -217,6 +217,42 @@ fn increment_var_must_name_a_number_in_env() {
     assert!(done.stderr.contains("increment_var"), "{}", done.stderr);
 }
 
+/// PM2 uid/gid: as root, the app runs as the given user with only its
+/// groups; otherwise the spec is refused.
+#[test]
+fn user_switch_needs_root_and_drops_groups() {
+    let shim = Shim::new();
+    let root = Command::new("id")
+        .arg("-u")
+        .output()
+        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "0");
+    let extra = json!({ "user": "nobody", "policy": { "autorestart": false } });
+    let done = shim.run(&shim.spec(
+        "/bin/sh",
+        &["-c", "echo uid=$(id -u) groups=$(id -G)"],
+        extra,
+    ));
+    if !root {
+        assert_eq!(done.code, Some(2), "{}", done.stderr);
+        assert!(done.stderr.contains("root"), "{}", done.stderr);
+        return;
+    }
+    assert_eq!(done.code, Some(0), "{}", done.stderr);
+    let nobody = |flag: &str| {
+        let o = Command::new("id")
+            .args([flag, "nobody"])
+            .output()
+            .expect("id");
+        String::from_utf8_lossy(&o.stdout).trim().to_owned()
+    };
+    let line = shim.out_log();
+    assert_eq!(
+        line.trim(),
+        format!("uid={} groups={}", nobody("-u"), nobody("-g")),
+        "root's groups must not leak"
+    );
+}
+
 #[test]
 fn stderr_goes_to_the_error_log() {
     let shim = Shim::new();

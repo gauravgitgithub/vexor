@@ -52,6 +52,16 @@ pub fn spawn_with(
         .current_dir(&spec.cwd)
         .env_clear()
         .envs(&spec.env);
+    // PM2 uid/gid. Dropping root also drops its supplementary groups
+    // (std does setgroups(0) when it sets the uid as root).
+    let ids = crate::user::resolve(spec.user.as_deref(), spec.group.as_deref())
+        .map_err(io::Error::other)?;
+    if let Some(gid) = ids.gid {
+        cmd.gid(gid);
+    }
+    if let Some(uid) = ids.uid {
+        cmd.uid(uid);
+    }
     if let Some(i) = index {
         cmd.env(&spec.instance_var, i.to_string());
         if let Some((var, value)) = spec.incremented(i) {

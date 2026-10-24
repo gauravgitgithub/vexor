@@ -23,6 +23,7 @@ mod metrics;
 mod orphan;
 mod output;
 mod process;
+mod user;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -135,6 +136,7 @@ pub fn validate(spec: &AppSpec) -> Result<(), String> {
             "`increment_var` {var:?} must name a variable of `env` holding a whole number"
         ));
     }
+    user::resolve(spec.user.as_deref(), spec.group.as_deref())?;
     if spec.shutdown_with_message && !spec.node_ipc && spec.cluster.is_none() {
         return Err("`shutdown_with_message` needs the Node IPC channel (`node_ipc`)".into());
     }

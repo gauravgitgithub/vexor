@@ -227,11 +227,16 @@ const IGNORED: &[(&str, &str)] = &[
 ];
 
 /// Fields whose absence changes behaviour.
-const FATAL: &[(&str, &str)] = &[
-    ("uid", "running as another user is not supported yet"),
-    ("gid", "running as another group is not supported yet"),
-    ("username", "running as another user is not supported yet"),
-];
+const FATAL: &[(&str, &str)] = &[];
+
+/// A user or group given as a name or a number.
+fn id_field(v: Option<&Value>) -> Option<String> {
+    match v? {
+        Value::String(s) if !s.is_empty() => Some(s.clone()),
+        Value::Number(n) => n.as_u64().map(|n| n.to_string()),
+        _ => None,
+    }
+}
 
 /// Every field this translator knows, for unknown-field reporting.
 const HANDLED: &[&str] = &[
@@ -265,6 +270,9 @@ const HANDLED: &[&str] = &[
     "instance_var",
     "increment_var",
     "shutdown_with_message",
+    "uid",
+    "gid",
+    "username",
     "treekill",
     "watch",
     "ignore_watch",
@@ -702,7 +710,11 @@ pub fn translate(app: &Value, ctx: &Context) -> Result<Translated, Vec<Note>> {
             .get("increment_var")
             .and_then(Value::as_str)
             .map(str::to_owned),
-        shutdown_with_message,
+        // Without IPC it can't apply: reported above as fatal, and with
+        // --allow-unsupported the app gets the stop signal instead.
+        shutdown_with_message: shutdown_with_message && node_ipc,
+        user: id_field(obj.get("uid").or_else(|| obj.get("username"))),
+        group: id_field(obj.get("gid")),
     };
     let autostart = obj
         .get("autostart")

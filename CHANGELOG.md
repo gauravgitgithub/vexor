@@ -3,6 +3,19 @@
 All notable changes to Vexor. Versions follow [Semantic Versioning](https://semver.org/);
 before 1.0, minor versions may include breaking changes, which are listed here.
 
+## Unreleased
+
+### Added
+- PM2 `uid`, `gid` and `username`: the app runs as that user (name or
+  number) and group (default: the user's primary group), without root's
+  other groups. Needs Vexor running as root, as PM2 does. No PM2
+  ecosystem field blocks a migration any more.
+- `vexor doctor [--json]`: checks the home directory (private, not on a
+  network filesystem), the daemon and its version, every app's
+  supervisor and crash loops, missing executables, free disk space for
+  logs, the open-file limit, the event database and configuration files,
+  and start at boot, with a fix for each finding.
+
 ## 0.9.0 (2026-10-24, prerelease)
 
 ### Added

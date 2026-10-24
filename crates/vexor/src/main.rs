@@ -4,6 +4,7 @@ mod alerts;
 mod apply;
 mod client;
 mod describe;
+mod doctor;
 mod logs;
 mod metrics;
 mod migrate;
@@ -123,6 +124,13 @@ enum Command {
     /// Live view of every app: CPU and memory, restarts, health, open
     /// alerts and the latest logs (PM2 `monit`).
     Monit,
+    /// Check the setup and say what to fix: daemon, apps, files, limits,
+    /// disk space, start at boot.
+    Doctor {
+        /// Machine-readable output.
+        #[arg(long)]
+        json: bool,
+    },
     /// Change an app's instance count: `4`, or `+2` / `-1` relative to now
     /// (PM2 `scale`). Only the difference is started or stopped.
     Scale {
@@ -490,6 +498,7 @@ fn main() -> ExitCode {
             }
         }
         Command::Monit => monit::run(&home),
+        Command::Doctor { json } => doctor::run(&home, json),
         Command::Scale { name, count } => {
             let current = match client::request(&home, &Request::List) {
                 Ok(Response::Ok { apps, .. }) => {

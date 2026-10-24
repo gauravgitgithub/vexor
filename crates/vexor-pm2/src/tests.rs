@@ -128,7 +128,17 @@ fn behaviour_changing_fields_are_fatal() {
     }));
     let mut f = fatal(&t.notes);
     f.sort_unstable();
-    assert_eq!(f, ["exec_mode", "shutdown_with_message", "uid",]);
+    assert_eq!(f, ["exec_mode", "shutdown_with_message",]);
+}
+
+#[test]
+fn uid_and_gid_are_translated() {
+    let t = tr(json!({ "name": "a", "script": "/bin/sleep", "uid": "www", "gid": 33 }));
+    assert!(fatal(&t.notes).is_empty(), "{:?}", t.notes);
+    assert_eq!(t.spec.user.as_deref(), Some("www"));
+    assert_eq!(t.spec.group.as_deref(), Some("33"));
+    let t = tr(json!({ "name": "a", "script": "/bin/sleep", "username": "deploy" }));
+    assert_eq!(t.spec.user.as_deref(), Some("deploy"));
 }
 
 #[test]

@@ -131,6 +131,9 @@ const TOOLS = {
     },
   },
   oxmgr: {
+    // OxMgr marks an app errored after its 3rd crash by default
+    // (crash_restart_limit 3), even with uptime between crashes.
+    crashLimit: 3,
     // Its PM2 ecosystem import doesn't run .js scripts with Node (found
     // while writing this), so apps are started one by one with `node`.
     start(apps) {
@@ -262,7 +265,8 @@ async function crashRestart(tool) {
   TOOLS[tool].start(idleApps(1));
   await waitOnline(tool, 1);
   const times = [];
-  for (let i = 0; i < 8; i++) {
+  const limit = TOOLS[tool].crashLimit;
+  for (let i = 0; i < (limit || 8); i++) {
     await sleep(1500); // past min_uptime, so each crash is "stable"
     const [pid] = appPids(/idle\.js/);
     const t = now();
@@ -277,7 +281,11 @@ async function crashRestart(tool) {
     times.push(now() - t);
   }
   stopAll();
-  return stats(times);
+  const s = stats(times);
+  if (limit) {
+    s.note = `only ${limit} restarts timed: it marks an app errored after its ${limit}rd crash by default, even with uptime between crashes`;
+  }
+  return s;
 }
 
 /** HTTP load: requests every 5 ms; counts failures. */

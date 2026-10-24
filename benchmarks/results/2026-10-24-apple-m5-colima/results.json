@@ -1,0 +1,233 @@
+{
+  "meta": {
+    "date": "2026-10-24",
+    "node": "v22.23.4",
+    "pm2": "7.1.0",
+    "vexor": "vexor 0.10.1",
+    "cpu": "Apple M5 (colima VM)",
+    "cores": 4,
+    "mem_gb": 4,
+    "platform": "linux/arm64 6.8.0-117-generic",
+    "container": true,
+    "trials": 15
+  },
+  "versions": {
+    "pm2": "7.1.0",
+    "vexor": "0.10.1",
+    "oxmgr": "0.5.0",
+    "forever": "4.0.3"
+  },
+  "pm2": {
+    "cli_ms": {
+      "median": 58,
+      "p95": 63,
+      "min": 57,
+      "max": 63,
+      "n": 15
+    },
+    "start10_ms": {
+      "median": 362,
+      "p95": 380,
+      "min": 354,
+      "max": 380,
+      "n": 5
+    },
+    "idle_1": {
+      "supervisor_rss": 136486912,
+      "supervisor_pss": 56579072,
+      "supervisor_processes": 2,
+      "supervisor_cpu_pct": 0.3663857709089698,
+      "app_rss": 65404928
+    },
+    "idle_10": {
+      "supervisor_rss": 138858496,
+      "supervisor_pss": 39277568,
+      "supervisor_processes": 2,
+      "supervisor_cpu_pct": 0.6990446389933758,
+      "app_rss": 655065088
+    },
+    "idle_50": {
+      "supervisor_rss": 140763136,
+      "supervisor_pss": 34818048,
+      "supervisor_processes": 2,
+      "supervisor_cpu_pct": 2.0995101143066615,
+      "app_rss": 3274178560
+    },
+    "crash_restart_ms": {
+      "median": 131,
+      "p95": 134,
+      "min": 125,
+      "max": 134,
+      "n": 8
+    },
+    "reload": {
+      "reloads": 5,
+      "ok": 1565,
+      "failed": 0
+    },
+    "daemon_crash": {
+      "still_managed": false,
+      "ok": 480,
+      "failed": 730
+    },
+    "install_bytes": 17502208
+  },
+  "vexor": {
+    "cli_ms": {
+      "median": 14,
+      "p95": 16,
+      "min": 13,
+      "max": 16,
+      "n": 15
+    },
+    "start10_ms": {
+      "median": 339,
+      "p95": 351,
+      "min": 317,
+      "max": 351,
+      "n": 5
+    },
+    "idle_1": {
+      "supervisor_rss": 8568832,
+      "supervisor_pss": 5758976,
+      "supervisor_processes": 2,
+      "supervisor_cpu_pct": 0,
+      "app_rss": 51789824
+    },
+    "idle_10": {
+      "supervisor_rss": 36483072,
+      "supervisor_pss": 8300544,
+      "supervisor_processes": 11,
+      "supervisor_cpu_pct": 0.06663779029087395,
+      "app_rss": 518004736
+    },
+    "idle_50": {
+      "supervisor_rss": 160804864,
+      "supervisor_pss": 19864576,
+      "supervisor_processes": 51,
+      "supervisor_cpu_pct": 0.19984012789768185,
+      "app_rss": 2589794304
+    },
+    "crash_restart_ms": {
+      "median": 47,
+      "p95": 49,
+      "min": 45,
+      "max": 49,
+      "n": 8
+    },
+    "reload": {
+      "reloads": 5,
+      "ok": 1592,
+      "failed": 0
+    },
+    "daemon_crash": {
+      "still_managed": true,
+      "ok": 1154,
+      "failed": 0
+    },
+    "install_bytes": 5087232
+  },
+  "oxmgr": {
+    "cli_ms": {
+      "median": 13,
+      "p95": 14,
+      "min": 12,
+      "max": 14,
+      "n": 15
+    },
+    "start10_ms": {
+      "median": 268,
+      "p95": 275,
+      "min": 262,
+      "max": 275,
+      "n": 5
+    },
+    "idle_1": {
+      "supervisor_rss": 3608576,
+      "supervisor_pss": 3604480,
+      "supervisor_processes": 1,
+      "supervisor_cpu_pct": 0.03331334532613765,
+      "app_rss": 48705536
+    },
+    "idle_10": {
+      "supervisor_rss": 3801088,
+      "supervisor_pss": 3796992,
+      "supervisor_processes": 1,
+      "supervisor_cpu_pct": 0.06664445184938354,
+      "app_rss": 485711872
+    },
+    "idle_50": {
+      "supervisor_rss": 4734976,
+      "supervisor_pss": 4730880,
+      "supervisor_processes": 1,
+      "supervisor_cpu_pct": 0.29971028006260614,
+      "app_rss": 2429591552
+    },
+    "crash_restart_ms": {
+      "median": 41,
+      "p95": 44,
+      "min": 40,
+      "max": 44,
+      "n": 3,
+      "note": "only 3 restarts timed: it marks an app errored after its 3rd crash by default, even with uptime between crashes"
+    },
+    "reload": {
+      "reloads": 5,
+      "ok": 1596,
+      "failed": 2
+    },
+    "daemon_crash": {
+      "still_managed": true,
+      "ok": 1202,
+      "failed": 0
+    },
+    "install_bytes": 4042752
+  },
+  "forever": {
+    "cli_ms": {
+      "median": 86,
+      "p95": 89,
+      "min": 84,
+      "max": 89,
+      "n": 15
+    },
+    "start10_ms": {
+      "median": 1005,
+      "p95": 1014,
+      "min": 991,
+      "max": 1014,
+      "n": 5
+    },
+    "idle_1": {
+      "supervisor_rss": 70238208,
+      "supervisor_pss": 31940608,
+      "supervisor_processes": 1,
+      "supervisor_cpu_pct": 0.19984678413216533,
+      "app_rss": 48562176
+    },
+    "idle_10": {
+      "supervisor_rss": 704339968,
+      "supervisor_pss": 195464192,
+      "supervisor_processes": 10,
+      "supervisor_cpu_pct": 2.4956741647810463,
+      "app_rss": 486359040
+    },
+    "idle_50": {
+      "supervisor_rss": 3522396160,
+      "supervisor_pss": 859862016,
+      "supervisor_processes": 50,
+      "supervisor_cpu_pct": 11.770964953115648,
+      "app_rss": 2429636608
+    },
+    "crash_restart_ms": {
+      "median": 18,
+      "p95": 19,
+      "min": 17,
+      "max": 19,
+      "n": 8
+    },
+    "reload": null,
+    "daemon_crash": null,
+    "install_bytes": 21434368
+  }
+}

@@ -125,11 +125,11 @@ app is down for about its start-up time while it moves. Details:
 
 ## Benchmarks
 
-Vexor 0.3.1 against PM2 7.1.0, OxMgr 0.5.0 (another Rust process manager)
+Vexor 0.10.1 against PM2 7.1.0, OxMgr 0.5.0 (another Rust process manager)
 and forever 4.0.3, each installed from npm and run alone on the same apps
 in one Linux container. Every number below was measured; the harness is in
 [`benchmarks/`](benchmarks/) and the raw results are
-[committed](benchmarks/results/2026-10-23-apple-m5-docker/results.json).
+[committed](benchmarks/results/2026-10-24-apple-m5-colima/results.json).
 
 <p align="center">
   <img src="docs/benchmarks/supervisor-memory.svg" alt="Supervisor memory: Vexor, PM2, OxMgr, forever" width="760"><br>
@@ -140,51 +140,62 @@ in one Linux container. Every number below was measured; the harness is in
   <img src="docs/benchmarks/install-size.svg" alt="Installed size" width="760">
 </p>
 
-Measured 2026-10-23 on Apple M5 (Docker Desktop VM) (10 cores, 8 GB), linux/arm64 7.0.12-linuxkit, in a container, Node v22.23.4. Each tool runs alone, installed from npm, on the same apps. **Bold** = best; n/a = not supported or failed (see notes).
+Measured 2026-10-24 on Apple M5 (colima VM) (4 cores, 4 GB), linux/arm64 6.8.0-117-generic, in a container, Node v22.23.4. Each tool runs alone, installed from npm, on the same apps. **Bold** = best; n/a = not supported or failed (see notes).
 
-| Measure | Vexor 0.3.1 | PM2 7.1.0 | OxMgr 0.5.0 | forever 4.0.3 |
+| Measure | Vexor 0.10.1 | PM2 7.1.0 | OxMgr 0.5.0 | forever 4.0.3 |
 |---|---|---|---|---|
-| List apps (CLI), median | **23 ms** | 76 ms | 24 ms | 109 ms |
-| Start 10 apps until online, median | 352 ms | 435 ms | **317 ms** | 1268 ms |
-| Supervisor memory (PSS), 1 app | 5.7 MiB | 33 MiB | **3.5 MiB** | 37 MiB |
-| Supervisor memory (PSS), 10 apps | 7.9 MiB | 21 MiB | **5.7 MiB** | 191 MiB |
-| Supervisor memory (PSS), 50 apps | 17 MiB | 21 MiB | **4.6 MiB** | 825 MiB |
-| Supervisor memory (RSS), 1 app | 8.1 MiB | 66 MiB | **3.5 MiB** | 67 MiB |
-| Supervisor memory (RSS), 10 apps | 33 MiB | 68 MiB | **5.7 MiB** | 675 MiB |
-| Supervisor memory (RSS), 50 apps | 140 MiB | 72 MiB | **4.6 MiB** | 3316 MiB |
-| Supervisor CPU while idle, 1 app | **0.00%** | 0.37% | 0.07% | 0.37% |
-| Supervisor CPU while idle, 10 apps | **0.00%** | 0.70% | 0.07% | 2.26% |
-| Supervisor CPU while idle, 50 apps | 0.33% | 1.50% | **0.17%** | 7.48% |
-| Crash to back online, median | 38 ms | 159 ms | 20 ms | **13 ms** |
-| Failed requests in 5 cluster reloads | **0** | **0** | **0** | n/a |
-| Supervisor daemon killed: failed requests | **0** | 739 | **0** | n/a |
+| List apps (CLI), median | 14 ms | 58 ms | **13 ms** | 86 ms |
+| Start 10 apps until online, median | 339 ms | 362 ms | **268 ms** | 1005 ms |
+| Supervisor memory (PSS), 1 app | 5.5 MiB | 54 MiB | **3.4 MiB** | 30 MiB |
+| Supervisor memory (PSS), 10 apps | 7.9 MiB | 37 MiB | **3.6 MiB** | 186 MiB |
+| Supervisor memory (PSS), 50 apps | 19 MiB | 33 MiB | **4.5 MiB** | 820 MiB |
+| Supervisor memory (RSS), 1 app | 8.2 MiB | 130 MiB | **3.4 MiB** | 67 MiB |
+| Supervisor memory (RSS), 10 apps | 35 MiB | 132 MiB | **3.6 MiB** | 672 MiB |
+| Supervisor memory (RSS), 50 apps | 153 MiB | 134 MiB | **4.5 MiB** | 3359 MiB |
+| Supervisor CPU while idle, 1 app | **0.00%** | 0.37% | 0.03% | 0.20% |
+| Supervisor CPU while idle, 10 apps | **0.07%** | 0.70% | 0.07% | 2.50% |
+| Supervisor CPU while idle, 50 apps | **0.20%** | 2.10% | 0.30% | 11.77% |
+| Crash to back online, median | 47 ms | 131 ms | 41 ms | **18 ms** |
+| Failed requests in 5 cluster reloads | **0** | **0** | 2 | n/a |
+| Supervisor daemon killed: failed requests | **0** | 730 | **0** | n/a |
 | Supervisor daemon killed: app still managed | **yes** | no | **yes** | n/a |
-| Installed size (npm) | 5.8 MiB | 17 MiB | **3.9 MiB** | 20 MiB |
+| Installed size (npm) | 4.9 MiB | 17 MiB | **3.9 MiB** | 20 MiB |
 
-Requests sent: reloads Vexor 1615, PM2 1726, OxMgr 1645, forever 0; daemon kill Vexor 1239, PM2 1219, OxMgr 1220, forever 0.
+Requests sent: reloads Vexor 1592, PM2 1565, OxMgr 1598, forever 0; daemon kill Vexor 1154, PM2 1210, OxMgr 1202, forever 0.
 
 Notes:
-- OxMgr, crash_restart_ms: Measured separately: OxMgr marks an app errored after its 3rd crash by default (crash_restart_limit 3), even with uptime between crashes, so only 3 restarts can be timed.
+- OxMgr, crash_restart_ms: only 3 restarts timed: it marks an app errored after its 3rd crash by default, even with uptime between crashes
 
-**Where Vexor wins.** Against PM2: 3× faster CLI, about 6× less supervisor
-memory for one app, less idle CPU, faster starts, faster crash recovery, a
-third of the install size, and the app keeps running and stays managed when
-the supervisor is killed (PM2 lost the app and 739 requests). Against
-forever: on every measure Vexor supports, and forever has no cluster mode,
-reload or daemon.
+**Where Vexor wins.** The least supervisor CPU while idle at every app
+count (0.20% of a core with 50 apps, against 0.30% for OxMgr, 2.1% for PM2
+and 11.8% for forever), and that includes sampling every app's CPU, memory
+and open files every 5 s for `ls`, `monit`, `metrics`, alerts and
+Prometheus. Against PM2: 4× faster CLI, about 10× less supervisor memory for
+one app, faster starts, faster crash recovery, a third of the install size,
+and the app keeps running and stays managed when the supervisor is killed
+(PM2 lost the app and 730 requests). Against forever: on every measure
+Vexor supports, and forever has no cluster mode, reload or daemon.
 
 **Where Vexor loses, and what we're doing about it.**
 
 - **Memory against OxMgr.** OxMgr runs one daemon for all apps; Vexor runs a
   small supervisor (shim) per app, which is what keeps apps managed when the
-  daemon dies. Measured as PSS, Vexor uses 17 MiB at 50 apps (PM2 21 MiB,
-  OxMgr 4.6 MiB); measured as RSS, which counts the shared binary once per
-  shim, 140 MiB. Shrinking the per-app shim is on the roadmap.
-- **Crash restarts** take 38 ms, against 13 ms for forever and 20 ms for
-  OxMgr (PM2: 159 ms). Note that OxMgr, by default, stops restarting an app
-  after its 3rd crash, even when it ran for seconds in between.
-- **Install size and start time:** OxMgr is smaller (3.9 MiB) and slightly
-  faster to start 10 apps (317 ms against 352 ms).
+  daemon dies. Measured as PSS, Vexor uses 19 MiB at 50 apps (PM2 33 MiB,
+  OxMgr 4.5 MiB); measured as RSS, which counts the shared binary once per
+  shim, 153 MiB. Shrinking the per-app shim is on the roadmap.
+- **Crash restarts** take 47 ms, against 18 ms for forever and 41 ms for
+  OxMgr (PM2: 131 ms). OxMgr, by default, stops restarting an app after its
+  3rd crash, even when it ran for seconds in between.
+- **CLI, start time and install size:** OxMgr is 1 ms faster to list apps,
+  faster to start 10 apps (268 ms against 339 ms) and smaller to install
+  (3.9 MiB against 4.9 MiB).
+- **Reload failures are noisy at this scale:** across this run and the
+  previous one, PM2 and OxMgr each dropped 2 requests in one run and none in
+  the other; Vexor dropped none in either.
+- **Since 0.3.1** (measured on a different host, so read with care): crash
+  recovery went from 38 to 47 ms and memory at 50 apps from 17 to 19 MiB
+  (PSS), while idle CPU with 50 apps fell from 0.33% to 0.20% and the
+  install shrank from 5.8 to 4.9 MiB.
 - **Windows:** PM2, OxMgr and forever run on Windows; Vexor doesn't yet.
 
 Methodology and how to reproduce: [docs/benchmarks.md](docs/benchmarks.md).
@@ -202,6 +213,13 @@ Methodology and how to reproduce: [docs/benchmarks.md](docs/benchmarks.md).
 | Restart on memory limit / cron / file change | ✓ / ✓ / ✓ | ✓ / ✓ / ✓ | ✓ / ✓ / ✓ | ✗ / ✗ / ✓ |
 | Built-in log rotation | ✓ | module (pm2-logrotate) | ✓ | ✗ |
 | One merged, timestamped log timeline | ✓ | per app ⁴ | ✗ | ✗ |
+| Live terminal view | `monit` | `monit` | `ui` | ✗ |
+| Alerts (crash loop, restarts, health, memory, CPU, log disk) by email or signed webhook | ✓ | paid (PM2 Plus) | ✗ ⁵ | ✗ |
+| Resource history (CPU, memory, open files over time) | ✓ | paid (PM2 Plus) | ✗ ⁵ | ✗ |
+| Prometheus `/metrics` | ✓ | community module | ✗ ⁵ | ✗ |
+| Scale without restarting the other instances | ✓ | ✓ | ✗ ⁵ | ✗ |
+| Setup diagnostics | `doctor` | `report` | `doctor` | ✗ |
+| Git-based deploy | ✗ | `deploy` | `deploy`, `pull` | ✗ |
 | Start at boot (systemd, launchd) | ✓ | ✓ | ✓ | ✗ |
 | Supervisor needs no Node.js | ✓ | ✗ | ✓ | ✗ |
 | Windows | ✗ | ✓ | ✓ | ✓ |
@@ -212,6 +230,7 @@ Methodology and how to reproduce: [docs/benchmarks.md](docs/benchmarks.md).
 ² OxMgr converts ecosystem files; it doesn't document moving apps from a running PM2 with rollback.
 ³ Measured: `kill -9` of the daemon under HTTP load (see [Benchmarks](#benchmarks)).
 ⁴ `pm2 logs` interleaves apps; lines carry timestamps only with `time: true` or `log_date_format`.
+⁵ Not in OxMgr 0.5.0's CLI help.
 OxMgr and forever capabilities are from their documentation and CLI help (OxMgr 0.5.0, forever 4.0.3) and our tests.
 
 ## Features

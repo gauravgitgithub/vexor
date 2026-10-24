@@ -338,6 +338,28 @@ impl Daemon {
                     Err(e) => error(ErrorCode::Internal, e.to_string()),
                 }
             }
+            Request::Metrics {
+                app,
+                since_ms,
+                until_ms,
+            } => {
+                if self.store.lock().await.get(&app).is_none() {
+                    return error(ErrorCode::NotFound, format!("no app named {app:?}"));
+                }
+                let events = self.events.clone();
+                let result =
+                    tokio::task::spawn_blocking(move || events.metrics(&app, since_ms, until_ms))
+                        .await;
+                match result {
+                    Ok(Ok((resolution_ms, points))) => Response::Metrics {
+                        resolution_ms: u64::try_from(resolution_ms).unwrap_or(0),
+                        points,
+                        warnings: self.events.warnings(),
+                    },
+                    Ok(Err(e)) => error(ErrorCode::Internal, e),
+                    Err(e) => error(ErrorCode::Internal, e.to_string()),
+                }
+            }
             Request::Start { spec, start } => self.start_new(*spec, start).await,
             Request::StartExisting { target } => self.for_each(target, Op::StartExisting).await,
             Request::Stop { target } => self.for_each(target, Op::Stop).await,

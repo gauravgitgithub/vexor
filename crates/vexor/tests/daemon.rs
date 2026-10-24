@@ -805,6 +805,29 @@ fn metrics_follow_each_instance_and_its_restarts() {
         std::thread::sleep(Duration::from_millis(20));
     };
     wait_metrics(&home, |s| s["pid"] == after && s["cpu_pct"].is_number());
+
+    // Plan step 6b.2: the history has both processes, oldest first.
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let out = home.cli(&["metrics", "web", "--since", "5m", "--json"]);
+        let v: Value = serde_json::from_slice(&out.stdout).expect("json");
+        let pids: Vec<u64> = v["points"]
+            .as_array()
+            .expect("points")
+            .iter()
+            .filter_map(|p| p["pid"].as_u64())
+            .collect();
+        let both = pids.first() == Some(&before) && pids.last() == Some(&after);
+        if both {
+            assert_eq!(v["resolution_ms"], 5000, "{v}");
+            break;
+        }
+        assert!(Instant::now() < deadline, "history: {v}");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let out = home.cli(&["metrics", "web", "--since", "5m"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("1 restart"), "{text}");
 }
 
 /// A shim started by an older Vexor survives the upgrade and only speaks

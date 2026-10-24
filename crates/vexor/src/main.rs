@@ -4,6 +4,7 @@ mod apply;
 mod client;
 mod describe;
 mod logs;
+mod metrics;
 mod migrate;
 mod spec;
 mod startup;
@@ -112,6 +113,17 @@ enum Command {
         /// At most this many events.
         #[arg(long, default_value_t = 50)]
         limit: u32,
+        /// Machine-readable output.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show an app's resource history: CPU, memory, open files, restarts.
+    Metrics {
+        name: String,
+        /// How far back, e.g. 10m, 2h, 7d (kept: raw 24h, per minute 7d,
+        /// per hour 90d).
+        #[arg(long, value_parser = parse_duration, default_value = "1h")]
+        since: std::time::Duration,
         /// Machine-readable output.
         #[arg(long)]
         json: bool,
@@ -434,6 +446,20 @@ fn main() -> ExitCode {
                 migrate_cmd(&home, pm2_home, dump, backup, json, env_names, verbose)
             }
         }
+        Command::Metrics { name, since, json } => {
+            let until_ms = describe::now_ms();
+            let since_ms =
+                until_ms.saturating_sub(u64::try_from(since.as_millis()).unwrap_or(u64::MAX));
+            send(
+                &home,
+                Request::Metrics {
+                    app: name,
+                    since_ms,
+                    until_ms,
+                },
+                json,
+            )
+        }
         Command::Events {
             app,
             since,
@@ -554,6 +580,28 @@ fn send(home: &std::path::Path, req: Request, json: bool) -> ExitCode {
             }
             ExitCode::SUCCESS
         }
+        Response::Metrics {
+            resolution_ms,
+            points,
+            warnings,
+        } => {
+            print_warnings(&warnings);
+            if json {
+                let out = serde_json::json!({ "resolution_ms": resolution_ms, "points": points });
+                match serde_json::to_string_pretty(&out) {
+                    Ok(s) => println!("{s}"),
+                    Err(e) => return fail(&e.to_string()),
+                }
+            } else if let Request::Metrics {
+                app,
+                since_ms,
+                until_ms,
+            } = &req
+            {
+                metrics::print(app, &points, resolution_ms, *since_ms, *until_ms);
+            }
+            ExitCode::SUCCESS
+        }
         Response::Ok { apps, warnings } => {
             print_warnings(&warnings);
             if json {
@@ -643,7 +691,12 @@ fn run_plan(home: &std::path::Path, plan: spec::Plan, allow_unsupported: bool) -
                 failed += 1;
                 eprintln!("vexor: {message}");
             }
-            Ok(Response::Events { .. } | Response::Describe { .. } | Response::Version { .. }) => {}
+            Ok(
+                Response::Events { .. }
+                | Response::Describe { .. }
+                | Response::Version { .. }
+                | Response::Metrics { .. },
+            ) => {}
             Err(e) => {
                 eprintln!("vexor: {e}");
                 return ExitCode::from(code::DAEMON_UNREACHABLE);

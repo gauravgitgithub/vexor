@@ -3,6 +3,18 @@
 All notable changes to Vexor. Versions follow [Semantic Versioning](https://semver.org/);
 before 1.0, minor versions may include breaking changes, which are listed here.
 
+## Unreleased
+
+### Added
+- Resource history: `vexor metrics <app> [--since 1h] [--json]` shows CPU
+  and memory sparklines, averages, peaks, open files and restarts per
+  instance. Samples are kept for 24 hours, per-minute averages for 7 days
+  and per-hour averages for 90 days, in about 0.8 MiB per process.
+
+### Fixed
+- `vexor logs --follow` skipped a whole file when a log rotated twice
+  between two reads (a fast writer with small `max_size`).
+
 ## 0.4.0 (2026-10-24, prerelease)
 
 ### Added

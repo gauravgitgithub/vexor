@@ -105,6 +105,25 @@ pub struct InstanceMetrics {
     pub health: Option<HealthStatus>,
 }
 
+/// One instance's resources over one bucket of time (one sample when raw).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MetricsPoint {
+    pub instance: u32,
+    /// Bucket start (sample time when raw), ms since the epoch.
+    pub ts_ms: u64,
+    /// Process measured last in the bucket.
+    pub pid: u32,
+    pub samples: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_avg: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_max: Option<f64>,
+    pub rss_avg: u64,
+    pub rss_max: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fds_max: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HealthStatus {
     pub ok: bool,
@@ -171,6 +190,12 @@ pub enum Request {
         since_ms: Option<u64>,
         limit: u32,
     },
+    /// Stored resource history of one app (plan 6b.2).
+    Metrics {
+        app: String,
+        since_ms: u64,
+        until_ms: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -194,6 +219,14 @@ pub enum Response {
     },
     Events {
         events: Vec<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        warnings: Vec<String>,
+    },
+    Metrics {
+        /// Width of each point in ms (the sampling interval for raw points).
+        resolution_ms: u64,
+        /// Ordered by instance, then time.
+        points: Vec<MetricsPoint>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         warnings: Vec<String>,
     },

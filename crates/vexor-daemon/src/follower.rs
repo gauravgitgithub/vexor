@@ -415,8 +415,12 @@ impl Follower {
                     "to": to,
                 }));
             }
-            // Latest-only and frequent: kept in memory, not logged or stored.
-            FromShim::Metrics { samples } => self.live.metrics_sample(samples),
+            // Frequent: kept in memory and in the metrics history, not
+            // logged or stored as events.
+            FromShim::Metrics { samples } => {
+                self.events.record_metrics(&self.name, samples.clone());
+                self.live.metrics_sample(samples);
+            }
             FromShim::Refused { reason } => {
                 self.log.write(json!({
                     "type": "shim_refused",

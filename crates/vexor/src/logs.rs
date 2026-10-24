@@ -303,8 +303,18 @@ impl Followed {
             .is_some_and(|m| (m.dev(), m.ino()) != self.id);
         if self.file.is_none() || replaced {
             if replaced {
-                // Read what the old file still had before switching.
+                // Read what the old file still had before switching, then
+                // any file rotated after it (several rotations can happen
+                // between two polls).
                 let mut tail = self.read_new();
+                for path in self.rotated_after_current() {
+                    if let Ok(mut f) = File::open(&path) {
+                        let mut buf = Vec::new();
+                        let _ = f.read_to_end(&mut buf);
+                        self.partial.extend_from_slice(&buf);
+                        tail.extend(self.complete_lines());
+                    }
+                }
                 if self.open() {
                     tail.extend(self.read_new());
                 }
@@ -333,12 +343,35 @@ impl Followed {
             self.offset += u64::try_from(n).unwrap_or(0);
         }
         self.partial.extend_from_slice(&buf);
+        self.complete_lines()
+    }
+
+    fn complete_lines(&mut self) -> Vec<String> {
         let mut lines = Vec::new();
         while let Some(i) = self.partial.iter().position(|&b| b == b'\n') {
             let line: Vec<u8> = self.partial.drain(..=i).collect();
             lines.push(String::from_utf8_lossy(&line[..line.len() - 1]).into_owned());
         }
         lines
+    }
+
+    /// Rotated files newer than the one being read (`path.N` … `path.1`,
+    /// oldest first), found by locating its inode in the `.1`, `.2`, …
+    /// chain. Empty if it is gone (rotated beyond `retain`).
+    fn rotated_after_current(&self) -> Vec<PathBuf> {
+        let mut newer = Vec::new();
+        for i in 1.. {
+            let path = PathBuf::from(format!("{}.{i}", self.source.path.display()));
+            let Ok(m) = std::fs::metadata(&path) else {
+                return Vec::new();
+            };
+            if (m.dev(), m.ino()) == self.id {
+                newer.reverse();
+                return newer;
+            }
+            newer.push(path);
+        }
+        Vec::new()
     }
 }
 
@@ -453,5 +486,29 @@ mod tests {
         assert!(f.poll().is_empty());
         append("after-truncate\n");
         assert_eq!(f.poll(), ["after-truncate"]);
+    }
+
+    #[test]
+    fn follow_reads_every_file_when_rotated_twice_between_polls() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write(dir.path(), "out.log", "");
+        let mut f = Followed::new(Source {
+            app: "a".into(),
+            err: false,
+            merged: false,
+            path: path.clone(),
+        });
+        let numbered = |i: u32| dir.path().join(format!("out.log.{i}"));
+        let rotate = |next: &str| {
+            for i in (1..5).rev() {
+                let _ = std::fs::rename(numbered(i), numbered(i + 1));
+            }
+            std::fs::rename(&path, numbered(1)).expect("rotate");
+            std::fs::write(&path, next).expect("new file");
+        };
+        std::fs::write(&path, "1\n").expect("write");
+        rotate("2\n");
+        rotate("3\n");
+        assert_eq!(f.poll(), ["1", "2", "3"]);
     }
 }

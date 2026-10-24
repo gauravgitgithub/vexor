@@ -122,10 +122,9 @@ mod tests {
             ..http(port)
         };
         assert!(probe(&tcp, t).await.is_ok());
-        // Nothing listening.
-        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-        let closed = l.local_addr().expect("addr").port();
-        drop(l);
+        // Nothing listening. Not a freed ephemeral port: tests running in
+        // parallel bind port 0 and could be handed that one.
+        let closed = 1;
         assert!(
             probe(&http(closed), t)
                 .await

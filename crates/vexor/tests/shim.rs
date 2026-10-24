@@ -947,12 +947,17 @@ fn cron_restart_restarts_on_schedule() {
     let extra = json!({ "instances": 2, "cron_restart": "* * * * * *" });
     let child = shim.start(&shim.spec(
         "/bin/sh",
-        &["-c", "echo started; while :; do sleep 0.05; done"],
+        &[
+            "-c",
+            "echo started $NODE_APP_INSTANCE; while :; do sleep 0.05; done",
+        ],
         extra,
     ));
     let started = Instant::now();
     let deadline = started + TIMEOUT;
-    while shim.out_log().matches("started").count() < 6 {
+    // Each instance started 3 times (2 restarts), however the schedule
+    // happened to spread them.
+    while (0..2).any(|i| shim.out_log().matches(&format!("started {i}\n")).count() < 3) {
         assert!(Instant::now() < deadline, "{}", shim.out_log());
         std::thread::sleep(Duration::from_millis(50));
     }

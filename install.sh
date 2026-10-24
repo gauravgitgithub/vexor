@@ -2,7 +2,7 @@
 # Install the vexor binary without npm or Node.js.
 #
 #   curl -fsSL https://raw.githubusercontent.com/gauravgitgithub/vexor/main/install.sh | sh
-#   curl -fsSL .../install.sh | sh -s -- v0.3.1        # a specific release
+#   curl -fsSL .../install.sh | sh -s -- v0.4.0        # a specific release
 #
 # Downloads vexor-<target>.tar.gz and SHA256SUMS from the GitHub release,
 # refuses to install unless the checksum matches, and installs to
@@ -48,7 +48,7 @@ fi
 if [ -z "${VEXOR_DOWNLOAD_BASE:-}" ] && [ "$VERSION" = latest ]; then
   meta=$(mktemp)
   fetch "https://api.github.com/repos/$REPO/releases?per_page=1" "$meta" ||
-    die "cannot look up the latest release; pass a version, e.g. sh -s -- v0.3.1"
+    die "cannot look up the latest release; pass a version, e.g. sh -s -- v0.4.0"
   VERSION=$(sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' "$meta" | head -n 1)
   rm -f "$meta"
   [ -n "$VERSION" ] || die "no releases found for $REPO"

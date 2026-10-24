@@ -5,6 +5,12 @@ before 1.0, minor versions may include breaking changes, which are listed here.
 
 ## 0.7.0 (2026-10-24, prerelease)
 
+### Fixed
+- Log lines were dropped when an app wrote many short lines while the
+  disk was briefly slow: the 1 MiB log buffer was counted in reads (128
+  of them), so a few kilobytes of short lines filled it. It now holds
+  1 MiB of output however it is split, and memory stays bounded.
+
 ### Security
 - Webhook URLs are treated as secrets (Slack's carries its token): only
   the scheme and host are ever shown or logged.

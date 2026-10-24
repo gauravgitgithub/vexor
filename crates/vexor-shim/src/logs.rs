@@ -5,7 +5,9 @@
 //! bounded queue; a dedicated writer thread does all disk I/O, so a slow or
 //! failing disk never stalls the shim's runtime or restart loop.
 //!
-//! - Memory is bounded by the queue: `buffer_bytes` per file.
+//! - Memory is bounded by the queue: `buffer_bytes` of output per file,
+//!   however it is split into reads (a busy app writing short lines makes
+//!   many small chunks).
 //! - `Overflow::Drop`: excess output is discarded and counted; a marker line
 //!   goes into the log and a `log_dropped` event is emitted. The app never
 //!   waits for the disk.
@@ -26,7 +28,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
 use vexor_core::{LogSpec, Overflow};
 
 use crate::output::{Output, ShimEvent};
@@ -78,7 +80,10 @@ impl Logs {
 /// Producer side of one log file.
 #[derive(Debug, Clone)]
 pub struct Sink {
-    tx: mpsc::Sender<Vec<u8>>,
+    tx: mpsc::UnboundedSender<Vec<u8>>,
+    /// Bytes that may still be queued (permits), returned as written.
+    room: Arc<Semaphore>,
+    capacity: u32,
     overflow: Overflow,
     dropped: Arc<AtomicU64>,
     timestamps: bool,
@@ -95,8 +100,9 @@ impl Sink {
             std::fs::create_dir_all(dir)?;
         }
         let file = LogFile::new(path.to_path_buf(), spec.max_size_bytes, spec.retain);
-        let slots = (usize::try_from(spec.buffer_bytes).unwrap_or(usize::MAX) / CHUNK).max(1);
-        let (tx, rx) = mpsc::channel(slots);
+        let capacity = spec.buffer_bytes.max(1);
+        let room = Arc::new(Semaphore::new(capacity as usize));
+        let (tx, rx) = mpsc::unbounded_channel();
         let dropped = Arc::new(AtomicU64::new(0));
         let reporter = Reporter {
             app: app.to_owned(),
@@ -106,12 +112,15 @@ impl Sink {
             error_reported: false,
         };
         let d = dropped.clone();
+        let r = room.clone();
         let handle = std::thread::Builder::new()
             .name("vexor-log".into())
-            .spawn(move || writer(rx, file, &d, reporter))?;
+            .spawn(move || writer(rx, file, &d, reporter, &r, capacity))?;
         Ok((
             Sink {
                 tx,
+                room,
+                capacity,
                 overflow: spec.overflow,
                 dropped,
                 timestamps: spec.timestamps,
@@ -131,22 +140,28 @@ impl Sink {
                 Ok(n) => n,
             };
             buf.truncate(n);
+            // Queued chunks must not keep the whole read buffer.
+            buf.shrink_to_fit();
             if self.timestamps {
                 buf = stamp(&buf, &mut at_line_start, &now_stamp());
             }
+            let need = permits(buf.len(), self.capacity);
             match self.overflow {
-                Overflow::Block => {
-                    if self.tx.send(buf).await.is_err() {
-                        return;
-                    }
-                }
-                Overflow::Drop => match self.tx.try_send(buf) {
-                    Ok(()) => {}
-                    Err(mpsc::error::TrySendError::Full(b)) => {
-                        self.dropped.fetch_add(len_u64(&b), Ordering::Relaxed);
-                    }
-                    Err(mpsc::error::TrySendError::Closed(_)) => return,
+                Overflow::Block => match self.room.acquire_many(need).await {
+                    Ok(p) => p.forget(),
+                    Err(_) => return,
                 },
+                Overflow::Drop => match self.room.try_acquire_many(need) {
+                    Ok(p) => p.forget(),
+                    Err(tokio::sync::TryAcquireError::NoPermits) => {
+                        self.dropped.fetch_add(len_u64(&buf), Ordering::Relaxed);
+                        continue;
+                    }
+                    Err(tokio::sync::TryAcquireError::Closed) => return,
+                },
+            }
+            if self.tx.send(buf).is_err() {
+                return;
             }
         }
     }
@@ -177,6 +192,17 @@ fn stamp(buf: &[u8], at_line_start: &mut bool, ts: &str) -> Vec<u8> {
     }
     out
 }
+
+/// Queue room a chunk takes: its length plus bookkeeping, capped so that
+/// a chunk larger than the whole buffer can still go through.
+fn permits(len: usize, capacity: u32) -> u32 {
+    u32::try_from(len.saturating_add(CHUNK_OVERHEAD))
+        .unwrap_or(u32::MAX)
+        .min(capacity)
+}
+
+/// Allocation and queue-node bytes per queued chunk, beyond its content.
+const CHUNK_OVERHEAD: usize = 64;
 
 fn len_u64(b: &[u8]) -> u64 {
     u64::try_from(b.len()).unwrap_or(u64::MAX)
@@ -226,10 +252,12 @@ impl Reporter {
 }
 
 fn writer(
-    mut rx: mpsc::Receiver<Vec<u8>>,
+    mut rx: mpsc::UnboundedReceiver<Vec<u8>>,
     mut file: LogFile,
     dropped: &AtomicU64,
     mut reporter: Reporter,
+    room: &Semaphore,
+    capacity: u32,
 ) {
     let mut unreported = 0;
     while let Some(chunk) = rx.blocking_recv() {
@@ -248,6 +276,7 @@ fn writer(
                 reporter.dropped(len_u64(&chunk), &mut unreported);
             }
         }
+        room.add_permits(permits(chunk.len(), capacity) as usize);
     }
     // Senders gone: account for anything dropped since the last chunk.
     let lost = dropped.swap(0, Ordering::Relaxed);
@@ -498,6 +527,55 @@ mod tests {
             .filter_map(|(_, e)| e["bytes"].as_u64())
             .sum();
         assert_eq!(reported, u64::try_from(lost).expect("fits"));
+    }
+
+    /// Yields `n` lines of 20 bytes, one per read, like an app logging a
+    /// short line at a time.
+    struct Lines(usize);
+
+    impl tokio::io::AsyncRead for Lines {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            if self.0 > 0 {
+                self.0 -= 1;
+                buf.put_slice(b"xxxxxxxxxxxxxxxxxxx\n");
+            }
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn the_buffer_holds_its_size_in_bytes_however_small_the_writes() {
+        // 2,000 short lines (40 KB) while the writer is stuck: they fit in
+        // the 1 MiB buffer. A buffer counted in reads held only 128 of them.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fifo = dir.path().join("fifo.log");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo");
+        assert!(status.success());
+        let spec = LogSpec {
+            timestamps: false,
+            max_size_bytes: 0,
+            ..LogSpec::new(fifo.clone(), fifo.clone())
+        };
+        let events = Output::new(false);
+        let logs = Logs::start("t", &spec, &events).expect("start");
+        logs.out.clone().pump(Lines(2_000)).await;
+        let reader = std::thread::spawn(move || std::fs::read(&fifo).expect("read fifo"));
+        logs.finish(Duration::from_secs(5)).await;
+        let got = reader.join().expect("reader");
+        assert_eq!(
+            got.len(),
+            2_000 * 20,
+            "{}",
+            String::from_utf8_lossy(&got[..200])
+        );
+        assert!(!String::from_utf8_lossy(&got).contains("[vexor] dropped"));
     }
 
     #[tokio::test]

@@ -82,6 +82,18 @@ enum Write {
         window: RouteWindow,
     },
     Prune,
+    /// Make the database "full" past this many pages (tests: a full disk).
+    #[cfg(test)]
+    LimitPages(u32),
+}
+
+/// The writer's last failure, shown on every command until a write
+/// succeeds again.
+#[derive(Debug, Default)]
+struct WriteError {
+    error: Option<String>,
+    since_ms: i64,
+    lost: u64,
 }
 
 /// Handle used by the rest of the daemon. Cheap to clone.
@@ -97,6 +109,7 @@ struct Inner {
     dropped: AtomicU64,
     /// Human-readable problems to show to the operator (`vexor list`).
     warnings: Mutex<Vec<String>>,
+    write_error: Arc<Mutex<WriteError>>,
 }
 
 impl Events {
@@ -135,11 +148,13 @@ impl Events {
                 }
             }
         };
+        let write_error = Arc::new(Mutex::new(WriteError::default()));
         let tx = conn.map(|c| {
             let (tx, rx) = sync_channel(QUEUE);
+            let errors = write_error.clone();
             std::thread::Builder::new()
                 .name("vexor-events".into())
-                .spawn(move || writer(c, &rx))
+                .spawn(move || writer(c, &rx, &errors))
                 .map(|_| tx)
         });
         let tx = match tx {
@@ -156,6 +171,7 @@ impl Events {
                 tx,
                 dropped: AtomicU64::new(0),
                 warnings: Mutex::new(warnings),
+                write_error,
             }),
         };
         if events.inner.tx.is_some() {
@@ -174,11 +190,31 @@ impl Events {
     }
 
     pub fn warnings(&self) -> Vec<String> {
-        self.inner
+        let mut w = self
+            .inner
             .warnings
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .clone()
+            .clone();
+        let e = self
+            .inner
+            .write_error
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(error) = &e.error {
+            let secs = (now_ms() - e.since_ms).max(0) / 1000;
+            let since = match secs {
+                0..60 => format!("{secs}s"),
+                60..3600 => format!("{}m", secs / 60),
+                _ => format!("{}h", secs / 3600),
+            };
+            w.push(format!(
+                "event history can't be written ({error}) for {since}: {} write(s) lost so far; supervision is not affected. Free disk space in {}",
+                e.lost,
+                self.inner.path.parent().map_or_else(String::new, |p| p.display().to_string())
+            ));
+        }
+        w
     }
 
     pub fn record_shim(&self, app: &str, shim_start: u64, seq: u64, event: Value) {
@@ -743,7 +779,23 @@ fn migrate_to_4(conn: &Connection) -> Result<(), String> {
     .map_err(|e| e.to_string())
 }
 
-fn writer(mut conn: Connection, rx: &Receiver<Write>) {
+/// Record the outcome of one write: a failure is shown until one succeeds.
+fn note(errors: &Mutex<WriteError>, result: rusqlite::Result<()>) {
+    let mut e = errors.lock().unwrap_or_else(PoisonError::into_inner);
+    match result {
+        Ok(()) => *e = WriteError::default(),
+        Err(err) => {
+            if e.error.is_none() {
+                eprintln!("vexor daemon: event history write failed: {err}");
+                e.since_ms = now_ms();
+            }
+            e.error = Some(err.to_string());
+            e.lost += 1;
+        }
+    }
+}
+
+fn writer(mut conn: Connection, rx: &Receiver<Write>, errors: &Mutex<WriteError>) {
     use std::sync::mpsc::RecvTimeoutError;
     // Resource samples arrive many times a second with 100 apps: they wait
     // up to METRICS_FLUSH and go into one transaction, not one each.
@@ -756,7 +808,7 @@ fn writer(mut conn: Connection, rx: &Receiver<Write>) {
                     Ok(w) => Some(w),
                     Err(RecvTimeoutError::Timeout) => None,
                     Err(RecvTimeoutError::Disconnected) => {
-                        let _ = write_batch(&mut conn, metrics);
+                        note(errors, write_batch(&mut conn, metrics));
                         return;
                     }
                 }
@@ -789,10 +841,14 @@ fn writer(mut conn: Connection, rx: &Receiver<Write>) {
             batch = std::mem::take(&mut metrics);
             flush_at = None;
         }
-        if !batch.is_empty()
-            && let Err(e) = write_batch(&mut conn, batch)
-        {
-            eprintln!("vexor daemon: event history write failed: {e}");
+        #[cfg(test)]
+        for w in &batch {
+            if let Write::LimitPages(n) = w {
+                let _ = conn.pragma_update(None, "max_page_count", n);
+            }
+        }
+        if !batch.is_empty() {
+            note(errors, write_batch(&mut conn, batch));
         }
     }
 }
@@ -1017,6 +1073,8 @@ fn write_batch(conn: &mut Connection, batch: Vec<Write>) -> rusqlite::Result<()>
                     }
                 }
             }
+            #[cfg(test)]
+            Write::LimitPages(_) => {}
             Write::Prune => {
                 let cutoff = now_ms() - i64::try_from(MAX_AGE.as_millis()).unwrap_or(i64::MAX);
                 tx.execute("DELETE FROM events WHERE ts_ms < ?1", params![cutoff])?;
@@ -1542,6 +1600,43 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         panic!("minutes {}, hours {}", count(1), count(2));
+    }
+
+    /// A full disk (here: SQLite's page limit): every command warns, with
+    /// how much was lost, until a write succeeds again.
+    #[test]
+    fn a_full_disk_is_reported_until_writes_succeed_again() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ev = Events::open(dir.path());
+        ev.record_daemon(None, "first", json!({}));
+        let wait = |ok: &dyn Fn(&[String]) -> bool| {
+            for _ in 0..600 {
+                let w = ev.warnings();
+                if ok(&w) {
+                    return w;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            panic!("warnings: {:?}", ev.warnings());
+        };
+        ev.send(Write::LimitPages(1));
+        for i in 0..50 {
+            ev.record_daemon(None, "filler", json!({ "data": "x".repeat(2000), "i": i }));
+        }
+        let w = wait(&|w| w.iter().any(|w| w.contains("can't be written")));
+        assert!(
+            w.iter().any(|w| w.contains("full") && w.contains("lost")),
+            "{w:?}"
+        );
+        ev.send(Write::LimitPages(1_000_000));
+        ev.record_daemon(None, "after", json!({}));
+        wait(&|w| w.is_empty());
+        assert!(
+            ev.query(None, None, 1000)
+                .expect("q")
+                .iter()
+                .any(|e| e["type"] == "after")
+        );
     }
 
     #[test]

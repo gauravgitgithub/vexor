@@ -674,6 +674,9 @@ fn claim(home: &Path, app: &str) -> std::io::Result<Claim> {
     let Some(lock) = control::lock_with_retry(&paths.lock, control::LOCK_WAIT)? else {
         return Ok(Claim::Taken);
     };
+    // Left by an upgrade whose new program died before resuming: its
+    // descriptors died with it. The processes are adopted as survivors.
+    let _ = std::fs::remove_file(upgrade::path(&control::shims_dir(home), app));
     let listener = control::bind(&paths.socket)?;
     Ok(Claim::Ours {
         lock,

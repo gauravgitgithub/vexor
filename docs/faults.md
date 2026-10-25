@@ -14,6 +14,9 @@ named in the last column.
 | A shim killed, cluster mode | The orphaned cluster primary can't be controlled (its channel died with the shim): the new shim stops it and its workers, then starts the app again. Nothing is left listening twice | `a_dead_shims_cluster_is_stopped_and_started_again` |
 | Shim replaced by a newer version (in-place upgrade), under HTTP load | No failed request; same app process, still connected to its IPC channel; output keeps flowing with nothing lost or repeated; the event stream continues without a gap; a later crash is still seen with its exit signal and restarted | `tests/upgrade.rs` |
 | In-place upgrade to a program that can't run | The shim carries on in its current program from the same handover; apps untouched; an `upgrade_skipped` event says why | `a_failed_exec_resumes_in_the_same_program` |
+| The new program dies before it resumes (a broken release), or the shim is killed mid-upgrade | The shim is gone, its apps aren't. The next shim adopts them (same PIDs) and removes the stale handover file. An app that writes output loses its pipe with the dead shim and ends at its next write (SIGPIPE); it is started again | `a_new_program_dying_mid_upgrade_leaves_the_apps_to_be_adopted`, `a_chatty_app_orphaned_mid_upgrade_is_started_again` |
+| Disk full under the event database | Supervision is not affected. Every command warns that history can't be written, for how long and how many writes were lost, until a write succeeds again; then the warning goes away by itself | `a_full_disk_is_reported_until_writes_succeed_again` (SQLite's page limit stands in for a full disk) |
+| The daemon sends a command and its connection closes at once (crash, or a new connection replaces it) | The command is still carried out | `a_command_sent_just_before_disconnecting_is_carried_out` |
 | Event database corrupted | The daemon keeps the bad file (`events.db.corrupt-<ts>`), starts a fresh one, warns on every command, and supervises as before | `fault_corrupt_event_database`, `corrupt_file_is_kept_and_replaced` |
 | Event database location unusable | Supervision continues without history; reported as degraded | `unusable_location_degrades_without_failing` |
 | Log file unwritable (here: replaced by a directory) | A `log_error` event, once; the app keeps running; logging resumes when the path is usable again | `fault_unwritable_log_file` |
@@ -25,7 +28,5 @@ named in the last column.
 | `state.json` corrupted, or written by a newer Vexor | Refused and kept, never overwritten | `corrupt_or_newer_files_are_refused_and_kept` |
 | Busy machine: a new process waits seconds before it runs (seen on macOS at `_dyld_start`) | Not a Vexor fault, but tests must not assume a crash shows within a fixed time; the migrate tests allow for it | `migrate_apply_*` in `tests/cli.rs` |
 
-Not covered yet: a full disk for the event database, a shim killed in the
-middle of an in-place upgrade (the next shim adopts its processes, as for
-any dead shim, but this isn't tested), and network filesystems (refused by
-`doctor`).
+Not covered: network filesystems for `$VEXOR_HOME` (reported as a problem
+by `vexor doctor`: SQLite's WAL mode isn't safe there).

@@ -244,26 +244,47 @@ fn upgrade(conn: &mut Welcomed, exec: &Path) {
     conn.conn.send(&json!({ "type": "upgrade", "exec": exec }));
 }
 
+/// Ask for an upgrade and wait until the shim closes this connection,
+/// which it does when it hands over (or resumes after a failed exec).
+fn upgrade_and_wait(mut conn: Welcomed, exec: &Path) {
+    upgrade(&mut conn, exec);
+    let deadline = Instant::now() + TIMEOUT;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match conn.conn.reader.read_line(&mut line) {
+            Ok(0) => return,
+            Ok(_) => {}
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(_) => return,
+        }
+        assert!(Instant::now() < deadline, "the shim never handed over");
+    }
+}
+
 #[test]
 fn upgrade_in_place_keeps_processes_output_and_events() {
     let shim = Shim::start(2);
-    let mut before = shim.connect();
+    let before = shim.connect();
     let welcome = before.welcome.clone();
     shim.wait_counters_past(2, 20);
     let pids_before = before.pids();
     assert_eq!(pids_before.len(), 2, "{welcome}");
     assert_eq!(welcome["version"], env!("CARGO_PKG_VERSION"));
 
-    upgrade(&mut before, Path::new(env!("CARGO_BIN_EXE_vexor")));
-    drop(before);
+    upgrade_and_wait(before, Path::new(env!("CARGO_BIN_EXE_vexor")));
     // The new image serves the same socket.
-    let after = loop {
-        let c = shim.connect();
-        if c.welcome["next_seq"].as_u64() > welcome["next_seq"].as_u64() {
-            break c;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    };
+    let after = shim.connect();
+    assert!(
+        after.welcome["next_seq"].as_u64() > welcome["next_seq"].as_u64(),
+        "{}\n{}",
+        after.welcome,
+        shim.shim_log()
+    );
     assert_eq!(
         after.welcome["shim_pid"], welcome["shim_pid"],
         "same shim process"
@@ -334,19 +355,18 @@ fn upgrade_to_a_missing_program_changes_nothing() {
 #[test]
 fn a_failed_exec_resumes_in_the_same_program() {
     let shim = Shim::start(1);
-    let mut conn = shim.connect();
+    let conn = shim.connect();
     let welcome = conn.welcome.clone();
     shim.wait_counters_past(1, 10);
     // A file that exists but can't be executed.
-    upgrade(&mut conn, &shim.path("spec.json"));
-    drop(conn);
-    let after = loop {
-        let c = shim.connect();
-        if c.welcome["next_seq"].as_u64() > welcome["next_seq"].as_u64() {
-            break c;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    };
+    upgrade_and_wait(conn, &shim.path("spec.json"));
+    let after = shim.connect();
+    assert!(
+        after.welcome["next_seq"].as_u64() > welcome["next_seq"].as_u64(),
+        "{}\n{}",
+        after.welcome,
+        shim.shim_log()
+    );
     assert_eq!(after.welcome["shim_pid"], welcome["shim_pid"]);
     assert_eq!(after.pids(), pids(&welcome["snapshot"]));
     let mut replay = shim.connect();
@@ -415,7 +435,7 @@ fn upgrade_under_http_load_drops_no_requests() {
             "policy": { "ready_timeout_ms": 10000 },
         }),
     );
-    let mut conn = shim.connect();
+    let conn = shim.connect();
     let deadline = Instant::now() + TIMEOUT;
     let first = loop {
         if let Ok(b) = get(port) {
@@ -446,8 +466,7 @@ fn upgrade_under_http_load_drops_no_requests() {
         (ok, failed, bodies)
     });
     std::thread::sleep(Duration::from_millis(300));
-    upgrade(&mut conn, Path::new(env!("CARGO_BIN_EXE_vexor")));
-    drop(conn);
+    upgrade_and_wait(conn, Path::new(env!("CARGO_BIN_EXE_vexor")));
     let deadline = Instant::now() + TIMEOUT;
     while !upgraded(&shim) {
         assert!(Instant::now() < deadline, "no upgrade\n{}", shim.shim_log());
@@ -490,4 +509,155 @@ fn upgraded(shim: &Shim) -> bool {
         }
     }
     false
+}
+
+/// The new program dies before it resumes (a broken release, or killed
+/// mid-upgrade): the shim is gone, its apps aren't. The next shim adopts
+/// them, same PIDs, and cleans up the stale handover file.
+#[test]
+fn a_new_program_dying_mid_upgrade_leaves_the_apps_to_be_adopted() {
+    let shim = Shim::start_with(
+        "/bin/sh",
+        &["-c", "exec sleep 300"],
+        json!({ "instances": 2 }),
+    );
+    let conn = shim.connect();
+    let pids_before = conn.pids();
+    assert_eq!(pids_before.len(), 2);
+    let broken = shim.path("broken-vexor");
+    std::fs::write(&broken, "#!/bin/sh\nexit 1\n").expect("write");
+    std::fs::set_permissions(&broken, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+        .expect("chmod");
+    upgrade_and_wait(conn, &broken);
+    let shim = shim;
+    // The shim's process (now the broken program) exits.
+    let deadline = Instant::now() + TIMEOUT;
+    let mut first = shim;
+    loop {
+        if matches!(first.child.try_wait(), Ok(Some(_))) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "shim still running\n{}",
+            first.shim_log()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        pids_before.values().all(|p| alive(*p)),
+        "apps died with the shim"
+    );
+    assert!(
+        first.path("shims/t.handover.json").exists(),
+        "handover left behind"
+    );
+
+    // What the daemon does next: start a shim, which adopts them.
+    let log = std::fs::File::create(first.path("shim2.log")).expect("log");
+    let second = Command::new(env!("CARGO_BIN_EXE_vexor"))
+        .arg("--home")
+        .arg(first.home.path())
+        .args(["shim", "--managed", "--spec"])
+        .arg(first.path("spec.json"))
+        .stdout(Stdio::null())
+        .stderr(log)
+        .spawn()
+        .expect("start shim");
+    first.child = second;
+    let deadline = Instant::now() + TIMEOUT;
+    let adopted = loop {
+        let c = first.connect();
+        let snap = c.welcome["snapshot"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        if snap.len() == 2 && snap.iter().all(|s| s["adopted"] == true) {
+            break c;
+        }
+        assert!(Instant::now() < deadline, "not adopted: {snap:?}");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(adopted.pids(), pids_before);
+    assert!(
+        !first.path("shims/t.handover.json").exists(),
+        "stale handover removed"
+    );
+}
+
+/// Same, with an app that writes output: the dead shim's pipe is gone, so
+/// its next write ends it (SIGPIPE); the new shim simply starts it again.
+#[test]
+fn a_chatty_app_orphaned_mid_upgrade_is_started_again() {
+    let shim = Shim::start(1);
+    let conn = shim.connect();
+    let p0 = conn.pids()[&0];
+    shim.wait_counters_past(1, 5);
+    let broken = shim.path("broken-vexor");
+    std::fs::write(&broken, "#!/bin/sh\nexit 1\n").expect("write");
+    std::fs::set_permissions(&broken, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+        .expect("chmod");
+    upgrade_and_wait(conn, &broken);
+    let mut first = shim;
+    let deadline = Instant::now() + TIMEOUT;
+    while !matches!(first.child.try_wait(), Ok(Some(_))) {
+        assert!(Instant::now() < deadline, "shim still running");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let second = Command::new(env!("CARGO_BIN_EXE_vexor"))
+        .arg("--home")
+        .arg(first.home.path())
+        .args(["shim", "--managed", "--spec"])
+        .arg(first.path("spec.json"))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start shim");
+    first.child = second;
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let c = first.connect();
+        let snap = c.welcome["snapshot"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        if snap.iter().any(|s| {
+            s["state"] == "online" && s["pid"].as_u64() != Some(p0) && s.get("adopted").is_none()
+        }) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "not started again: {snap:?}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let last = counters(&first.out_log())[&0]
+        .last()
+        .copied()
+        .expect("lines");
+    let deadline = Instant::now() + TIMEOUT;
+    while counters(&first.out_log())[&0].last().copied() == Some(last) {
+        assert!(Instant::now() < deadline, "no new output");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// A command is carried out even when the daemon disconnects right after
+/// sending it (it used to be lost if the shim noticed the closed
+/// connection first).
+#[test]
+fn a_command_sent_just_before_disconnecting_is_carried_out() {
+    for _ in 0..5 {
+        let mut shim = Shim::start(1);
+        let mut conn = shim.connect();
+        conn.conn.send(&json!({ "type": "stop" }));
+        drop(conn);
+        let deadline = Instant::now() + TIMEOUT;
+        while !matches!(shim.child.try_wait(), Ok(Some(_))) {
+            assert!(
+                Instant::now() < deadline,
+                "stop was lost\n{}",
+                shim.shim_log()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
 }

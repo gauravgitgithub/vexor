@@ -19,6 +19,17 @@ before 1.0, minor versions may include breaking changes, which are listed here.
 - docs/faults.md: the faults Vexor is tested against and what happens.
 
 ### Fixed
+- A failing event database (disk full, I/O errors) was reported only in
+  `daemon.err`; every command now warns, with how long and how many
+  writes were lost, until writes succeed again.
+- A command the daemon sent right before its connection closed (or was
+  replaced) could be lost by the shim; commands are now carried out as
+  soon as they are read.
+- A shim that resumed after a failed in-place upgrade kept its old control
+  session alive, serving stale state; it is now closed with the old
+  program state.
+- A shim whose new program dies mid-upgrade leaves a stale handover file;
+  the next shim removes it (and adopts the apps).
 - CLI questions (`ls`, `describe`, `events`, `metrics`, `routes`, `alerts`)
   to a hung daemon failed only after 5 minutes; now after 10 s, saying what
   to do. Commands that can take long (`stop`, `restart`, ...) keep 5

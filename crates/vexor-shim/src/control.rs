@@ -137,9 +137,12 @@ pub struct Links {
     pub upgrade: mpsc::UnboundedSender<PathBuf>,
 }
 
-/// Accept daemon connections until the task is aborted.
+/// Accept daemon connections until the task is aborted. The current
+/// session ends with it (an upgrade that resumes in this program must not
+/// leave a session of the old state behind).
 pub async fn serve(listener: UnixListener, out: Output, me: Identity, app: Arc<str>, links: Links) {
-    let mut current: Option<tokio::task::JoinHandle<()>> = None;
+    // Held only for its drop: it aborts the session it guards.
+    let mut _session: Option<AbortOnDrop> = None;
     loop {
         let stream = match listener.accept().await {
             Ok((s, _)) => s,
@@ -152,16 +155,14 @@ pub async fn serve(listener: UnixListener, out: Output, me: Identity, app: Arc<s
         if !same_user(&stream) {
             continue;
         }
-        if let Some(old) = current.take() {
-            old.abort();
-        }
-        current = Some(tokio::spawn(session(
+        // Replacing it aborts the previous session.
+        _session = Some(AbortOnDrop(tokio::spawn(session(
             stream,
             out.clone(),
             me,
             app.clone(),
             links.clone(),
-        )));
+        ))));
     }
 }
 
@@ -186,18 +187,47 @@ async fn session(stream: UnixStream, out: Output, me: Identity, app: Arc<str>, l
     let (read, mut write) = stream.into_split();
 
     // Reading isn't cancel-safe (a partial line would be lost), so it runs
-    // in its own task and hands over whole messages.
-    let (tx, mut rx) = mpsc::channel::<ToShim>(8);
+    // in its own task. It hands the hello over, and once the session has
+    // accepted it, carries out each command as soon as it is read: a
+    // command is never lost because sending events failed, or because a
+    // new connection replaced this one. The channel closes with the
+    // connection.
+    let (tx, mut rx) = mpsc::channel::<ToShim>(1);
+    let (accepted, go) = tokio::sync::oneshot::channel::<()>();
     let reader = tokio::spawn(async move {
         let mut r = BufReader::new(read);
         let mut buf = Vec::new();
+        let Ok(Some(hello)) = vexor_proto::recv::<_, ToShim>(&mut r, &mut buf).await else {
+            return;
+        };
+        if tx.send(hello).await.is_err() || go.await.is_err() {
+            return;
+        }
         while let Ok(Some(msg)) = vexor_proto::recv::<_, ToShim>(&mut r, &mut buf).await {
-            if tx.send(msg).await.is_err() {
-                break;
+            match msg {
+                ToShim::Stop => {
+                    stop.send_replace(true);
+                }
+                ToShim::Restart => {
+                    let _ = restart.send(crate::instance::Control::Restart);
+                }
+                ToShim::Reload => {
+                    let _ = restart.send(crate::instance::Control::Reload);
+                }
+                ToShim::Scale { instances } => {
+                    let _ = scale.send(instances);
+                }
+                ToShim::Upgrade { exec } => {
+                    let _ = upgrade.send(exec);
+                }
+                ToShim::Hello { .. } => {}
             }
         }
+        drop(tx);
     });
-    let _guard = AbortOnDrop(reader);
+    // Not aborted with the session: it ends at end of file, after carrying
+    // out every command the peer sent before closing.
+    drop(reader);
 
     let supported = MIN_SHIM_PROTOCOL..=SHIM_PROTOCOL;
     let (protocol, resume) = match tokio::time::timeout(HELLO_TIMEOUT, rx.recv()).await {
@@ -213,6 +243,7 @@ async fn session(stream: UnixStream, out: Output, me: Identity, app: Arc<str>, l
         }
         _ => return,
     };
+    let _ = accepted.send(());
 
     let next_seq = out.next_seq();
     let mut cursor = match resume {
@@ -289,15 +320,8 @@ async fn session(stream: UnixStream, out: Output, me: Identity, app: Arc<str>, l
                     return;
                 }
             }
-            msg = rx.recv() => match msg {
-                Some(ToShim::Stop) => { stop.send_replace(true); }
-                Some(ToShim::Restart) => { let _ = restart.send(crate::instance::Control::Restart); }
-                Some(ToShim::Reload) => { let _ = restart.send(crate::instance::Control::Reload); }
-                Some(ToShim::Scale { instances }) => { let _ = scale.send(instances); }
-                Some(ToShim::Upgrade { exec }) => { let _ = upgrade.send(exec); }
-                Some(ToShim::Hello { .. }) => {}
-                None => return,
-            },
+            // The connection closed (commands are carried out by the reader).
+            msg = rx.recv() => if msg.is_none() { return },
         }
     }
 }

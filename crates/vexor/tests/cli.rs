@@ -1161,29 +1161,34 @@ fn migrate_backup_copies_pm2_state_privately_and_never_overwrites() {
 }
 
 /// A stand-in for `pm2` that records its arguments (except `jlist`); `pm2
-/// stop` fails while `<work>/pm2-fail` exists; `jlist` reports every app
-/// `pm2 start`ed as online.
+/// stop` fails while `<work>/pm2-fail` exists. It keeps each app's status in
+/// `<work>/pm2-live` (`name status` lines; it starts as `pm2_dump` saved it:
+/// `web` online, `idle` stopped), which `stop` and `start` update and `jlist`
+/// reports.
 fn fake_pm2(env: &Env) -> (PathBuf, PathBuf) {
     let log = env.work.path().join("pm2-calls.log");
     let fail = env.work.path().join("pm2-fail");
-    let started = env.work.path().join("pm2-started");
+    let live = env.work.path().join("pm2-live");
+    std::fs::write(&live, "web online\nidle stopped\n").expect("write pm2-live");
     let bin = env.script(
         "fake-pm2",
         &format!(
             r#"#!/bin/sh
+set_status() {{ grep -v "^$1 " '{live}' > '{live}.tmp'; echo "$1 $2" >> '{live}.tmp'; mv '{live}.tmp' '{live}'; }}
 if [ "$1" = jlist ]; then
   printf '['; sep=''
-  [ -e '{started}' ] && while read -r n; do printf '%s{{"name":"%s","pm2_env":{{"status":"online"}}}}' "$sep" "$n"; sep=,; done < '{started}'
+  while read -r n st; do printf '%s{{"name":"%s","pm2_env":{{"status":"%s"}}}}' "$sep" "$n" "$st"; sep=,; done < '{live}'
   echo ']'; exit 0
 fi
 echo "$*" >> '{log}'
 [ "$1" = stop ] && [ -e '{fail}' ] && {{ echo 'boom' >&2; exit 1; }}
-[ "$1" = start ] && echo "$2" >> '{started}'
+[ "$1" = stop ] && set_status "$2" stopped
+[ "$1" = start ] && set_status "$2" online
 exit 0
 "#,
             log = log.display(),
             fail = fail.display(),
-            started = started.display(),
+            live = live.display(),
         ),
     );
     (bin, log)
@@ -1401,6 +1406,53 @@ fn migrate_apply_refuses_unsafe_starts() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("boom"));
     assert!(env.list().iter().all(|a| a["name"] != "web"));
     assert_eq!(pm2_calls(&log), ["stop web"]);
+}
+
+#[test]
+fn migrate_apply_refuses_when_pm2_no_longer_matches_its_saved_list() {
+    let env = Env::new();
+    let pm2_home = pm2_home_with_backup(&env);
+    let (pm2, log) = fake_pm2(&env);
+    // `idle` was saved as stopped but has been started under PM2 since:
+    // applying the plan would add it to Vexor stopped and leave it running
+    // under PM2.
+    std::fs::write(
+        env.work.path().join("pm2-live"),
+        "web online\nidle online\n",
+    )
+    .expect("write");
+    let args = [
+        "migrate",
+        "--from-pm2",
+        "--apply",
+        "--yes",
+        "--pm2-home",
+        pm2_home.to_str().expect("utf-8"),
+        "--pm2",
+        pm2.to_str().expect("utf-8"),
+    ];
+    let out = env.run(&args);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("out of date"), "{stderr}");
+    assert!(
+        stderr.contains("idle (saved stopped, now running)"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("pm2 save"), "{stderr}");
+    assert!(pm2_calls(&log).is_empty(), "PM2 was touched");
+    assert!(env.list().is_empty(), "Vexor was touched");
+
+    // And the other way round: saved as running, gone from PM2.
+    std::fs::write(env.work.path().join("pm2-live"), "idle stopped\n").expect("write");
+    let out = env.run(&args);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("web (saved running, now not in PM2)"),
+        "{stderr}"
+    );
+    assert!(pm2_calls(&log).is_empty(), "PM2 was touched");
 }
 
 #[test]

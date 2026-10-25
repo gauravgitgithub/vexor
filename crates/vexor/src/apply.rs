@@ -178,26 +178,57 @@ struct Pm2 {
     home: PathBuf,
 }
 
+/// One PM2 process as `pm2 jlist` reports it now.
+#[derive(Debug, Clone)]
+struct LiveProcess {
+    status: String,
+    /// Restarts before `min_uptime`: PM2 keeps restarting it.
+    unstable_restarts: u64,
+}
+
 impl Pm2 {
+    /// Every PM2 process by app name, from `pm2 jlist`.
+    fn live(&self) -> Result<BTreeMap<String, Vec<LiveProcess>>, String> {
+        let out = Command::new(&self.bin)
+            .arg("jlist")
+            .env("PM2_HOME", &self.home)
+            .output()
+            .map_err(|e| format!("cannot run {}: {e}", self.bin.display()))?;
+        if !out.status.success() {
+            return Err(format!("`pm2 jlist` failed ({})", out.status));
+        }
+        let text = String::from_utf8_lossy(&out.stdout);
+        // pm2 may print notices before the JSON.
+        let json = text.find('[').map_or("[]", |i| &text[i..]);
+        let list: Vec<serde_json::Value> =
+            serde_json::from_str(json).map_err(|e| format!("cannot read `pm2 jlist`: {e}"))?;
+        let mut by_name: BTreeMap<String, Vec<LiveProcess>> = BTreeMap::new();
+        for p in &list {
+            let (Some(name), Some(status)) = (p["name"].as_str(), p["pm2_env"]["status"].as_str())
+            else {
+                continue;
+            };
+            by_name
+                .entry(name.to_owned())
+                .or_default()
+                .push(LiveProcess {
+                    status: status.to_owned(),
+                    unstable_restarts: p["pm2_env"]["unstable_restarts"].as_u64().unwrap_or(0),
+                });
+        }
+        Ok(by_name)
+    }
+
     /// Wait until every PM2 process named `name` is online.
     fn wait_online(&self, name: &str, timeout: Duration) -> Result<(), String> {
         let deadline = Instant::now() + timeout;
         let mut last = String::from("no status");
         while Instant::now() < deadline {
-            let out = Command::new(&self.bin)
-                .arg("jlist")
-                .env("PM2_HOME", &self.home)
-                .output()
-                .map_err(|e| format!("cannot run {}: {e}", self.bin.display()))?;
-            let text = String::from_utf8_lossy(&out.stdout);
-            // pm2 may print notices before the JSON.
-            let json = text.find('[').map_or("[]", |i| &text[i..]);
-            if let Ok(serde_json::Value::Array(list)) = serde_json::from_str(json) {
-                let st: Vec<&str> = list
-                    .iter()
-                    .filter(|p| p["name"] == name)
-                    .filter_map(|p| p["pm2_env"]["status"].as_str())
-                    .collect();
+            if let Ok(live) = self.live() {
+                let st: Vec<&str> = live
+                    .get(name)
+                    .map(|ps| ps.iter().map(|p| p.status.as_str()).collect())
+                    .unwrap_or_default();
                 if !st.is_empty() && st.iter().all(|s| *s == "online") {
                     return Ok(());
                 }
@@ -266,6 +297,39 @@ fn vexor_ok(home: &Path, req: &Request) -> Result<(), String> {
         Response::Error { message, .. } => Err(message),
         _ => Ok(()),
     }
+}
+
+/// Same test as the dump's: any instance online, or on its way there.
+fn live_running(ps: &[LiveProcess]) -> bool {
+    ps.iter().any(|p| {
+        matches!(
+            p.status.as_str(),
+            "online" | "launching" | "waiting restart"
+        )
+    })
+}
+
+/// Apps whose running state under PM2 now differs from the saved dump, as
+/// "name (saved X, now Y)". The plan was made from the dump, so applying it
+/// to such an app would do the wrong thing: one saved as stopped but running
+/// again would be added to Vexor stopped and left running under PM2.
+fn stale_in_dump(
+    apps: &[&migrate::AppPlan],
+    live: &BTreeMap<String, Vec<LiveProcess>>,
+) -> Vec<String> {
+    let word = |running: bool| if running { "running" } else { "stopped" };
+    apps.iter()
+        .filter_map(|a| {
+            let now = live.get(&a.name).is_some_and(|ps| live_running(ps));
+            (now != a.running).then(|| {
+                let shown = match live.get(&a.name) {
+                    None => "not in PM2".to_owned(),
+                    Some(_) => word(now).to_owned(),
+                };
+                format!("{} (saved {}, now {shown})", a.name, word(a.running))
+            })
+        })
+        .collect()
 }
 
 /// Healthy: every instance online with no restart, and the same live
@@ -423,6 +487,32 @@ fn apply(home: &Path, pm2_home: &Path, dump: &Path, opts: Options) -> Result<u8,
             crate::code::PARTIAL
         });
     }
+    // The plan says which apps PM2 runs as of `pm2 save`; check that still
+    // holds before changing anything. Apps interrupted mid-move were stopped
+    // under PM2 by us, so they are left out.
+    let pm2 = Pm2 {
+        bin: find_pm2(opts.pm2)?,
+        home: pm2_home.to_path_buf(),
+    };
+    let live = pm2.live()?;
+    let fresh: Vec<&migrate::AppPlan> = todo
+        .iter()
+        .copied()
+        .filter(|a| {
+            !matches!(
+                last.get(&a.name),
+                Some(Step::Begin | Step::Pm2Stopped | Step::VexorStarted)
+            )
+        })
+        .collect();
+    let stale = stale_in_dump(&fresh, &live);
+    if !stale.is_empty() {
+        return Err(format!(
+            "PM2's saved process list is out of date: {}. Nothing was changed. \
+             Run `pm2 save`, then `vexor migrate --from-pm2 --backup`, review the new plan and run --apply again",
+            stale.join(", ")
+        ));
+    }
     for a in &todo {
         let what = match a.downtime {
             Downtime::Brief => "stop under PM2, start under Vexor",
@@ -451,14 +541,6 @@ fn apply(home: &Path, pm2_home: &Path, dump: &Path, opts: Options) -> Result<u8,
         }
     }
 
-    let pm2 = if todo.iter().any(|a| a.running) {
-        Some(Pm2 {
-            bin: find_pm2(opts.pm2)?,
-            home: pm2_home.to_path_buf(),
-        })
-    } else {
-        None
-    };
     let mut journal = Journal::open(&backup.dir)?;
     let existing: Vec<String> = vexor_apps(home)?.into_iter().map(|a| a.name).collect();
     let mut left_on_pm2: Vec<String> = Vec::new();
@@ -491,7 +573,6 @@ fn apply(home: &Path, pm2_home: &Path, dump: &Path, opts: Options) -> Result<u8,
             journal.write(name, Step::Begin, None)?;
         }
         if a.running {
-            let pm2 = pm2.as_ref().expect("pm2 found for running apps");
             if let Err(e) = pm2.run(&["stop", name]) {
                 // Nothing changed for this app yet.
                 journal.write(name, Step::Failed, Some(e.clone()))?;
@@ -556,9 +637,10 @@ fn apply(home: &Path, pm2_home: &Path, dump: &Path, opts: Options) -> Result<u8,
                 // if Vexor never added it (the start was refused), there is
                 // nothing to delete, but PM2 must still start it again.
                 let deleted = vexor_delete(home, name);
-                let restarted = match (&pm2, a.running) {
-                    (Some(p), true) => p.run(&["start", name]),
-                    _ => Ok(()),
+                let restarted = if a.running {
+                    pm2.run(&["start", name])
+                } else {
+                    Ok(())
                 };
                 let back = match (deleted, restarted) {
                     (Ok(()), Ok(())) => Ok(()),
@@ -567,10 +649,18 @@ fn apply(home: &Path, pm2_home: &Path, dump: &Path, opts: Options) -> Result<u8,
                 };
                 // An app that was already failing under PM2 says nothing
                 // about the move: leave it there and carry on.
+                // PM2 flips such an app between `online` and `waiting
+                // restart`, so its unstable restarts count too.
                 let failing_before = a
                     .pm2_status
                     .iter()
-                    .any(|s| matches!(s.as_str(), "waiting restart" | "errored"));
+                    .any(|s| matches!(s.as_str(), "waiting restart" | "errored"))
+                    || live.get(name).is_some_and(|ps| {
+                        ps.iter().any(|p| {
+                            p.unstable_restarts > 0
+                                || matches!(p.status.as_str(), "waiting restart" | "errored")
+                        })
+                    });
                 match back {
                     Ok(()) if failing_before => {
                         journal.write(

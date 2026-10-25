@@ -3,6 +3,18 @@
 All notable changes to Vexor. Versions follow [Semantic Versioning](https://semver.org/);
 before 1.0, minor versions may include breaking changes, which are listed here.
 
+## 0.13.2 (2026-10-25, prerelease)
+
+### Changed
+- `vexor migrate --from-pm2` no longer needs `pm2 save`: when PM2's daemon
+  is running, the plan is made from what PM2 runs now (`pm2 jlist`), and
+  `--backup` keeps that list for `--apply`. Without a running PM2 daemon,
+  or with `--dump FILE`, the saved dump is used as before. `--pm2` now
+  works with the dry run and `--backup` too.
+- `--apply` no longer refuses when PM2's state differs from the plan: an
+  app started under PM2 since is stopped there and moved, one stopped
+  since is added to Vexor stopped, and the plan shows which.
+
 ## 0.13.1 (2026-10-25, prerelease)
 
 ### Fixed

@@ -87,9 +87,12 @@ impl Live {
         l.lines.json_lines += w.json_lines;
         for r in &w.routes {
             l.lines.requests += r.count;
-            let mut key = (r.method.clone(), r.route.clone());
+            let mut key = (
+                vexor_proto::http_method(&r.method).to_owned(),
+                r.route.clone(),
+            );
             if !l.route_totals.contains_key(&key) && l.route_totals.len() >= MAX_ROUTE_TOTALS {
-                key.1 = "(other)".to_owned();
+                key = ("-".to_owned(), "(other)".to_owned());
             }
             let t = l.route_totals.entry(key).or_default();
             t.0 += r.count;

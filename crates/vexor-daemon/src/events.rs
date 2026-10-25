@@ -837,29 +837,31 @@ fn route_id(
     method: &str,
     route: &str,
 ) -> rusqlite::Result<i64> {
-    let find = |route: &str| {
+    // Shims send standard methods only; checked again here.
+    let method = vexor_proto::http_method(method);
+    let find = |method: &str, route: &str| {
         tx.prepare_cached(
             "SELECT id FROM route_names WHERE app = ?1 AND method = ?2 AND route = ?3",
         )?
         .query_row(params![app, method, route], |r| r.get::<_, i64>(0))
     };
-    match find(route) {
+    match find(method, route) {
         Err(rusqlite::Error::QueryReturnedNoRows) => {}
         found => return found,
     }
     let known: i64 = tx
         .prepare_cached("SELECT count(*) FROM route_names WHERE app = ?1")?
         .query_row(params![app], |r| r.get(0))?;
-    let route = if known < MAX_ROUTES_PER_APP {
-        route
+    let (method, route) = if known < MAX_ROUTES_PER_APP {
+        (method, route)
     } else {
-        "(other)"
+        ("-", "(other)")
     };
     tx.prepare_cached(
         "INSERT OR IGNORE INTO route_names (app, method, route) VALUES (?1, ?2, ?3)",
     )?
     .execute(params![app, method, route])?;
-    find(route)
+    find(method, route)
 }
 
 fn write_batch(conn: &mut Connection, batch: Vec<Write>) -> rusqlite::Result<()> {

@@ -40,16 +40,18 @@ Without configuration, these fields are looked for, first match wins:
 | status | `res.statusCode`, `res.status`, `statusCode`, `status`, `status_code`, `response.status`, `response.statusCode`, `meta.res.statusCode`, `http.status_code`, `http.response.status_code` |
 | duration (ms) | `responseTime`, `response_time`, `response-time`, `res.responseTime`, `duration`, `duration_ms`, `elapsed`, `elapsed_ms`, `latency`, `latency_ms`, `meta.responseTime`, `http.duration` |
 
-Numbers given as strings (`"12.5"`, `"12.5ms"`, as morgan writes them) are
+Methods other than GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS, CONNECT
+and TRACE are shown as `-`. Numbers given as strings (`"12.5"`, `"12.5ms"`, as morgan writes them) are
 read too. Fastify logs the URL on its "incoming request" line and the
 status and time on "request completed"; the two are joined by `reqId`,
 separately for each process (by output pipe, and by pino's `pid` field for
 cluster workers, which share one), so processes numbering requests the
 same way don't mix.
 
-URLs become routes: the scheme, host, query string and fragment are
-dropped, and path segments that look like ids (numbers, UUIDs, hex strings
-of 16+ characters, tokens of 20+ characters with digits) become `:id`:
+URLs become routes: the scheme, host, credentials (`user:pw@`), query
+string and fragment are dropped, and path segments that look like ids
+(numbers, UUIDs, hex strings of 16+ characters, tokens of 20+ characters
+with digits) or contain `@` (an email address) become `:id`:
 `/users/42/orders?page=2` is counted as `/users/:id/orders`. A route
 template in the log (`route`, `http.route`) is used as it is. Routes are
 cut at 200 bytes and control characters are replaced, so a log line can't
@@ -106,7 +108,12 @@ app again to get them.
 - Latency quantiles come from a histogram with buckets 19% wide
   (0.1 ms to 30 min), so p50/p95/p99 are within about 9% of the exact
   value. The average and the maximum are exact.
-- Lines longer than 64 KiB are counted but not read.
+- Lines longer than 64 KiB are counted but not read; request ids longer
+  than 128 bytes are not joined.
+- Route names reach `vexor routes`, `events.db` and Prometheus labels. A
+  URL path that carries secrets in a segment not shaped like an id is kept
+  as written: log route templates (`req.route`, `http.route`) or map
+  `routes.route` to one, or set `routes: false`.
 - Reading happens on the log writer thread, never on the supervisor's
   control loop. Measured on an Apple M5, release build: a 392-byte pino-http
   request line costs 2.3 µs, another JSON line 0.2 µs (most are skipped

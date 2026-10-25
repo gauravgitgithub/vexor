@@ -95,6 +95,18 @@ pub enum FromShim {
     },
 }
 
+/// An HTTP method as stored and shown: one of the standard methods, else
+/// `-`, so a log line can't create unbounded method names.
+pub fn http_method(m: &str) -> &'static str {
+    const METHODS: [&str; 9] = [
+        "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "CONNECT", "TRACE",
+    ];
+    METHODS
+        .into_iter()
+        .find(|k| k.eq_ignore_ascii_case(m))
+        .unwrap_or("-")
+}
+
 /// What the shim read from an app's output over one window.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RouteWindow {

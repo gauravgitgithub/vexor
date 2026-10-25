@@ -22,6 +22,8 @@ use vexor_proto::{RouteStats, RouteWindow, hist};
 const MAX_LINE: usize = 64 * 1024;
 /// Fastify-style requests waiting for their outcome line.
 const MAX_PENDING: usize = 4096;
+/// Longer request ids aren't joined (bounds what waiting requests hold).
+const MAX_ID_LEN: usize = 128;
 const MAX_ROUTE_LEN: usize = 200;
 const OTHER: &str = "(other)";
 
@@ -218,7 +220,7 @@ impl Tap {
             s.json_lines += 1;
             let mut key = (method, route);
             if !s.routes.contains_key(&key) && s.routes.len() >= self.max_routes {
-                key.1 = OTHER.to_owned();
+                key = ("-".to_owned(), OTHER.to_owned());
             }
             let acc = s.routes.entry(key).or_default();
             acc.count += 1;
@@ -295,7 +297,11 @@ impl Tap {
             return Line::Text;
         }
         let route = self.route.find(&v).and_then(Value::as_str).map(normalize);
-        let method = self.method.find(&v).and_then(Value::as_str).map(method);
+        let method = self
+            .method
+            .find(&v)
+            .and_then(Value::as_str)
+            .map(|m| vexor_proto::http_method(m).to_owned());
         let status = self.status.find(&v).and_then(status);
         let ms = self
             .duration
@@ -311,6 +317,9 @@ impl Tap {
                 Value::Number(n) => n.to_string(),
                 _ => return None,
             };
+            if id.len() > MAX_ID_LEN {
+                return None;
+            }
             Some(match v.get("pid").and_then(Value::as_u64) {
                 Some(pid) => format!("{pid}:{id}"),
                 None => id,
@@ -413,22 +422,24 @@ fn status(v: &Value) -> Option<u16> {
     Some(n as u16)
 }
 
-fn method(m: &str) -> String {
-    if !m.is_empty() && m.len() <= 16 && m.bytes().all(|b| b.is_ascii_alphabetic()) {
-        m.to_ascii_uppercase()
-    } else {
-        "-".to_owned()
-    }
-}
-
-/// A route from a template or URL: no scheme, host, query or fragment, ids
-/// replaced by `:id`, control characters replaced, at most 200 bytes.
+/// A route from a template or URL: no scheme, host, credentials, query or
+/// fragment, ids (and anything with `@`, such as an email) replaced by
+/// `:id`, control characters replaced, at most 200 bytes.
 pub fn normalize(raw: &str) -> String {
     let mut path = raw.trim();
-    for scheme in ["http://", "https://"] {
-        if let Some(rest) = path.strip_prefix(scheme) {
-            path = rest.find('/').map_or("/", |i| &rest[i..]);
-        }
+    // `scheme://authority/...` (any scheme, any case) or `//authority/...`.
+    let scheme_end = path.find("://").filter(|&i| {
+        let s = &path.as_bytes()[..i];
+        s.first().is_some_and(u8::is_ascii_alphabetic)
+            && s.iter()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'+' | b'.' | b'-'))
+    });
+    let authority = match scheme_end {
+        Some(i) => Some(&path[i + 3..]),
+        None => path.strip_prefix("//"),
+    };
+    if let Some(rest) = authority {
+        path = rest.find('/').map_or("/", |i| &rest[i..]);
     }
     let end = path.find(['?', '#']).unwrap_or(path.len());
     let path = &path[..end];
@@ -461,6 +472,9 @@ fn is_id(seg: &str) -> bool {
     let b = seg.as_bytes();
     if b.is_empty() {
         return false;
+    }
+    if b.contains(&b'@') {
+        return true;
     }
     let uuid = b.len() == 36
         && b.iter().enumerate().all(|(i, c)| match i {
@@ -505,6 +519,14 @@ mod tests {
         assert_eq!(normalize("/files/deadbeefdeadbeef00"), "/files/:id");
         assert_eq!(normalize("/t/abcDEF123456789xyz_-Q"), "/t/:id");
         assert_eq!(normalize("/users/:id"), "/users/:id");
+        assert_eq!(normalize("HTTPS://user:pw@h.example/a?t=1"), "/a");
+        assert_eq!(normalize("ws+unix://h/sock/x"), "/sock/x");
+        assert_eq!(normalize("//cdn.example/lib.js"), "/lib.js");
+        assert_eq!(
+            normalize("/invite/jane@example.com/accept"),
+            "/invite/:id/accept"
+        );
+        assert_eq!(normalize("/a:b://not-a-scheme"), "/a:b://not-a-scheme");
         assert_eq!(normalize("/v1/health"), "/v1/health");
         assert_eq!(normalize(""), "/");
         assert_eq!(normalize("/a\u{1b}[31m"), "/a?[31m");
@@ -582,6 +604,13 @@ mod tests {
         t.feed(1, &mut a, incoming("req-2", "/a").as_bytes());
         t.closed(1);
         assert!(t.lock().pending.is_empty() && t.lock().pending_order.is_empty());
+        // Overlong ids aren't held.
+        t.feed(
+            1,
+            &mut a,
+            incoming(&"x".repeat(MAX_ID_LEN + 1), "/a").as_bytes(),
+        );
+        assert!(t.lock().pending.is_empty());
     }
 
     #[test]
@@ -645,6 +674,19 @@ mod tests {
         let w = t.take(1).expect("window");
         assert_eq!(route(&w, "-", "/a").count, 2);
         assert_eq!(route(&w, "-", OTHER).count, 2);
+        // Methods outside the standard ones are folded.
+        let t = tap();
+        feed(
+            &t,
+            "{\"method\":\"x1\",\"url\":\"/a\",\"status\":200,\"duration\":1}\n",
+        );
+        feed(
+            &t,
+            "{\"method\":\"patch\",\"url\":\"/a\",\"status\":200,\"duration\":1}\n",
+        );
+        let w2 = t.take(2).expect("window");
+        assert_eq!(route(&w2, "-", "/a").count, 1);
+        assert_eq!(route(&w2, "PATCH", "/a").count, 1);
         assert!((route(&w, "-", "/b").max_ms - 250.0).abs() < 1e-9);
         assert_eq!(w.routes.len(), 3);
     }

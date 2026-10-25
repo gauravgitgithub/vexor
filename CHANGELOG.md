@@ -3,6 +3,25 @@
 All notable changes to Vexor. Versions follow [Semantic Versioning](https://semver.org/);
 before 1.0, minor versions may include breaking changes, which are listed here.
 
+## 0.11.0 (2026-10-25, prerelease)
+
+### Added
+- `vexor routes <app> [--since 6h] [--all] [--json]`: requests per route,
+  4xx and 5xx share, p50/p95/max latency and requests over time, read
+  from the JSON request logs the app already writes (pino-http, Fastify,
+  express-winston, morgan JSON, OpenTelemetry fields). No SDK or code
+  change. URLs become routes (`/users/42?x=1` → `/users/:id`); plain-text
+  logs are reported as "no route data", never guessed at. Ecosystem key
+  `routes`: `false`, or a mapping of fields for other log shapes
+  (docs/routes.md). Kept per minute for 7 days, per hour for 90 days.
+- Prometheus: `vexor_route_requests_total` and
+  `vexor_route_server_errors_total` per app, method and route.
+
+### Changed
+- Shim protocol 4 and event database schema 4 (migrated forward
+  automatically). Apps started under an older Vexor keep working, without
+  route stats until they are deleted and started again.
+
 ## 0.10.1 (2026-10-24, prerelease)
 
 ### Changed

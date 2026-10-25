@@ -23,6 +23,7 @@ mod metrics;
 mod orphan;
 mod output;
 mod process;
+mod routes;
 mod user;
 
 use std::path::{Path, PathBuf};
@@ -184,6 +185,15 @@ pub async fn run(spec: AppSpec, home: Option<PathBuf>) -> i32 {
     // `ToShim::Scale` from the daemon connection: the new instance count.
     let (scale_tx, mut scale_rx) = tokio::sync::mpsc::unbounded_channel::<u32>();
 
+    // Per-route stats are only read by the daemon.
+    let route_spec = spec.routes.clone().unwrap_or_default();
+    let tap = (home.is_some() && route_spec.enabled)
+        .then(|| Arc::new(routes::Tap::new(&route_spec, output::now_ms())));
+    let route_interval = std::time::Duration::from_millis(match spec.policy.metrics_interval_ms {
+        0 => 5_000,
+        ms => ms.max(100),
+    });
+
     // Daemon-managed mode: lock, control socket, persisted identities.
     let mut presence = None;
     let managed = match &home {
@@ -218,6 +228,7 @@ pub async fn run(spec: AppSpec, home: Option<PathBuf>) -> i32 {
                         restart: restart_tx.clone(),
                         metrics: metrics_rx.clone(),
                         scale: scale_tx.clone(),
+                        routes: tap.clone().map(|t| (t, route_interval)),
                     },
                 ));
                 let managed = orphan::Managed::persisted(paths.pids.clone());
@@ -230,7 +241,7 @@ pub async fn run(spec: AppSpec, home: Option<PathBuf>) -> i32 {
             }
         },
     };
-    let logs = match logs::Logs::start(&spec.name, &spec.logs, &out) {
+    let logs = match logs::Logs::start(&spec.name, &spec.logs, &out, tap) {
         Ok(l) => l,
         Err(e) => {
             eprintln!("vexor shim: cannot set up log files: {e}");

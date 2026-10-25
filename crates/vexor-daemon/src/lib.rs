@@ -667,6 +667,7 @@ impl Daemon {
                     running: desired == Desired::Running && live.shim_pid().is_some(),
                     snapshot: live.snapshot(),
                     metrics: live.metrics(),
+                    routes: live.route_totals(),
                     name,
                 }
             })
@@ -927,6 +928,37 @@ impl Daemon {
                         resolution_ms: u64::try_from(resolution_ms).unwrap_or(0),
                         points,
                         warnings: self.events.warnings(),
+                    },
+                    Ok(Err(e)) => error(ErrorCode::Internal, e),
+                    Err(e) => error(ErrorCode::Internal, e.to_string()),
+                }
+            }
+            Request::Routes {
+                app,
+                since_ms,
+                until_ms,
+            } => {
+                if self.store.lock().await.get(&app).is_none() {
+                    return error(ErrorCode::NotFound, format!("no app named {app:?}"));
+                }
+                let live = self.live(&app).unwrap_or_default();
+                let mut warnings = self.events.warnings();
+                if live.shim_pid().is_some() && live.protocol() < 4 {
+                    warnings.push(format!(
+                        "{app}'s supervisor predates route stats; vexor delete {app} and start it again to read them"
+                    ));
+                }
+                let events = self.events.clone();
+                let result =
+                    tokio::task::spawn_blocking(move || events.routes(&app, since_ms, until_ms))
+                        .await;
+                match result {
+                    Ok(Ok((resolution_ms, routes, points))) => Response::Routes {
+                        resolution_ms: u64::try_from(resolution_ms).unwrap_or(0),
+                        routes,
+                        points,
+                        logs: live.log_lines(),
+                        warnings,
                     },
                     Ok(Err(e)) => error(ErrorCode::Internal, e),
                     Err(e) => error(ErrorCode::Internal, e.to_string()),

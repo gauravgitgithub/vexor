@@ -10,6 +10,7 @@ mod metrics;
 mod migrate;
 mod monit;
 mod ops;
+mod routes;
 mod spec;
 mod startup;
 mod ui;
@@ -168,6 +169,21 @@ enum Command {
         /// per hour 90d).
         #[arg(long, value_parser = parse_duration, default_value = "1h")]
         since: std::time::Duration,
+        /// Machine-readable output.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show an app's requests per route (count, errors, p50/p95 latency),
+    /// read from its JSON request logs.
+    Routes {
+        name: String,
+        /// How far back, e.g. 10m, 2h, 7d (kept: per minute 7d, per hour
+        /// 90d).
+        #[arg(long, value_parser = parse_duration, default_value = "1h")]
+        since: std::time::Duration,
+        /// Show every route, not only the 20 busiest.
+        #[arg(long)]
+        all: bool,
         /// Machine-readable output.
         #[arg(long)]
         json: bool,
@@ -557,6 +573,65 @@ fn main() -> ExitCode {
                 json,
             )
         }
+        Command::Routes {
+            name,
+            since,
+            all,
+            json,
+        } => {
+            let until_ms = describe::now_ms();
+            let since_ms =
+                until_ms.saturating_sub(u64::try_from(since.as_millis()).unwrap_or(u64::MAX));
+            let req = Request::Routes {
+                app: name.clone(),
+                since_ms,
+                until_ms,
+            };
+            match client::request(&home, &req) {
+                Ok(Response::Routes {
+                    resolution_ms,
+                    routes,
+                    points,
+                    logs,
+                    warnings,
+                }) => {
+                    print_warnings(&warnings);
+                    if json {
+                        let out = serde_json::json!({
+                            "resolution_ms": resolution_ms,
+                            "routes": routes,
+                            "points": points,
+                            "logs": logs,
+                        });
+                        match serde_json::to_string_pretty(&out) {
+                            Ok(s) => println!("{s}"),
+                            Err(e) => return fail(&e.to_string()),
+                        }
+                    } else {
+                        routes::print(&routes::View {
+                            app: &name,
+                            routes: &routes,
+                            points: &points,
+                            resolution_ms,
+                            since: since_ms,
+                            until: until_ms,
+                            logs,
+                            all,
+                        });
+                    }
+                    ExitCode::SUCCESS
+                }
+                Ok(Response::Error { message, .. }) => {
+                    eprintln!("vexor: {message}");
+                    ExitCode::from(code::FAILED)
+                }
+                Ok(_) => fail("unexpected answer from the daemon"),
+                Err(e) => {
+                    eprintln!("vexor: {e}");
+                    ExitCode::from(code::DAEMON_UNREACHABLE)
+                }
+            }
+        }
         Command::Events {
             app,
             since,
@@ -748,6 +823,8 @@ fn send(home: &std::path::Path, req: Request, json: bool) -> ExitCode {
             }
             ExitCode::SUCCESS
         }
+        // Answered in place by `vexor routes`.
+        Response::Routes { .. } => fail("unexpected answer from the daemon"),
         Response::Ok { apps, warnings } => {
             print_warnings(&warnings);
             if json {
@@ -842,6 +919,7 @@ fn run_plan(home: &std::path::Path, plan: spec::Plan, allow_unsupported: bool) -
                 | Response::Describe { .. }
                 | Response::Version { .. }
                 | Response::Metrics { .. }
+                | Response::Routes { .. }
                 | Response::Alerts { .. }
                 | Response::AlertsTested { .. },
             ) => {}

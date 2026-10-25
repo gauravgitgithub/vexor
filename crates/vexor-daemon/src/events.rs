@@ -14,6 +14,9 @@
 //!   Compact on purpose (integer app ids, CPU in tenths of a percent,
 //!   memory in KiB, rollup times in seconds): see docs/plan.md 6b.2 for
 //!   measured sizes.
+//! - Per-route request stats (plan 6b.5) go straight into 1-minute and
+//!   1-hour buckets in `routes_rollup` (counts, errors, total and longest
+//!   duration, a sparse latency histogram), keyed by `route_names`.
 //! - A corrupt file is renamed `events.db.corrupt-<ts>` (never deleted) and a
 //!   fresh one is created. If no database can be opened at all, the daemon
 //!   keeps supervising without history and reports that it is degraded.
@@ -26,10 +29,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OpenFlags, params};
 use serde_json::{Value, json};
-use vexor_proto::{InstanceMetrics, MetricsPoint, Resume};
+use vexor_proto::{
+    InstanceMetrics, MetricsPoint, Resume, RoutePoint, RouteSummary, RouteWindow, hist,
+};
 
 pub const FILE: &str = "events.db";
-const SCHEMA_VERSION: i32 = 3;
+const SCHEMA_VERSION: i32 = 4;
 const QUEUE: usize = 10_000;
 /// Default retention.
 pub const MAX_AGE: Duration = Duration::from_secs(30 * 24 * 3600);
@@ -49,6 +54,12 @@ pub const ROLLUPS: [(i64, i64, Duration); 2] = [
 pub const MAX_RAW_METRICS: i64 = 3_000_000;
 /// Longest a resource sample waits in memory before it is written.
 const METRICS_FLUSH: Duration = Duration::from_secs(2);
+/// Distinct routes stored per app; requests to others are stored as
+/// `(other)`, so a route that slips past normalization can't grow the
+/// database without bound.
+pub const MAX_ROUTES_PER_APP: i64 = 1_000;
+/// Routes with a time series in a `routes` answer (the busiest).
+pub const ROUTE_SERIES: usize = 20;
 
 enum Write {
     Shim {
@@ -65,6 +76,10 @@ enum Write {
     Metrics {
         app: String,
         samples: Vec<InstanceMetrics>,
+    },
+    Routes {
+        app: String,
+        window: RouteWindow,
     },
     Prune,
 }
@@ -192,6 +207,150 @@ impl Events {
                 samples,
             });
         }
+    }
+
+    /// Store one window of per-route request stats.
+    pub fn record_routes(&self, app: &str, window: RouteWindow) {
+        if !window.routes.is_empty() {
+            self.send(Write::Routes {
+                app: app.to_owned(),
+                window,
+            });
+        }
+    }
+
+    /// Per-route stats of `app` between `since_ms` and `until_ms`, in
+    /// per-minute buckets, or per-hour ones for long or old ranges: a
+    /// summary per route (busiest first) and a series for the busiest
+    /// [`ROUTE_SERIES`]. Returns the bucket width in ms.
+    pub fn routes(
+        &self,
+        app: &str,
+        since_ms: u64,
+        until_ms: u64,
+    ) -> Result<(i64, Vec<RouteSummary>, Vec<RoutePoint>), String> {
+        let conn = self.reader().map_err(|e| format!("route history: {e}"))?;
+        let since = i64::try_from(since_ms / 1000).unwrap_or(i64::MAX);
+        let until = i64::try_from(until_ms / 1000).unwrap_or(i64::MAX);
+        let span = until.saturating_sub(since);
+        let oldest = |keep: Duration| now_ms() / 1000 - i64::try_from(keep.as_secs()).unwrap_or(0);
+        let (res, width, _) = ROLLUPS
+            .iter()
+            .copied()
+            .find(|(_, width, keep)| span / width <= 1_500 && since >= oldest(*keep))
+            .unwrap_or(ROLLUPS[1]);
+        let mut stmt = conn
+            .prepare(
+                "SELECT n.method, n.route, r.ts_s, r.n, r.client_errors, r.server_errors,
+                        r.total_ms, r.max_ms, r.hist
+                 FROM routes_rollup r
+                 JOIN route_names n ON n.id = r.route
+                 JOIN metric_apps a ON a.id = n.app
+                 WHERE a.name = ?1 AND r.res = ?2 AND r.ts_s >= ?3 AND r.ts_s <= ?4
+                 ORDER BY n.method, n.route, r.ts_s",
+            )
+            .map_err(|e| e.to_string())?;
+        struct Bucket {
+            ts_s: i64,
+            n: u64,
+            server_errors: u64,
+            hist: Vec<(u16, u64)>,
+        }
+        struct Route {
+            summary: RouteSummary,
+            total_ms: f64,
+            hist: Vec<(u16, u64)>,
+            buckets: Vec<Bucket>,
+        }
+        let mut routes: Vec<Route> = Vec::new();
+        let u = |v: i64| u64::try_from(v).unwrap_or(0);
+        let rows = stmt
+            .query_map(
+                params![app, res, since - since.rem_euclid(width), until],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)?,
+                        u(r.get(3)?),
+                        u(r.get(4)?),
+                        u(r.get(5)?),
+                        r.get::<_, f64>(6)?,
+                        r.get::<_, f64>(7)?,
+                        hist::decode(&r.get::<_, Vec<u8>>(8)?),
+                    ))
+                },
+            )
+            .map_err(|e| e.to_string())?;
+        for row in rows {
+            let (method, route, ts_s, n, client, server, total_ms, max_ms, h) =
+                row.map_err(|e| e.to_string())?;
+            let same = routes
+                .last()
+                .is_some_and(|r| r.summary.method == method && r.summary.route == route);
+            if !same {
+                routes.push(Route {
+                    summary: RouteSummary {
+                        method,
+                        route,
+                        count: 0,
+                        client_errors: 0,
+                        server_errors: 0,
+                        avg_ms: 0.0,
+                        p50_ms: 0.0,
+                        p95_ms: 0.0,
+                        p99_ms: 0.0,
+                        max_ms: 0.0,
+                    },
+                    total_ms: 0.0,
+                    hist: Vec::new(),
+                    buckets: Vec::new(),
+                });
+            }
+            let r = routes.last_mut().expect("pushed");
+            r.summary.count += n;
+            r.summary.client_errors += client;
+            r.summary.server_errors += server;
+            r.summary.max_ms = r.summary.max_ms.max(max_ms);
+            r.total_ms += total_ms;
+            hist::merge(&mut r.hist, &h);
+            r.buckets.push(Bucket {
+                ts_s,
+                n,
+                server_errors: server,
+                hist: h,
+            });
+        }
+        routes.sort_by(|a, b| {
+            b.summary
+                .count
+                .cmp(&a.summary.count)
+                .then_with(|| a.summary.route.cmp(&b.summary.route))
+        });
+        let mut summaries = Vec::with_capacity(routes.len());
+        let mut points = Vec::new();
+        for (i, mut r) in routes.into_iter().enumerate() {
+            let q = |q| round1(hist::quantile(&r.hist, q).unwrap_or(0.0));
+            #[allow(clippy::cast_precision_loss)]
+            let avg = r.total_ms / r.summary.count.max(1) as f64;
+            r.summary.avg_ms = round1(avg);
+            r.summary.p50_ms = q(0.5);
+            r.summary.p95_ms = q(0.95);
+            r.summary.p99_ms = q(0.99);
+            r.summary.max_ms = round1(r.summary.max_ms);
+            if i < ROUTE_SERIES {
+                let index = u32::try_from(i).unwrap_or(u32::MAX);
+                points.extend(r.buckets.iter().map(|b| RoutePoint {
+                    route: index,
+                    ts_ms: u(b.ts_s) * 1000,
+                    count: b.n,
+                    server_errors: b.server_errors,
+                    p95_ms: round1(hist::quantile(&b.hist, 0.95).unwrap_or(0.0)),
+                }));
+            }
+            summaries.push(r.summary);
+        }
+        Ok((width * 1000, summaries, points))
     }
 
     /// Resource history of `app` between `since_ms` and `until_ms`: raw
@@ -450,12 +609,18 @@ fn open_checked(path: &Path) -> Result<Connection, String> {
             .map_err(|e| e.to_string())?;
             migrate_to_2(&conn)?;
             migrate_to_3(&conn)?;
+            migrate_to_4(&conn)?;
         }
         1 => {
             migrate_to_2(&conn)?;
             migrate_to_3(&conn)?;
+            migrate_to_4(&conn)?;
         }
-        2 => migrate_to_3(&conn)?,
+        2 => {
+            migrate_to_3(&conn)?;
+            migrate_to_4(&conn)?;
+        }
+        3 => migrate_to_4(&conn)?,
         SCHEMA_VERSION => {}
         v => {
             return Err(format!(
@@ -528,6 +693,35 @@ fn migrate_to_3(conn: &Connection) -> Result<(), String> {
     .map_err(|e| e.to_string())
 }
 
+/// Schema 4: per-route request stats (see the module docs).
+fn migrate_to_4(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(
+        "BEGIN;
+         CREATE TABLE route_names (
+           id INTEGER PRIMARY KEY,
+           app INTEGER NOT NULL,
+           method TEXT NOT NULL,
+           route TEXT NOT NULL,
+           UNIQUE (app, method, route)
+         );
+         CREATE TABLE routes_rollup (
+           route INTEGER NOT NULL,
+           res INTEGER NOT NULL,
+           ts_s INTEGER NOT NULL,
+           n INTEGER NOT NULL,
+           client_errors INTEGER NOT NULL,
+           server_errors INTEGER NOT NULL,
+           total_ms REAL NOT NULL,
+           max_ms REAL NOT NULL,
+           hist BLOB NOT NULL,
+           PRIMARY KEY (route, res, ts_s)
+         ) WITHOUT ROWID;
+         PRAGMA user_version = 4;
+         COMMIT;",
+    )
+    .map_err(|e| e.to_string())
+}
+
 fn writer(mut conn: Connection, rx: &Receiver<Write>) {
     use std::sync::mpsc::RecvTimeoutError;
     // Resource samples arrive many times a second with 100 apps: they wait
@@ -557,7 +751,7 @@ fn writer(mut conn: Connection, rx: &Receiver<Write>) {
             .into_iter()
             .chain(std::iter::from_fn(|| rx.try_recv().ok()).take(999))
         {
-            if matches!(w, Write::Metrics { .. }) {
+            if matches!(w, Write::Metrics { .. } | Write::Routes { .. }) {
                 metrics.push(w);
                 flush_at.get_or_insert_with(|| std::time::Instant::now() + METRICS_FLUSH);
             } else {
@@ -608,7 +802,64 @@ fn prune_metrics(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
             )?;
         }
     }
+    let routes: Vec<i64> = tx
+        .prepare("SELECT id FROM route_names")?
+        .query_map([], |r| r.get(0))?
+        .collect::<Result<_, _>>()?;
+    for route in routes {
+        for (res, _, keep) in ROLLUPS {
+            let keep = i64::try_from(keep.as_secs()).unwrap_or(i64::MAX);
+            tx.execute(
+                "DELETE FROM routes_rollup WHERE route = ?1 AND res = ?2 AND ts_s < ?3",
+                params![route, res, now - keep],
+            )?;
+        }
+    }
+    tx.execute(
+        "DELETE FROM route_names WHERE id NOT IN (SELECT DISTINCT route FROM routes_rollup)",
+        [],
+    )?;
     Ok(())
+}
+
+fn app_id(tx: &rusqlite::Transaction<'_>, app: &str) -> rusqlite::Result<i64> {
+    tx.prepare_cached("INSERT OR IGNORE INTO metric_apps (name) VALUES (?1)")?
+        .execute(params![app])?;
+    tx.prepare_cached("SELECT id FROM metric_apps WHERE name = ?1")?
+        .query_row(params![app], |r| r.get(0))
+}
+
+/// The id of a route, created if the app has room for it, else of its
+/// `(other)` route.
+fn route_id(
+    tx: &rusqlite::Transaction<'_>,
+    app: i64,
+    method: &str,
+    route: &str,
+) -> rusqlite::Result<i64> {
+    let find = |route: &str| {
+        tx.prepare_cached(
+            "SELECT id FROM route_names WHERE app = ?1 AND method = ?2 AND route = ?3",
+        )?
+        .query_row(params![app, method, route], |r| r.get::<_, i64>(0))
+    };
+    match find(route) {
+        Err(rusqlite::Error::QueryReturnedNoRows) => {}
+        found => return found,
+    }
+    let known: i64 = tx
+        .prepare_cached("SELECT count(*) FROM route_names WHERE app = ?1")?
+        .query_row(params![app], |r| r.get(0))?;
+    let route = if known < MAX_ROUTES_PER_APP {
+        route
+    } else {
+        "(other)"
+    };
+    tx.prepare_cached(
+        "INSERT OR IGNORE INTO route_names (app, method, route) VALUES (?1, ?2, ?3)",
+    )?
+    .execute(params![app, method, route])?;
+    find(route)
 }
 
 fn write_batch(conn: &mut Connection, batch: Vec<Write>) -> rusqlite::Result<()> {
@@ -654,16 +905,53 @@ fn write_batch(conn: &mut Connection, batch: Vec<Write>) -> rusqlite::Result<()>
                     params![now_ms(), app, kind, data.to_string()],
                 )?;
             }
+            Write::Routes { app, window } => {
+                let app = app_id(&tx, &app)?;
+                let ts = i64::try_from(window.end_ms.saturating_sub(1) / 1000).unwrap_or(i64::MAX);
+                for r in window.routes {
+                    let route = route_id(&tx, app, &r.method, &r.route)?;
+                    for (res, width, _) in ROLLUPS {
+                        let bucket = ts - ts.rem_euclid(width);
+                        let mut h: Vec<(u16, u64)> = tx
+                            .prepare_cached(
+                                "SELECT hist FROM routes_rollup WHERE route = ?1 AND res = ?2 AND ts_s = ?3",
+                            )?
+                            .query_row(params![route, res, bucket], |row| row.get::<_, Vec<u8>>(0))
+                            .map(|b| hist::decode(&b))
+                            .or_else(|e| match e {
+                                rusqlite::Error::QueryReturnedNoRows => Ok(Vec::new()),
+                                e => Err(e),
+                            })?;
+                        hist::merge(&mut h, &r.hist);
+                        let i = |v: u64| i64::try_from(v).unwrap_or(i64::MAX);
+                        tx.prepare_cached(
+                            "INSERT INTO routes_rollup
+                               (route, res, ts_s, n, client_errors, server_errors, total_ms, max_ms, hist)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                             ON CONFLICT (route, res, ts_s) DO UPDATE SET
+                               n = n + excluded.n,
+                               client_errors = client_errors + excluded.client_errors,
+                               server_errors = server_errors + excluded.server_errors,
+                               total_ms = total_ms + excluded.total_ms,
+                               max_ms = max(max_ms, excluded.max_ms),
+                               hist = excluded.hist",
+                        )?
+                        .execute(params![
+                            route,
+                            res,
+                            bucket,
+                            i(r.count),
+                            i(r.client_errors),
+                            i(r.server_errors),
+                            r.total_ms,
+                            r.max_ms,
+                            hist::encode(&h),
+                        ])?;
+                    }
+                }
+            }
             Write::Metrics { app, samples } => {
-                tx.execute(
-                    "INSERT OR IGNORE INTO metric_apps (name) VALUES (?1)",
-                    params![app],
-                )?;
-                let id: i64 = tx.query_row(
-                    "SELECT id FROM metric_apps WHERE name = ?1",
-                    params![app],
-                    |r| r.get(0),
-                )?;
+                let id = app_id(&tx, &app)?;
                 let mut raw = tx.prepare_cached(
                     "INSERT OR REPLACE INTO metrics_raw (app, instance, ts_ms, pid, cpu, rss_kib, fds)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -1093,6 +1381,139 @@ mod tests {
             (p.pid, p.ts_ms, p.cpu_max, p.rss_max),
             (42, now / 1000 * 1000, Some(1.5), 2 << 20)
         );
+    }
+
+    fn window(end_ms: u64, routes: &[(&str, u64, u64, f64)]) -> RouteWindow {
+        RouteWindow {
+            start_ms: end_ms - 5_000,
+            end_ms,
+            lines: 10,
+            json_lines: 10,
+            routes: routes
+                .iter()
+                .map(
+                    |&(route, count, server_errors, ms)| vexor_proto::RouteStats {
+                        method: "GET".into(),
+                        route: route.into(),
+                        count,
+                        client_errors: 0,
+                        server_errors,
+                        #[allow(clippy::cast_precision_loss)]
+                        total_ms: ms * count as f64,
+                        max_ms: ms,
+                        hist: vec![(hist::bucket(ms), count)],
+                    },
+                )
+                .collect(),
+        }
+    }
+
+    fn wait_routes(
+        ev: &Events,
+        since: u64,
+        until: u64,
+        total: u64,
+    ) -> (i64, Vec<RouteSummary>, Vec<RoutePoint>) {
+        for _ in 0..600 {
+            let got = ev.routes("web", since, until).expect("routes");
+            if got.1.iter().map(|r| r.count).sum::<u64>() >= total {
+                return got;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("routes never arrived");
+    }
+
+    #[test]
+    fn routes_roll_up_with_latency_quantiles() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ev = Events::open(dir.path());
+        let now = base();
+        let minute = now - now % 60_000;
+        // Two windows in one minute merge; a third lands in the next.
+        ev.record_routes(
+            "web",
+            window(minute + 10_000, &[("/a", 95, 1, 10.0), ("/b", 3, 0, 2.0)]),
+        );
+        ev.record_routes("web", window(minute + 20_000, &[("/a", 5, 4, 1_000.0)]));
+        ev.record_routes("web", window(minute + 70_000, &[("/a", 10, 0, 10.0)]));
+        // A window with no requests stores nothing.
+        ev.record_routes("web", window(minute + 30_000, &[]));
+        let (width, routes, points) = wait_routes(&ev, minute, minute + 120_000, 113);
+        assert_eq!(width, 60_000);
+        assert_eq!(routes.len(), 2);
+        let a = &routes[0];
+        assert_eq!((a.route.as_str(), a.count, a.server_errors), ("/a", 110, 5));
+        assert!((a.p50_ms - 10.0).abs() < 1.0, "{a:?}");
+        assert!((a.p99_ms - 1_000.0).abs() < 100.0, "{a:?}");
+        assert!((a.max_ms - 1_000.0).abs() < 1e-9);
+        assert!((a.avg_ms - 55.0).abs() < 0.1, "{a:?}");
+        let a_points: Vec<_> = points.iter().filter(|p| p.route == 0).collect();
+        assert_eq!(a_points.len(), 2);
+        assert_eq!((a_points[0].ts_ms, a_points[0].count), (minute, 100));
+        assert_eq!(a_points[0].server_errors, 5);
+        assert_eq!(
+            (a_points[1].ts_ms, a_points[1].count),
+            (minute + 60_000, 10)
+        );
+        // Other apps don't leak in.
+        assert!(
+            ev.routes("api", minute, minute + 120_000)
+                .expect("q")
+                .1
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn routes_past_the_per_app_limit_are_stored_as_other() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ev = Events::open(dir.path());
+        let now = base();
+        let names: Vec<String> = (0..=MAX_ROUTES_PER_APP).map(|i| format!("/r{i}")).collect();
+        let routes: Vec<(&str, u64, u64, f64)> =
+            names.iter().map(|n| (n.as_str(), 1, 0, 1.0)).collect();
+        ev.record_routes("web", window(now, &routes));
+        let total = u64::try_from(names.len()).expect("len");
+        let (_, got, points) = wait_routes(&ev, now - 60_000, now + 1_000, total);
+        assert_eq!(got.len(), names.len());
+        assert!(got.iter().any(|r| r.route == "(other)"));
+        assert!(
+            !got.iter()
+                .any(|r| r.route == format!("/r{MAX_ROUTES_PER_APP}"))
+        );
+        // Series only for the busiest.
+        assert!(points.iter().all(|p| (p.route as usize) < ROUTE_SERIES));
+    }
+
+    #[test]
+    fn prune_drops_expired_routes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ev = Events::open(dir.path());
+        let now = base();
+        // Eight days ago: the minute row expires, the hour row stays.
+        ev.record_routes(
+            "web",
+            window(now - 8 * 24 * 3_600_000, &[("/old", 1, 0, 1.0)]),
+        );
+        ev.send(Write::Prune);
+        let count = |res: i64| -> i64 {
+            ev.reader()
+                .expect("reader")
+                .query_row(
+                    "SELECT count(*) FROM routes_rollup WHERE res = ?1",
+                    params![res],
+                    |r| r.get(0),
+                )
+                .expect("count")
+        };
+        for _ in 0..600 {
+            if count(1) == 0 && count(2) == 1 {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("minutes {}, hours {}", count(1), count(2));
     }
 
     #[test]

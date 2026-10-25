@@ -291,6 +291,7 @@ fn build(args: &StartArgs, script: &Path, home: &Path) -> Result<AppSpec, String
         shutdown_with_message: false,
         user: None,
         group: None,
+        routes: None,
         node_ipc,
         treekill: true,
         policy,

@@ -7,6 +7,8 @@
 
 use std::io;
 
+pub mod hist;
+
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -16,8 +18,8 @@ pub const PROTOCOL: u32 = 1;
 /// Daemon ↔ shim protocol. Shims outlive daemon upgrades (and downgrades),
 /// so a shim accepts every version from [`MIN_SHIM_PROTOCOL`], and a daemon
 /// refused by an older shim says hello again with the minimum.
-/// 2: [`FromShim::Metrics`]. 3: [`ToShim::Scale`].
-pub const SHIM_PROTOCOL: u32 = 3;
+/// 2: [`FromShim::Metrics`]. 3: [`ToShim::Scale`]. 4: [`FromShim::Routes`].
+pub const SHIM_PROTOCOL: u32 = 4;
 pub const MIN_SHIM_PROTOCOL: u32 = 1;
 
 /// Longest accepted message line, in bytes.
@@ -86,6 +88,73 @@ pub enum FromShim {
     Metrics {
         samples: Vec<InstanceMetrics>,
     },
+    /// Request stats read from the app's JSON logs since the previous
+    /// window (protocol 4). Like metrics, not an event.
+    Routes {
+        window: RouteWindow,
+    },
+}
+
+/// What the shim read from an app's output over one window.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RouteWindow {
+    pub start_ms: u64,
+    pub end_ms: u64,
+    /// Output lines seen, and how many of them were JSON objects.
+    pub lines: u64,
+    pub json_lines: u64,
+    pub routes: Vec<RouteStats>,
+}
+
+/// Requests to one route in one window.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RouteStats {
+    pub method: String,
+    pub route: String,
+    pub count: u64,
+    /// Responses with a 4xx and with a 5xx status.
+    pub client_errors: u64,
+    pub server_errors: u64,
+    pub total_ms: f64,
+    pub max_ms: f64,
+    /// Durations, see [`hist`].
+    pub hist: Vec<(u16, u64)>,
+}
+
+/// One route over a queried range.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RouteSummary {
+    pub method: String,
+    pub route: String,
+    pub count: u64,
+    pub client_errors: u64,
+    pub server_errors: u64,
+    pub avg_ms: f64,
+    pub p50_ms: f64,
+    pub p95_ms: f64,
+    pub p99_ms: f64,
+    pub max_ms: f64,
+}
+
+/// One route over one bucket of time.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RoutePoint {
+    /// Index into the response's `routes`.
+    pub route: u32,
+    /// Bucket start, ms since the epoch.
+    pub ts_ms: u64,
+    pub count: u64,
+    pub server_errors: u64,
+    pub p95_ms: f64,
+}
+
+/// Lines the connected shim has read since it connected, for telling apps
+/// without JSON logs (or without request fields in them) apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct LogLines {
+    pub lines: u64,
+    pub json_lines: u64,
+    pub requests: u64,
 }
 
 /// One instance's resources, sampled by its shim. Unknown fields are
@@ -213,6 +282,12 @@ pub enum Request {
         since_ms: u64,
         until_ms: u64,
     },
+    /// Per-route request stats of one app (plan 6b.5).
+    Routes {
+        app: String,
+        since_ms: u64,
+        until_ms: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -258,6 +333,20 @@ pub enum Response {
         resolution_ms: u64,
         /// Ordered by instance, then time.
         points: Vec<MetricsPoint>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        warnings: Vec<String>,
+    },
+    Routes {
+        /// Width of each point in ms.
+        resolution_ms: u64,
+        /// Busiest first.
+        routes: Vec<RouteSummary>,
+        /// Ordered by route, then time.
+        points: Vec<RoutePoint>,
+        /// From the connected shim; absent when none is connected or it
+        /// predates route stats.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        logs: Option<LogLines>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         warnings: Vec<String>,
     },

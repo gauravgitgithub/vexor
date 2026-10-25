@@ -131,6 +131,8 @@ pub struct Links {
     pub restart: broadcast::Sender<crate::instance::Control>,
     pub metrics: watch::Receiver<Vec<InstanceMetrics>>,
     pub scale: mpsc::UnboundedSender<u32>,
+    /// Per-route stats, taken once per interval.
+    pub routes: Option<(Arc<crate::routes::Tap>, Duration)>,
 }
 
 /// Accept daemon connections until the task is aborted.
@@ -176,6 +178,7 @@ async fn session(stream: UnixStream, out: Output, me: Identity, app: Arc<str>, l
         restart,
         mut metrics,
         scale,
+        routes,
     } = links;
     let (read, mut write) = stream.into_split();
 
@@ -229,6 +232,12 @@ async fn session(stream: UnixStream, out: Output, me: Identity, app: Arc<str>, l
     // Daemons before protocol 2 would reject metrics messages.
     let mut send_metrics = protocol >= 2;
     metrics.mark_changed();
+    // And before protocol 4, route windows. The first tick sends what was
+    // read while no daemon was connected.
+    let routes = routes.filter(|_| protocol >= 4);
+    let mut route_tick = routes
+        .as_ref()
+        .map(|(_, every)| tokio::time::interval(*every));
 
     loop {
         let changed = out.changed();
@@ -263,6 +272,14 @@ async fn session(stream: UnixStream, out: Output, me: Identity, app: Arc<str>, l
                 let samples = metrics.borrow_and_update().clone();
                 if !samples.is_empty()
                     && vexor_proto::send(&mut write, &FromShim::Metrics { samples }).await.is_err()
+                {
+                    return;
+                }
+            }
+            () = async { route_tick.as_mut().expect("guarded").tick().await; }, if route_tick.is_some() => {
+                let tap = &routes.as_ref().expect("with the tick").0;
+                if let Some(window) = tap.take(crate::output::now_ms())
+                    && vexor_proto::send(&mut write, &FromShim::Routes { window }).await.is_err()
                 {
                     return;
                 }

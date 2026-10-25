@@ -42,9 +42,12 @@ And:
 
 | Metric | Type | Meaning |
 |---|---|---|
+| `vexor_route_requests_total` | counter | requests per route, by `app`, `method` and `route`, read from JSON request logs (docs/routes.md) |
+| `vexor_route_server_errors_total` | counter | responses with a 5xx status, same labels |
 | `vexor_alerts_open` | gauge | open alert incidents, by `rule` and `level` (docs/alerts.md) |
 | `vexor_build_info` | gauge | 1, with the Vexor `version` label |
 
 CPU, memory and open files come from the samples the shims take every
 `metrics_interval_ms` (5 s by default); restarts, states and uptime come
-from the lifecycle events, so they are exact.
+from the lifecycle events, so they are exact. Route counters start at 0
+when the daemon starts (Prometheus treats that as a counter reset).

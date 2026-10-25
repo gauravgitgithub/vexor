@@ -19,12 +19,13 @@
 //! - Write errors (disk full, …) are reported once per streak; the app keeps
 //!   running and writing resumes when the disk recovers.
 
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -32,6 +33,7 @@ use tokio::sync::{Semaphore, mpsc};
 use vexor_core::{LogSpec, Overflow};
 
 use crate::output::{Output, ShimEvent};
+use crate::routes::{Partial, Tap};
 
 /// Bytes read from a pipe per chunk.
 pub const CHUNK: usize = 8 * 1024;
@@ -49,13 +51,19 @@ pub struct Logs {
 }
 
 impl Logs {
-    pub fn start(app: &str, spec: &LogSpec, events: &Output) -> io::Result<Logs> {
-        let (out, w1) = Sink::start(app, &spec.out, spec, events)?;
+    /// With `routes`, every line written is also read for request stats.
+    pub fn start(
+        app: &str,
+        spec: &LogSpec,
+        events: &Output,
+        routes: Option<Arc<Tap>>,
+    ) -> io::Result<Logs> {
+        let (out, w1) = Sink::start(app, &spec.out, spec, events, routes.clone())?;
         let mut writers = vec![w1];
         let err = if spec.err == spec.out {
             out.clone()
         } else {
-            let (err, w2) = Sink::start(app, &spec.err, spec, events)?;
+            let (err, w2) = Sink::start(app, &spec.err, spec, events, routes)?;
             writers.push(w2);
             err
         };
@@ -77,10 +85,19 @@ impl Logs {
     }
 }
 
+/// Output of one pipe, or the end of it.
+enum Queued {
+    Output { pipe: u32, data: Vec<u8> },
+    Closed(u32),
+}
+
+/// Numbers pipes, so the writer can keep each one's unfinished line apart.
+static NEXT_PIPE: AtomicU32 = AtomicU32::new(0);
+
 /// Producer side of one log file.
 #[derive(Debug, Clone)]
 pub struct Sink {
-    tx: mpsc::UnboundedSender<Vec<u8>>,
+    tx: mpsc::UnboundedSender<Queued>,
     /// Bytes that may still be queued (permits), returned as written.
     room: Arc<Semaphore>,
     capacity: u32,
@@ -95,6 +112,7 @@ impl Sink {
         path: &Path,
         spec: &LogSpec,
         events: &Output,
+        routes: Option<Arc<Tap>>,
     ) -> io::Result<(Sink, std::thread::JoinHandle<()>)> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
@@ -115,7 +133,7 @@ impl Sink {
         let r = room.clone();
         let handle = std::thread::Builder::new()
             .name("vexor-log".into())
-            .spawn(move || writer(rx, file, &d, reporter, &r, capacity))?;
+            .spawn(move || writer(rx, file, &d, reporter, &r, capacity, routes.as_deref()))?;
         Ok((
             Sink {
                 tx,
@@ -130,7 +148,13 @@ impl Sink {
     }
 
     /// Copy a pipe into this sink until EOF.
-    pub async fn pump(self, mut from: impl AsyncRead + Unpin) {
+    pub async fn pump(self, from: impl AsyncRead + Unpin) {
+        let pipe = NEXT_PIPE.fetch_add(1, Ordering::Relaxed);
+        self.copy(pipe, from).await;
+        let _ = self.tx.send(Queued::Closed(pipe));
+    }
+
+    async fn copy(&self, pipe: u32, mut from: impl AsyncRead + Unpin) {
         // Per pipe: whether the next byte starts a line.
         let mut at_line_start = true;
         loop {
@@ -160,7 +184,7 @@ impl Sink {
                     Err(tokio::sync::TryAcquireError::Closed) => return,
                 },
             }
-            if self.tx.send(buf).is_err() {
+            if self.tx.send(Queued::Output { pipe, data: buf }).is_err() {
                 return;
             }
         }
@@ -252,15 +276,27 @@ impl Reporter {
 }
 
 fn writer(
-    mut rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    mut rx: mpsc::UnboundedReceiver<Queued>,
     mut file: LogFile,
     dropped: &AtomicU64,
     mut reporter: Reporter,
     room: &Semaphore,
     capacity: u32,
+    routes: Option<&Tap>,
 ) {
     let mut unreported = 0;
-    while let Some(chunk) = rx.blocking_recv() {
+    let mut partials: HashMap<u32, Partial> = HashMap::new();
+    while let Some(queued) = rx.blocking_recv() {
+        let (pipe, chunk) = match queued {
+            Queued::Output { pipe, data } => (pipe, data),
+            Queued::Closed(pipe) => {
+                partials.remove(&pipe);
+                if let Some(tap) = routes {
+                    tap.closed(pipe);
+                }
+                continue;
+            }
+        };
         let lost = dropped.swap(0, Ordering::Relaxed);
         if lost > 0 {
             let marker = format!(
@@ -277,6 +313,9 @@ fn writer(
             }
         }
         room.add_permits(permits(chunk.len(), capacity) as usize);
+        if let Some(tap) = routes {
+            tap.feed(pipe, partials.entry(pipe).or_default(), &chunk);
+        }
     }
     // Senders gone: account for anything dropped since the last chunk.
     let lost = dropped.swap(0, Ordering::Relaxed);
@@ -492,7 +531,7 @@ mod tests {
             max_size_bytes: 0,
             ..spec
         };
-        let logs = Logs::start("t", &spec, &events).expect("start");
+        let logs = Logs::start("t", &spec, &events, None).expect("start");
         let input = vec![b'x'; CHUNK * 20];
         logs.out.clone().pump(&input[..]).await;
         // Now drain the FIFO.
@@ -564,7 +603,7 @@ mod tests {
             ..LogSpec::new(fifo.clone(), fifo.clone())
         };
         let events = Output::new(false);
-        let logs = Logs::start("t", &spec, &events).expect("start");
+        let logs = Logs::start("t", &spec, &events, None).expect("start");
         logs.out.clone().pump(Lines(2_000)).await;
         let reader = std::thread::spawn(move || std::fs::read(&fifo).expect("read fifo"));
         logs.finish(Duration::from_secs(5)).await;
@@ -591,7 +630,7 @@ mod tests {
             ..LogSpec::new(path.clone(), path.clone())
         };
         let events = Output::new(false);
-        let logs = Logs::start("t", &spec, &events).expect("start");
+        let logs = Logs::start("t", &spec, &events, None).expect("start");
         let input: Vec<u8> = (0..200_000u32)
             .flat_map(|i| format!("{i}\n").into_bytes())
             .collect();

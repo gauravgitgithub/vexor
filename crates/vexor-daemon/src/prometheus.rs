@@ -55,6 +55,8 @@ pub struct AppView {
     pub running: bool,
     pub snapshot: Vec<Value>,
     pub metrics: Vec<InstanceMetrics>,
+    /// (method, route, requests, 5xx responses), from JSON request logs.
+    pub routes: Vec<(String, String, u64, u64)>,
 }
 
 /// A label value, escaped as the exposition format requires.
@@ -211,6 +213,33 @@ pub fn render(apps: &[AppView], open_alerts: &[(String, String, String)], now_ms
         );
     }
 
+    type Route = (String, String, u64, u64);
+    #[allow(clippy::cast_precision_loss)]
+    let counter = |f: &mut Family<'_>, name: &str, help: &str, value: fn(&Route) -> u64| {
+        f.header(name, "counter", help);
+        for a in apps {
+            for t in &a.routes {
+                f.sample(
+                    name,
+                    &[("app", &a.name), ("method", &t.0), ("route", &t.1)],
+                    value(t) as f64,
+                );
+            }
+        }
+    };
+    counter(
+        &mut f,
+        "vexor_route_requests_total",
+        "Requests per route, read from the app's JSON request logs.",
+        |t| t.2,
+    );
+    counter(
+        &mut f,
+        "vexor_route_server_errors_total",
+        "Responses with a 5xx status per route, from JSON request logs.",
+        |t| t.3,
+    );
+
     f.header(
         "vexor_alerts_open",
         "gauge",
@@ -259,6 +288,7 @@ mod tests {
                 open_fds: Some(7),
                 health: None,
             }],
+            routes: vec![("GET".into(), "/users/:id".into(), 40, 3)],
         }];
         let alerts = [
             ("web".to_owned(), "memory".to_owned(), "warning".to_owned()),
@@ -275,6 +305,8 @@ mod tests {
             r#"vexor_instance_memory_bytes{app="we\"b",instance="0"} 1024"#,
             r#"vexor_instance_open_files{app="we\"b",instance="0"} 7"#,
             r#"vexor_alerts_open{rule="memory",level="warning"} 2"#,
+            r#"vexor_route_requests_total{app="we\"b",method="GET",route="/users/:id"} 40"#,
+            r#"vexor_route_server_errors_total{app="we\"b",method="GET",route="/users/:id"} 3"#,
             "# TYPE vexor_instance_restarts_total counter",
         ] {
             assert!(text.lines().any(|l| l == line), "missing {line}\n{text}");

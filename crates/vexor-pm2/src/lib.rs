@@ -284,6 +284,7 @@ const HANDLED: &[&str] = &[
     "max_memory_restart",
     "cron_restart",
     "health_check",
+    "routes",
     "time",
     "log_date_format",
 ];
@@ -586,6 +587,7 @@ pub fn translate(app: &Value, ctx: &Context) -> Result<Translated, Vec<Note>> {
         &mut policy,
         &mut c,
     );
+    let routes = routes_spec(obj.get("routes"), &mut c);
     let wait_ready = obj.get("wait_ready").and_then(Value::as_bool) == Some(true);
     let listen_timeout = duration_ms(obj.get("listen_timeout"), "listen_timeout", &mut c);
     let shutdown_with_message =
@@ -715,6 +717,7 @@ pub fn translate(app: &Value, ctx: &Context) -> Result<Translated, Vec<Note>> {
         shutdown_with_message: shutdown_with_message && node_ipc,
         user: id_field(obj.get("uid").or_else(|| obj.get("username"))),
         group: id_field(obj.get("gid")),
+        routes,
     };
     let autostart = obj
         .get("autostart")
@@ -889,6 +892,33 @@ fn health_check_spec(
     policy.health_unhealthy_after = Some(unhealthy_after);
     policy.health_restart_after = Some(restart_after);
     Some(spec)
+}
+
+/// Vexor's `routes` extension (docs/routes.md): `false` turns per-route
+/// stats off; an object maps request fields.
+fn routes_spec(v: Option<&Value>, c: &mut Ctx) -> Option<vexor_core::RouteSpec> {
+    match v {
+        None | Some(Value::Null | Value::Bool(true)) => None,
+        Some(Value::Bool(false)) => Some(vexor_core::RouteSpec {
+            enabled: false,
+            ..vexor_core::RouteSpec::default()
+        }),
+        Some(o @ Value::Object(_)) => match serde_json::from_value(o.clone()) {
+            Ok(spec) => Some(spec),
+            Err(e) => {
+                c.note("routes", Severity::Fatal, e.to_string());
+                None
+            }
+        },
+        Some(_) => {
+            c.note(
+                "routes",
+                Severity::Fatal,
+                "expected false or an object such as { route: \"req.url\" }",
+            );
+            None
+        }
+    }
 }
 
 /// PM2 `watch` / `ignore_watch` / `watch_delay` (docs/compatibility.md).

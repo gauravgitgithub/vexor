@@ -80,6 +80,10 @@ pub struct AppSpec {
     /// the user's primary group.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
+    /// Per-route request stats from the app's JSON request logs (pino,
+    /// winston, morgan JSON, ...). Absent: on, with the usual field names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routes: Option<RouteSpec>,
 }
 
 impl AppSpec {
@@ -183,6 +187,70 @@ fn default_health_interval() -> u64 {
 
 fn default_health_timeout() -> u64 {
     2_000
+}
+
+/// Where request fields are in a JSON log line: dotted paths (`req.url`).
+/// A field left out is looked up under its usual names (docs/routes.md).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouteSpec {
+    #[serde(default = "yes")]
+    pub enabled: bool,
+    /// Route template (`/users/:id`) or URL; URLs are normalized.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration: Option<String>,
+    /// Unit of `duration` values.
+    #[serde(default)]
+    pub duration_unit: DurationUnit,
+    /// Distinct routes tracked; requests to others count as `(other)`.
+    #[serde(default = "default_max_routes")]
+    pub max_routes: u32,
+}
+
+impl Default for RouteSpec {
+    fn default() -> RouteSpec {
+        RouteSpec {
+            enabled: true,
+            route: None,
+            method: None,
+            status: None,
+            duration: None,
+            duration_unit: DurationUnit::default(),
+            max_routes: default_max_routes(),
+        }
+    }
+}
+
+fn default_max_routes() -> u32 {
+    100
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DurationUnit {
+    Ns,
+    Us,
+    #[default]
+    Ms,
+    S,
+}
+
+impl DurationUnit {
+    /// Milliseconds in one unit.
+    pub fn ms(self) -> f64 {
+        match self {
+            DurationUnit::Ns => 1e-6,
+            DurationUnit::Us => 1e-3,
+            DurationUnit::Ms => 1.0,
+            DurationUnit::S => 1e3,
+        }
+    }
 }
 
 /// What `watch` watches.

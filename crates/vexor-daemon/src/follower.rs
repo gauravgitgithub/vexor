@@ -15,7 +15,7 @@ use tokio::io::BufReader;
 use tokio::net::UnixStream;
 use tokio::sync::{mpsc, watch};
 use vexor_proto::{
-    Desired, FromShim, InstanceMetrics, MIN_SHIM_PROTOCOL, Resume, SHIM_PROTOCOL, ToShim,
+    Desired, FromShim, InstanceMetrics, LogLines, MIN_SHIM_PROTOCOL, Resume, SHIM_PROTOCOL, ToShim,
 };
 use vexor_shim::{Identity, Paths};
 
@@ -43,7 +43,15 @@ struct LiveInner {
     metrics: Vec<InstanceMetrics>,
     /// Protocol agreed with the connected shim.
     protocol: u32,
+    /// Lines the connected shim has read for route stats.
+    lines: LogLines,
+    /// Requests and 5xx responses per (method, route) since the daemon
+    /// started, for Prometheus counters.
+    route_totals: BTreeMap<(String, String), (u64, u64)>,
 }
+
+/// Routes counted per app for Prometheus; others add to `(other)`.
+const MAX_ROUTE_TOTALS: usize = 1_000;
 
 impl Live {
     pub fn shim_pid(&self) -> Option<u32> {
@@ -58,6 +66,37 @@ impl Live {
         self.lock().metrics.clone()
     }
 
+    /// Lines read for route stats, when the connected shim reads them.
+    pub fn log_lines(&self) -> Option<LogLines> {
+        let l = self.lock();
+        (l.shim_pid.is_some() && l.protocol >= 4).then_some(l.lines)
+    }
+
+    /// Requests and 5xx responses per (method, route).
+    pub fn route_totals(&self) -> Vec<(String, String, u64, u64)> {
+        self.lock()
+            .route_totals
+            .iter()
+            .map(|((m, r), (n, e))| (m.clone(), r.clone(), *n, *e))
+            .collect()
+    }
+
+    fn route_window(&self, w: &vexor_proto::RouteWindow) {
+        let mut l = self.lock();
+        l.lines.lines += w.lines;
+        l.lines.json_lines += w.json_lines;
+        for r in &w.routes {
+            l.lines.requests += r.count;
+            let mut key = (r.method.clone(), r.route.clone());
+            if !l.route_totals.contains_key(&key) && l.route_totals.len() >= MAX_ROUTE_TOTALS {
+                key.1 = "(other)".to_owned();
+            }
+            let t = l.route_totals.entry(key).or_default();
+            t.0 += r.count;
+            t.1 += r.server_errors;
+        }
+    }
+
     /// Protocol of the connected shim (0 when none is connected).
     pub fn protocol(&self) -> u32 {
         let l = self.lock();
@@ -69,6 +108,7 @@ impl Live {
         l.shim_pid = Some(pid);
         l.protocol = protocol;
         l.metrics.clear();
+        l.lines = LogLines::default();
         l.snapshot = snapshot
             .into_iter()
             .filter_map(|s| Some((s["instance"].as_u64()?, s)))
@@ -436,6 +476,10 @@ impl Follower {
             FromShim::Metrics { samples } => {
                 self.events.record_metrics(&self.name, samples.clone());
                 self.live.metrics_sample(samples);
+            }
+            FromShim::Routes { window } => {
+                self.live.route_window(&window);
+                self.events.record_routes(&self.name, window);
             }
             FromShim::Refused { reason } => {
                 self.log.write(json!({

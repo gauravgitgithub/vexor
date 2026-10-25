@@ -654,6 +654,36 @@ fn health_check_translates() {
 }
 
 #[test]
+fn routes_translate() {
+    let dir = tempfile::tempdir().expect("dir");
+    let tr = |v: serde_json::Value| translate(&v, &ctx(dir.path())).expect("translates");
+    let t = tr(json!({"name": "a", "script": "/bin/sh"}));
+    assert!(t.spec.routes.is_none());
+    let t = tr(json!({"name": "a", "script": "/bin/sh", "routes": false}));
+    assert!(!t.spec.routes.expect("routes").enabled);
+    let t = tr(json!({
+        "name": "a", "script": "/bin/sh",
+        "routes": { "route": "http.path", "duration": "took", "duration_unit": "s" }
+    }));
+    assert!(fatal(&t.notes).is_empty(), "{:?}", t.notes);
+    let r = t.spec.routes.expect("routes");
+    assert_eq!(
+        (r.route.as_deref(), r.status.as_deref()),
+        (Some("http.path"), None)
+    );
+    assert_eq!((r.enabled, r.max_routes), (true, 100));
+    assert_eq!(r.duration_unit, vexor_core::DurationUnit::S);
+    for bad in [
+        json!({ "path": "x" }),
+        json!({ "duration_unit": "h" }),
+        json!("req.url"),
+    ] {
+        let t = tr(json!({"name": "a", "script": "/bin/sh", "routes": bad}));
+        assert_eq!(fatal(&t.notes), ["routes"], "{bad}");
+    }
+}
+
+#[test]
 fn time_setting_controls_log_timestamps() {
     let dir = tempfile::tempdir().expect("dir");
     let tr = |v: serde_json::Value| translate(&v, &ctx(dir.path())).expect("translates");

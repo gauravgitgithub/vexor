@@ -761,6 +761,88 @@ fn wait_metrics(home: &Home, ok: impl Fn(&Value) -> bool) -> Value {
     }
 }
 
+/// Plan step 6b.5: request lines in an app's JSON logs become per-route
+/// stats; an app with plain-text logs is reported as having none.
+#[test]
+fn routes_come_from_json_request_logs() {
+    let mut home = Home::new();
+    // pino-http shape: every fourth request fails with a 500.
+    let json_app = r#"i=0; while :; do
+        s=200; [ $((i % 4)) -eq 0 ] && s=500
+        printf '{"level":30,"req":{"method":"GET","url":"/users/%d?x=1"},"res":{"statusCode":%d},"responseTime":%d}\n' $i $s 12
+        printf '{"level":30,"msg":"tick"}\n'
+        i=$((i+1)); sleep 0.02
+    done"#;
+    home.add_app(
+        "web",
+        "/bin/sh",
+        &["-c", json_app],
+        json!({ "policy": { "metrics_interval_ms": 200 } }),
+    );
+    home.add_app(
+        "plain",
+        "/bin/sh",
+        &["-c", "while :; do echo hello; sleep 0.05; done"],
+        json!({ "policy": { "metrics_interval_ms": 200 } }),
+    );
+    home.start_daemon();
+
+    let deadline = Instant::now() + TIMEOUT;
+    let route = loop {
+        let out = home.cli(&["routes", "web", "--since", "5m", "--json"]);
+        let v: Value = serde_json::from_slice(&out.stdout).expect("json");
+        let found = v["routes"]
+            .as_array()
+            .and_then(|r| r.iter().find(|r| r["route"] == "/users/:id").cloned());
+        if let Some(r) = found.filter(|r| r["count"].as_u64() >= Some(8)) {
+            assert!(
+                v["logs"]["json_lines"].as_u64() > v["logs"]["requests"].as_u64(),
+                "{v}"
+            );
+            assert_eq!(v["resolution_ms"], 60_000, "{v}");
+            break r;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "routes: {v}\n{}",
+            home.diagnostics("web")
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    assert_eq!(route["method"], "GET");
+    let (count, errors) = (
+        route["count"].as_u64().expect("n"),
+        route["server_errors"].as_u64().expect("e"),
+    );
+    assert!(
+        errors * 4 >= count - 4 && errors * 4 <= count + 4,
+        "{route}"
+    );
+    let p95 = route["p95_ms"].as_f64().expect("p95");
+    assert!((p95 - 12.0).abs() < 1.5, "{route}");
+
+    let out = home.cli(&["routes", "web", "--since", "5m"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("/users/:id") && text.contains("12ms"),
+        "{text}"
+    );
+
+    // Plain text: counted, never guessed at.
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let out = home.cli(&["routes", "plain"]);
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        if text.contains("aren't JSON") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "{text}");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let out = home.cli(&["routes", "nope"]);
+    assert!(!out.status.success());
+}
+
 /// Plan step 6b.1: the shim samples each instance, the daemon serves the
 /// latest sample, and after a crash the sample is the new process's.
 #[test]
@@ -879,8 +961,11 @@ fn daemon_falls_back_to_protocol_1_for_an_older_shim() {
     home.start_daemon();
     home.wait_count("shim_connected", 1);
     // Steps down one version at a time until the shim accepts.
-    assert_eq!(*seen.lock().expect("lock"), [json!(3), json!(2), json!(1)]);
-    assert_eq!(home.count("shim_refused"), 2);
+    assert_eq!(
+        *seen.lock().expect("lock"),
+        [json!(4), json!(3), json!(2), json!(1)]
+    );
+    assert_eq!(home.count("shim_refused"), 3);
     let out = home.cli(&["list", "--json"]);
     let apps: Vec<Value> = serde_json::from_slice(&out.stdout).expect("json");
     assert_eq!(apps[0]["snapshot"][0]["state"], "online", "{apps:?}");
@@ -893,6 +978,12 @@ fn daemon_falls_back_to_protocol_1_for_an_older_shim() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
+
+    // Route stats need protocol 4: said so instead of "no data".
+    let out = home.cli(&["routes", "old"]);
+    assert!(out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("predates route stats"), "{err}");
 
     home.kill_daemon();
     let _ = stand_in.kill();

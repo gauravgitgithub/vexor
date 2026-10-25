@@ -148,3 +148,23 @@ jobs:
             (cd "$d" && npm publish --provenance --access public)
           done
           (cd stage/vexord && npm publish --provenance --access public)
+
+  # The published packages as users install them: npm, pnpm and Yarn (1,
+  # and 4 with PnP and node_modules), in a project and globally, on every
+  # supported platform, including real Intel macOS.
+  verify:
+    needs: npm
+    if: ${{ !cancelled() && needs.npm.result == 'success' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      - name: Install with every package manager and run
+        run: npm/scripts/check-package-managers.sh "${GITHUB_REF_NAME#v}"

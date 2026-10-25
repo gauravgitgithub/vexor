@@ -3,6 +3,17 @@
 All notable changes to Vexor. Versions follow [Semantic Versioning](https://semver.org/);
 before 1.0, minor versions may include breaking changes, which are listed here.
 
+## Unreleased
+
+### Changed
+- Every release is installed and run with npm, pnpm and Yarn (1, and 4
+  with Plug'n'Play and `node_modules`), in a project and globally, on Linux
+  x64 and arm64, macOS arm64 and macOS x64 on Intel hardware
+  (`npm/scripts/check-package-managers.sh`). CI also runs the whole test
+  suite on an Intel Mac.
+- Two migration tests no longer fail on a heavily loaded Mac, where a
+  just-started process can wait seconds before it runs.
+
 ## 0.12.0 (2026-10-25, prerelease)
 
 ### Added

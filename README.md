@@ -77,6 +77,8 @@ upgraded.
 
 ```sh
 npm install -g vexord          # installs the `vexor` command
+pnpm add -g vexord             # or pnpm
+yarn global add vexord         # or Yarn 1; Yarn 4: yarn add vexord (PnP works)
 ```
 
 Without npm or Node.js (verifies the SHA-256 checksum before installing):
@@ -86,7 +88,12 @@ curl -fsSL https://raw.githubusercontent.com/gauravgitgithub/vexor/main/install.
 ```
 
 Prebuilt for Linux x64 and arm64 (static, any distribution) and macOS arm64
-and x64. No install scripts run during `npm install`.
+and x64. No install scripts run during install. Every release is installed
+with npm, pnpm and Yarn (1, and 4 with Plug'n'Play and `node_modules`) on
+each of those platforms, macOS x64 on Intel hardware, before it is called
+done. With Yarn 1, `yarn run vexor` drops a `--` from the arguments (Yarn's
+behaviour); use `node_modules/.bin/vexor` or `npx vexor` when an app takes
+arguments after `--`.
 
 ## Quick start
 

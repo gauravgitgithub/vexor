@@ -1291,16 +1291,17 @@ fn migrate_apply_moves_running_apps_and_resumes_idempotently() {
 fn migrate_apply_puts_an_unhealthy_app_back_under_pm2() {
     let env = Env::new();
     env.script("loop.sh", "#!/bin/sh\necho crashing >&2\nexit 3\n");
-    // The health window is min_uptime (at least 1 s). On a loaded machine
-    // the report of an instant crash can take longer than 1 s, so give this
-    // app a window that clearly covers it.
+    // The health window is min_uptime (at least 1 s). Longer than
+    // --timeout, so `web` can never pass as healthy: on a loaded macOS
+    // machine an exec'd process can sit at _dyld_start for seconds before
+    // it runs (and crashes), and would otherwise be seen online throughout.
     let pm2_home = env.work.path().join("pm2home");
     std::fs::create_dir_all(&pm2_home).expect("mkdir");
     let dump = pm2_dump(&env);
     let mut d: Value =
         serde_json::from_str(&std::fs::read_to_string(&dump).expect("read")).expect("json");
     for e in d.as_array_mut().expect("array") {
-        e["min_uptime"] = 3000.into();
+        e["min_uptime"] = 15_000.into();
     }
     std::fs::write(pm2_home.join("dump.pm2"), d.to_string()).expect("write");
     env.ok(&[
@@ -1574,7 +1575,11 @@ fn migrate_apply_continues_past_an_app_already_failing_under_pm2() {
     for e in d.as_array_mut().expect("array") {
         if e["name"] == "web" {
             e["status"] = "waiting restart".into();
-            e["min_uptime"] = 3000.into();
+            // Longer than --timeout: `web` can't pass as healthy even when
+            // it sits at _dyld_start for seconds on a loaded macOS machine
+            // and is seen online, not crashing (1 run in 10 with the suite
+            // in parallel; every run with two suites at once).
+            e["min_uptime"] = 15_000.into();
         }
     }
     std::fs::write(pm2_home.join("dump.pm2"), d.to_string()).expect("write");
@@ -1593,8 +1598,15 @@ fn migrate_apply_continues_past_an_app_already_failing_under_pm2() {
         "--pm2",
         pm2.to_str().expect("utf-8"),
     ]);
-    assert_eq!(out.status.code(), Some(4));
     let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(4),
+        "{stdout}\n{}\nEVENTS {}\nLIST {}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&env.run(&["events", "--json"]).stdout),
+        String::from_utf8_lossy(&env.run(&["list", "--json"]).stdout)
+    );
     assert!(
         stdout.contains("idle: added to Vexor (stopped)"),
         "{stdout}"

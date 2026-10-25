@@ -355,6 +355,9 @@ pub enum Response {
         routes: Vec<RouteSummary>,
         /// Ordered by route, then time.
         points: Vec<RoutePoint>,
+        /// All routes together per bucket (`route` is 0).
+        #[serde(default)]
+        totals: Vec<RoutePoint>,
         /// From the connected shim; absent when none is connected or it
         /// predates route stats.
         #[serde(default, skip_serializing_if = "Option::is_none")]

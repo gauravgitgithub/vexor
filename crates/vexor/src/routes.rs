@@ -23,7 +23,7 @@ pub fn ms(v: f64) -> String {
     }
 }
 
-fn pct(part: u64, total: u64) -> String {
+pub fn pct(part: u64, total: u64) -> String {
     if part == 0 {
         return "0".to_owned();
     }

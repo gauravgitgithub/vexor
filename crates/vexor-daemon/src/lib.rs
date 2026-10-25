@@ -953,10 +953,11 @@ impl Daemon {
                     tokio::task::spawn_blocking(move || events.routes(&app, since_ms, until_ms))
                         .await;
                 match result {
-                    Ok(Ok((resolution_ms, routes, points))) => Response::Routes {
+                    Ok(Ok((resolution_ms, routes, points, totals))) => Response::Routes {
                         resolution_ms: u64::try_from(resolution_ms).unwrap_or(0),
                         routes,
                         points,
+                        totals,
                         logs: live.log_lines(),
                         warnings,
                     },

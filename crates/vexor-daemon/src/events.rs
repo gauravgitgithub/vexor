@@ -221,14 +221,16 @@ impl Events {
 
     /// Per-route stats of `app` between `since_ms` and `until_ms`, in
     /// per-minute buckets, or per-hour ones for long or old ranges: a
-    /// summary per route (busiest first) and a series for the busiest
-    /// [`ROUTE_SERIES`]. Returns the bucket width in ms.
+    /// summary per route (busiest first), a series for the busiest
+    /// [`ROUTE_SERIES`], and one for all routes together (`route` 0).
+    /// Returns the bucket width in ms first.
+    #[allow(clippy::type_complexity)]
     pub fn routes(
         &self,
         app: &str,
         since_ms: u64,
         until_ms: u64,
-    ) -> Result<(i64, Vec<RouteSummary>, Vec<RoutePoint>), String> {
+    ) -> Result<(i64, Vec<RouteSummary>, Vec<RoutePoint>, Vec<RoutePoint>), String> {
         let conn = self.reader().map_err(|e| format!("route history: {e}"))?;
         let since = i64::try_from(since_ms / 1000).unwrap_or(i64::MAX);
         let until = i64::try_from(until_ms / 1000).unwrap_or(i64::MAX);
@@ -327,6 +329,25 @@ impl Events {
                 .cmp(&a.summary.count)
                 .then_with(|| a.summary.route.cmp(&b.summary.route))
         });
+        // All routes per bucket: (requests, 5xx, durations).
+        let mut all: std::collections::BTreeMap<i64, (u64, u64, Vec<(u16, u64)>)> =
+            std::collections::BTreeMap::new();
+        for b in routes.iter().flat_map(|r| &r.buckets) {
+            let t = all.entry(b.ts_s).or_default();
+            t.0 += b.n;
+            t.1 += b.server_errors;
+            hist::merge(&mut t.2, &b.hist);
+        }
+        let totals = all
+            .into_iter()
+            .map(|(ts_s, (count, server_errors, h))| RoutePoint {
+                route: 0,
+                ts_ms: u(ts_s) * 1000,
+                count,
+                server_errors,
+                p95_ms: round1(hist::quantile(&h, 0.95).unwrap_or(0.0)),
+            })
+            .collect();
         let mut summaries = Vec::with_capacity(routes.len());
         let mut points = Vec::new();
         for (i, mut r) in routes.into_iter().enumerate() {
@@ -350,7 +371,7 @@ impl Events {
             }
             summaries.push(r.summary);
         }
-        Ok((width * 1000, summaries, points))
+        Ok((width * 1000, summaries, points, totals))
     }
 
     /// Resource history of `app` between `since_ms` and `until_ms`: raw
@@ -1410,12 +1431,13 @@ mod tests {
         }
     }
 
+    #[allow(clippy::type_complexity)]
     fn wait_routes(
         ev: &Events,
         since: u64,
         until: u64,
         total: u64,
-    ) -> (i64, Vec<RouteSummary>, Vec<RoutePoint>) {
+    ) -> (i64, Vec<RouteSummary>, Vec<RoutePoint>, Vec<RoutePoint>) {
         for _ in 0..600 {
             let got = ev.routes("web", since, until).expect("routes");
             if got.1.iter().map(|r| r.count).sum::<u64>() >= total {
@@ -1441,7 +1463,7 @@ mod tests {
         ev.record_routes("web", window(minute + 70_000, &[("/a", 10, 0, 10.0)]));
         // A window with no requests stores nothing.
         ev.record_routes("web", window(minute + 30_000, &[]));
-        let (width, routes, points) = wait_routes(&ev, minute, minute + 120_000, 113);
+        let (width, routes, points, totals) = wait_routes(&ev, minute, minute + 120_000, 113);
         assert_eq!(width, 60_000);
         assert_eq!(routes.len(), 2);
         let a = &routes[0];
@@ -1458,6 +1480,10 @@ mod tests {
             (a_points[1].ts_ms, a_points[1].count),
             (minute + 60_000, 10)
         );
+        // All routes together, per minute.
+        assert_eq!(totals.len(), 2);
+        assert_eq!((totals[0].count, totals[0].server_errors), (103, 5));
+        assert_eq!(totals[1].count, 10);
         // Other apps don't leak in.
         assert!(
             ev.routes("api", minute, minute + 120_000)
@@ -1477,7 +1503,7 @@ mod tests {
             names.iter().map(|n| (n.as_str(), 1, 0, 1.0)).collect();
         ev.record_routes("web", window(now, &routes));
         let total = u64::try_from(names.len()).expect("len");
-        let (_, got, points) = wait_routes(&ev, now - 60_000, now + 1_000, total);
+        let (_, got, points, _) = wait_routes(&ev, now - 60_000, now + 1_000, total);
         assert_eq!(got.len(), names.len());
         assert!(got.iter().any(|r| r.route == "(other)"));
         assert!(

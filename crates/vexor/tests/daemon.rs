@@ -828,6 +828,28 @@ fn routes_come_from_json_request_logs() {
         "{text}"
     );
 
+    // Plan step 6b.6: the same history on one axis, with the app's start.
+    let out = home.cli(&["timeline", "web", "--since", "5m", "--color", "never"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    for want in [
+        "CPU",
+        "Memory",
+        "Requests",
+        "5xx",
+        "p95",
+        "Events",
+        "●",
+        "app_added",
+    ] {
+        assert!(text.contains(want), "missing {want}:\n{text}");
+    }
+    let out = home.cli(&["timeline", "web", "--since", "5m", "--json"]);
+    let v: Value = serde_json::from_slice(&out.stdout).expect("json");
+    assert!(
+        v["requests"].as_array().is_some_and(|r| !r.is_empty()),
+        "{v}"
+    );
+
     // Plain text: counted, never guessed at.
     let deadline = Instant::now() + TIMEOUT;
     loop {

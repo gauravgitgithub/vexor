@@ -13,6 +13,7 @@ mod ops;
 mod routes;
 mod spec;
 mod startup;
+mod timeline;
 mod ui;
 
 use std::path::PathBuf;
@@ -184,6 +185,17 @@ enum Command {
         /// Show every route, not only the 20 busiest.
         #[arg(long)]
         all: bool,
+        /// Machine-readable output.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show an app's history on one time axis: CPU, memory, requests, 5xx,
+    /// p95 latency, and crashes, restarts, reloads, health and alerts.
+    Timeline {
+        name: String,
+        /// How far back, e.g. 30m, 6h, 7d.
+        #[arg(long, value_parser = parse_duration, default_value = "1h")]
+        since: std::time::Duration,
         /// Machine-readable output.
         #[arg(long)]
         json: bool,
@@ -573,6 +585,7 @@ fn main() -> ExitCode {
                 json,
             )
         }
+        Command::Timeline { name, since, json } => timeline::run(&home, name, since, json),
         Command::Routes {
             name,
             since,
@@ -594,6 +607,7 @@ fn main() -> ExitCode {
                     points,
                     logs,
                     warnings,
+                    totals,
                 }) => {
                     print_warnings(&warnings);
                     if json {
@@ -601,6 +615,7 @@ fn main() -> ExitCode {
                             "resolution_ms": resolution_ms,
                             "routes": routes,
                             "points": points,
+                            "totals": totals,
                             "logs": logs,
                         });
                         match serde_json::to_string_pretty(&out) {

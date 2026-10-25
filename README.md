@@ -39,7 +39,7 @@ commands several times faster. Each app has its own small supervisor, so your
 apps keep running and stay managed even if the main daemon crashes or is
 upgraded.
 
-> **Status: prerelease (0.11).** Used for evaluation and real migrations;
+> **Status: prerelease (0.12).** Used for evaluation and real migrations;
 > see the [changelog](CHANGELOG.md) and the [known limits](#is-vexor-production-ready).
 
 ## Why Vexor
@@ -99,6 +99,7 @@ vexor reload app                   # new processes first, then retire the old
 vexor describe app                 # configuration, status, recent events
 vexor metrics app --since 6h       # CPU, memory, restarts over time
 vexor routes app                   # requests, errors, p95 per route from JSON logs
+vexor timeline app --since 6h      # CPU, memory, requests, errors, crashes on one axis
 vexor alerts                       # open incidents and alert rules
 vexor signal SIGUSR2 app           # PM2 sendSignal; also flush, kill
 vexor scale app +2                 # PM2 scale: only the difference starts or stops
@@ -245,7 +246,7 @@ OxMgr and forever capabilities are from their documentation and CLI help (OxMgr 
 | Logs | timestamped lines, one merged timeline, built-in rotation (10 MiB × 5 by default), back-pressure control |
 | Reliability | per-app supervisors survive daemon crashes and upgrades; PID identity checks against PID reuse; orphaned descendants cleaned up |
 | PM2 compatibility | ecosystem files (`.js`, `.cjs`, `.mjs`, `.json`), `vexor check` lists every unsupported setting before you start, conformance-tested against PM2 7 |
-| Observability | `monit`, resource history (`metrics`), per-route stats from JSON request logs (`routes`), alerts by email or webhook, Prometheus |
+| Observability | `monit`, one-axis history of an app (`timeline`), resource history (`metrics`), per-route stats from JSON request logs (`routes`), alerts by email or webhook, Prometheus |
 | Operations | `save`/`resurrect`, `startup` for systemd and launchd, `describe`, `events` history, `--json` everywhere |
 
 ## FAQ

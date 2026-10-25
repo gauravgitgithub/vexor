@@ -20,9 +20,12 @@ GET     /search                9702      0     0  158ms  266ms  1.9s   ▃▄▅
   and per-hour buckets for 90 days.
 - `--all` shows every route, not only the 20 busiest.
 - `--json` returns `routes` (one summary per route, busiest first),
+  `totals` (all routes together per bucket),
   `points` (per bucket: requests, 5xx responses and p95 for the 20 busiest
   routes, `route` being an index into `routes`), `resolution_ms`, and
   `logs` (see [No route data](#no-route-data)).
+- `vexor timeline <app>` draws requests, 5xx and p95 of all routes
+  together next to CPU, memory and the app's events.
 - Prometheus: `vexor_route_requests_total` and
   `vexor_route_server_errors_total`, labelled `app`, `method` and `route`
   ([prometheus.md](prometheus.md)).

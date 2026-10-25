@@ -115,10 +115,9 @@ vexor doctor                       # what's wrong with the setup, and how to fix
 vexor startup                      # start at boot (systemd, launchd)
 ```
 
-## Migrate from PM2 in four commands
+## Migrate from PM2 in three commands
 
 ```sh
-pm2 save                           # make PM2's saved list current
 vexor migrate --from-pm2           # dry run: the plan, changes nothing
 vexor migrate --from-pm2 --backup  # back up PM2's state and the plan
 vexor migrate --from-pm2 --apply   # move apps one at a time
@@ -278,8 +277,8 @@ or reported (for example `uid`/`gid` need Vexor running as root, as in PM2). Dif
 
 ### How do I migrate from PM2 to Vexor?
 
-`pm2 save`, then `vexor migrate --from-pm2` (a dry run), `--backup`, and
-`--apply`. Apps move one at a time and any app that isn't healthy under
+`vexor migrate --from-pm2` (a dry run), then `--backup` and `--apply`.
+Vexor reads what PM2 runs now, so no `pm2 save` is needed. Apps move one at a time and any app that isn't healthy under
 Vexor goes back to PM2. `vexor migrate --rollback` undoes the migration.
 
 ### Does Vexor support cluster mode and zero-downtime reloads?

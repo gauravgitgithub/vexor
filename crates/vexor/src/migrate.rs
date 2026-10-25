@@ -1,7 +1,7 @@
 //! `vexor migrate --from-pm2`: plan a move from PM2 to Vexor
-//! (docs/migration.md). The dry run reads PM2's `dump.pm2` and changes
-//! nothing: no PM2 command is run, no Vexor app is added, and the Vexor
-//! daemon is not started.
+//! (docs/migration.md). The dry run reads PM2's live process list (`pm2
+//! jlist`) when PM2's daemon is running, else its `dump.pm2`, and changes
+//! nothing: no Vexor app is added, and the Vexor daemon is not started.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -48,6 +48,8 @@ pub struct AppPlan {
 #[derive(Debug, Serialize)]
 pub struct Report {
     pub dump: PathBuf,
+    /// Read from PM2's daemon (`pm2 jlist`) rather than from `dump`.
+    pub live: bool,
     pub pm2_version: Option<String>,
     /// Seconds since the dump was written.
     pub dump_age_secs: Option<u64>,
@@ -90,28 +92,99 @@ pub(crate) fn current_user() -> Option<String> {
         .ok()
 }
 
+/// Whether PM2's daemon is running for `pm2_home`. Any `pm2` command run
+/// when it isn't would start one.
+pub fn pm2_daemon_running(pm2_home: &Path) -> bool {
+    pm2_home.join("rpc.sock").exists()
+        && std::fs::read_to_string(pm2_home.join("pm2.pid"))
+            .ok()
+            .and_then(|s| s.trim().parse::<i32>().ok())
+            .and_then(rustix::process::Pid::from_raw)
+            .is_some_and(|p| rustix::process::test_kill_process(p).is_ok())
+}
+
+/// `pm2` from PATH, unless given.
+pub fn find_pm2(explicit: Option<PathBuf>) -> Option<PathBuf> {
+    if explicit.is_some() {
+        return explicit;
+    }
+    let path = std::env::var("PATH").unwrap_or_default();
+    std::env::split_paths(&path)
+        .map(|d| d.join("pm2"))
+        .find(|p| p.is_file())
+}
+
+/// PM2's live process list in `dump.pm2`'s format, or None when PM2's
+/// daemon isn't running. `pm2 jlist` gives each process's `pm2_env`, the
+/// object `pm2 save` writes to the dump; PM2 modules are left out, as
+/// `pm2 save` does.
+pub fn live_snapshot(pm2: &Path, pm2_home: &Path) -> Result<Option<Vec<u8>>, String> {
+    if !pm2_daemon_running(pm2_home) {
+        return Ok(None);
+    }
+    let out = Command::new(pm2)
+        .arg("jlist")
+        .env("PM2_HOME", pm2_home)
+        .output()
+        .map_err(|e| format!("cannot run {}: {e}", pm2.display()))?;
+    if !out.status.success() {
+        return Err(format!("`pm2 jlist` failed ({})", out.status));
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    // pm2 may print notices before the JSON.
+    let json = text.find('[').map_or("[]", |i| &text[i..]);
+    let list: Vec<Value> =
+        serde_json::from_str(json).map_err(|e| format!("cannot read `pm2 jlist`: {e}"))?;
+    let procs: Vec<Value> = list
+        .into_iter()
+        .filter_map(|mut p| p.get_mut("pm2_env").map(Value::take))
+        .filter(|e| e.get("pmx_module") != Some(&Value::Bool(true)))
+        .collect();
+    serde_json::to_vec(&procs)
+        .map(Some)
+        .map_err(|e| e.to_string())
+}
+
+/// Build the dry-run report from PM2's live process list (`live_snapshot`).
+pub fn plan_live(snapshot: &[u8], pm2_home: &Path) -> Result<Report, String> {
+    let text =
+        std::str::from_utf8(snapshot).map_err(|e| format!("`pm2 jlist` is not UTF-8: {e}"))?;
+    plan_text(text, &pm2_home.join("dump.pm2"), pm2_home, true)
+}
+
 /// Build the dry-run report from a dump file.
 pub fn plan(dump_path: &Path, pm2_home: &Path) -> Result<Report, String> {
     let text = std::fs::read_to_string(dump_path).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             format!(
-                "no PM2 dump at {}. Run `pm2 save` first so it matches what PM2 is running \
-                 (or pass --pm2-home / --dump)",
+                "PM2 isn't running and there is no PM2 dump at {}. Start PM2 so Vexor can read \
+                 what it runs, or `pm2 save` (or pass --pm2-home / --dump)",
                 dump_path.display()
             )
         } else {
             format!("cannot read {}: {e}", dump_path.display())
         }
     })?;
+    plan_text(&text, dump_path, pm2_home, false)
+}
+
+/// `dump_path` is where the process list came from, or with `live`, PM2's
+/// own dump (checked only for who can read it).
+fn plan_text(text: &str, dump_path: &Path, pm2_home: &Path, live: bool) -> Result<Report, String> {
     let user = current_user();
-    let dump =
-        dump::parse(&text, user.as_deref()).map_err(|e| format!("{}: {e}", dump_path.display()))?;
+    let source = if live {
+        "`pm2 jlist`".to_owned()
+    } else {
+        dump_path.display().to_string()
+    };
+    let dump = dump::parse(text, user.as_deref()).map_err(|e| format!("{source}: {e}"))?;
 
     let mut warnings = Vec::new();
     let mut important = Vec::new();
     let meta = std::fs::metadata(dump_path).ok();
     let dump_age_secs = meta
         .as_ref()
+        .filter(|_| !live)
         .and_then(|m| m.modified().ok())
         .and_then(|t| t.elapsed().ok())
         .map(|d| d.as_secs());
@@ -187,6 +260,7 @@ pub fn plan(dump_path: &Path, pm2_home: &Path) -> Result<Report, String> {
 
     Ok(Report {
         dump: dump_path.to_path_buf(),
+        live,
         pm2_version: dump.pm2_version,
         dump_age_secs,
         processes: dump.processes,
@@ -574,9 +648,13 @@ pub fn print(r: &Report, env_names: bool, verbose: bool) {
                 .as_deref()
                 .map(|v| format!(" · PM2 {v}"))
                 .unwrap_or_default(),
-            r.dump_age_secs
-                .map(|s| format!(" · saved {}", age(s)))
-                .unwrap_or_default()
+            if r.live {
+                " · live from PM2".to_owned()
+            } else {
+                r.dump_age_secs
+                    .map(|s| format!(" · saved {}", age(s)))
+                    .unwrap_or_default()
+            }
         ))
     );
     if r.apps.is_empty() {
@@ -669,8 +747,13 @@ pub fn print(r: &Report, env_names: bool, verbose: bool) {
 /// Everything: commands, paths, environment, every finding (--verbose).
 pub fn print_verbose(r: &Report, env_names: bool) {
     println!(
-        "PM2 dump: {} ({}{} processes, {} apps{})",
-        r.dump.display(),
+        "PM2 {}: {} ({}{} processes, {} apps{})",
+        if r.live { "process list" } else { "dump" },
+        if r.live {
+            "live (`pm2 jlist`)".to_owned()
+        } else {
+            r.dump.display().to_string()
+        },
         r.pm2_version
             .as_deref()
             .map(|v| format!("PM2 {v}, "))
@@ -888,6 +971,10 @@ pub struct Manifest {
     pub vexor_version: String,
     pub pm2_home: PathBuf,
     pub dump: PathBuf,
+    /// The plan was made from PM2's live process list, kept as
+    /// `pm2/live.json`, rather than from `dump`.
+    #[serde(default)]
+    pub live: bool,
     pub files: Vec<BackedUpFile>,
     /// SHA-256 of `plan.json`, the dry-run report saved with the backup.
     pub plan_sha256: String,
@@ -963,6 +1050,7 @@ pub fn backup(
     home: &Path,
     pm2_home: &Path,
     dump: &Path,
+    live: Option<&[u8]>,
     report: &Report,
     now_ms: u64,
 ) -> Result<(PathBuf, Manifest), String> {
@@ -1020,7 +1108,10 @@ pub fn backup(
         for (source, copy) in sources {
             let (data, mode) = match read_regular(&source) {
                 Ok(x) => x,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound && copy != "pm2/dump.pm2" => {
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::NotFound
+                        && (live.is_some() || copy != "pm2/dump.pm2") =>
+                {
                     continue;
                 }
                 Err(e) => return Err(err("cannot read", &source, e)),
@@ -1040,6 +1131,17 @@ pub fn backup(
                 sha256: sha256(&data),
             });
         }
+        if let Some(data) = live {
+            let dest = tmp.join("pm2/live.json");
+            write_private(&dest, data).map_err(|e| err("cannot write", &dest, e))?;
+            files.push(BackedUpFile {
+                source: PathBuf::from("pm2 jlist"),
+                copy: "pm2/live.json".into(),
+                size: data.len() as u64,
+                mode: 0o600,
+                sha256: sha256(data),
+            });
+        }
         let plan = serde_json::to_vec_pretty(report).map_err(|e| e.to_string())?;
         write_private(&tmp.join("plan.json"), &plan)
             .map_err(|e| err("cannot write", &tmp.join("plan.json"), e))?;
@@ -1049,6 +1151,7 @@ pub fn backup(
             vexor_version: env!("CARGO_PKG_VERSION").to_owned(),
             pm2_home: pm2_home.to_path_buf(),
             dump: dump.to_path_buf(),
+            live: live.is_some(),
             files,
             plan_sha256: sha256(&plan),
         };

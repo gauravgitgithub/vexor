@@ -1048,7 +1048,7 @@ fn migrate_blocked_apps_exit_4_and_missing_dump_explains() {
         env.work.path().join("nope").to_str().expect("utf-8"),
     ]);
     assert_eq!(out.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("pm2 save"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("PM2 isn't running"));
 
     // --from-pm2 is required.
     assert_eq!(env.run(&["migrate"]).status.code(), Some(2));
@@ -1164,17 +1164,24 @@ fn migrate_backup_copies_pm2_state_privately_and_never_overwrites() {
 /// stop` fails while `<work>/pm2-fail` exists. It keeps each app's status in
 /// `<work>/pm2-live` (`name status` lines; it starts as `pm2_dump` saved it:
 /// `web` online, `idle` stopped), which `stop` and `start` update and `jlist`
-/// reports.
+/// reports, unless `<work>/pm2-jlist.json` exists: then `jlist` prints that.
+/// Its daemon counts as running for `<work>/pm2home`.
 fn fake_pm2(env: &Env) -> (PathBuf, PathBuf) {
     let log = env.work.path().join("pm2-calls.log");
     let fail = env.work.path().join("pm2-fail");
     let live = env.work.path().join("pm2-live");
+    let jlist = env.work.path().join("pm2-jlist.json");
     std::fs::write(&live, "web online\nidle stopped\n").expect("write pm2-live");
+    let pm2_home = env.work.path().join("pm2home");
+    std::fs::create_dir_all(&pm2_home).expect("mkdir");
+    std::fs::write(pm2_home.join("pm2.pid"), std::process::id().to_string()).expect("pid");
+    std::fs::write(pm2_home.join("rpc.sock"), "").expect("sock");
     let bin = env.script(
         "fake-pm2",
         &format!(
             r#"#!/bin/sh
 set_status() {{ grep -v "^$1 " '{live}' > '{live}.tmp'; echo "$1 $2" >> '{live}.tmp'; mv '{live}.tmp' '{live}'; }}
+if [ "$1" = jlist ] && [ -e '{jlist}' ]; then cat '{jlist}'; exit 0; fi
 if [ "$1" = jlist ]; then
   printf '['; sep=''
   while read -r n st; do printf '%s{{"name":"%s","pm2_env":{{"status":"%s"}}}}' "$sep" "$n" "$st"; sep=,; done < '{live}'
@@ -1189,6 +1196,7 @@ exit 0
             log = log.display(),
             fail = fail.display(),
             live = live.display(),
+            jlist = jlist.display(),
         ),
     );
     (bin, log)
@@ -1374,7 +1382,17 @@ fn migrate_apply_refuses_unsafe_starts() {
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("--backup"));
 
-    env.ok(&["migrate", "--from-pm2", "--backup", "--pm2-home", &ph]);
+    let dump_file = nowhere.join("dump.pm2");
+    let dump_file = dump_file.to_str().expect("utf-8");
+    env.ok(&[
+        "migrate",
+        "--from-pm2",
+        "--backup",
+        "--pm2-home",
+        &ph,
+        "--dump",
+        dump_file,
+    ]);
     // Not a terminal and no --yes.
     let out = apply(&[]);
     assert_eq!(out.status.code(), Some(1));
@@ -1409,13 +1427,12 @@ fn migrate_apply_refuses_unsafe_starts() {
 }
 
 #[test]
-fn migrate_apply_refuses_when_pm2_no_longer_matches_its_saved_list() {
+fn migrate_apply_follows_what_pm2_runs_now() {
     let env = Env::new();
     let pm2_home = pm2_home_with_backup(&env);
     let (pm2, log) = fake_pm2(&env);
-    // `idle` was saved as stopped but has been started under PM2 since:
-    // applying the plan would add it to Vexor stopped and leave it running
-    // under PM2.
+    // `idle` was saved as stopped but has been started under PM2 since: it
+    // is moved like a running app, not added stopped.
     std::fs::write(
         env.work.path().join("pm2-live"),
         "web online\nidle online\n",
@@ -1431,28 +1448,142 @@ fn migrate_apply_refuses_when_pm2_no_longer_matches_its_saved_list() {
         "--pm2",
         pm2.to_str().expect("utf-8"),
     ];
-    let out = env.run(&args);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(out.status.code(), Some(1), "{stderr}");
-    assert!(stderr.contains("out of date"), "{stderr}");
+    let out = env.ok(&args);
     assert!(
-        stderr.contains("idle (saved stopped, now running)"),
-        "{stderr}"
+        out.contains("idle: stop under PM2, start under Vexor (stopped when planned)"),
+        "{out}"
     );
-    assert!(stderr.contains("pm2 save"), "{stderr}");
-    assert!(pm2_calls(&log).is_empty(), "PM2 was touched");
-    assert!(env.list().is_empty(), "Vexor was touched");
+    assert!(
+        out.contains("idle: stopped under PM2, running under Vexor"),
+        "{out}"
+    );
+    assert_eq!(pm2_calls(&log), ["stop web", "stop idle"]);
+    for a in env.list() {
+        assert_eq!(a["desired"], "running", "{a}");
+    }
 
-    // And the other way round: saved as running, gone from PM2.
+    // And the other way round: saved as running, gone from PM2 since.
+    let env = Env::new();
+    let pm2_home = pm2_home_with_backup(&env);
+    let (pm2, log) = fake_pm2(&env);
     std::fs::write(env.work.path().join("pm2-live"), "idle stopped\n").expect("write");
-    let out = env.run(&args);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(out.status.code(), Some(1), "{stderr}");
-    assert!(
-        stderr.contains("web (saved running, now not in PM2)"),
-        "{stderr}"
+    let out = env.ok(&[
+        "migrate",
+        "--from-pm2",
+        "--apply",
+        "--yes",
+        "--pm2-home",
+        pm2_home.to_str().expect("utf-8"),
+        "--pm2",
+        pm2.to_str().expect("utf-8"),
+    ]);
+    assert!(out.contains("web: added to Vexor (stopped)"), "{out}");
+    assert!(pm2_calls(&log).is_empty(), "{:?}", pm2_calls(&log));
+}
+
+#[test]
+fn migrate_plans_from_live_pm2_without_pm2_save() {
+    let env = Env::new();
+    let pm2_home = env.work.path().join("pm2home");
+    std::fs::create_dir_all(&pm2_home).expect("mkdir");
+    let dump = pm2_dump(&env);
+    std::fs::rename(&dump, pm2_home.join("dump.pm2")).expect("move");
+    let (pm2, log) = fake_pm2(&env);
+    // PM2 now runs `idle` too (never saved), and a PM2 module, which isn't
+    // an app to move.
+    let d: Value =
+        serde_json::from_str(&std::fs::read_to_string(pm2_home.join("dump.pm2")).expect("read"))
+            .expect("json");
+    let mut procs: Vec<Value> = d
+        .as_array()
+        .expect("array")
+        .iter()
+        .enumerate()
+        .map(|(i, e)| {
+            let mut e = e.clone();
+            e["status"] = "online".into();
+            e["pm_id"] = i.into();
+            serde_json::json!({ "pid": 1, "name": e["name"], "pm2_env": e })
+        })
+        .collect();
+    procs.push(serde_json::json!({
+        "name": "pm2-logrotate",
+        "pm2_env": { "name": "pm2-logrotate", "pmx_module": true, "status": "online" }
+    }));
+    std::fs::write(
+        env.work.path().join("pm2-jlist.json"),
+        serde_json::to_string(&procs).expect("json"),
+    )
+    .expect("write");
+    let (ph, pm2) = (
+        pm2_home.to_str().expect("utf-8"),
+        pm2.to_str().expect("utf-8"),
     );
-    assert!(pm2_calls(&log).is_empty(), "PM2 was touched");
+
+    let plan: Value = serde_json::from_str(&env.ok(&[
+        "migrate",
+        "--from-pm2",
+        "--json",
+        "--pm2-home",
+        ph,
+        "--pm2",
+        pm2,
+    ]))
+    .expect("json");
+    assert_eq!(plan["live"], true);
+    let names: Vec<&str> = plan["apps"]
+        .as_array()
+        .expect("apps")
+        .iter()
+        .filter_map(|a| a["name"].as_str())
+        .collect();
+    assert_eq!(names, ["web", "idle"]);
+    assert!(
+        plan["apps"]
+            .as_array()
+            .expect("apps")
+            .iter()
+            .all(|a| a["downtime"] == "brief"),
+        "{plan}"
+    );
+    let text = env.ok(&["migrate", "--from-pm2", "--pm2-home", ph, "--pm2", pm2]);
+    assert!(text.contains("live from PM2"), "{text}");
+
+    // The backup keeps the live list; --apply uses it, so later changes
+    // to dump.pm2 (or no `pm2 save` at all) don't matter.
+    env.ok(&[
+        "migrate",
+        "--from-pm2",
+        "--backup",
+        "--pm2-home",
+        ph,
+        "--pm2",
+        pm2,
+    ]);
+    let dir = std::fs::read_dir(env.home.path().join("migrations"))
+        .expect("ls")
+        .map(|e| e.expect("entry").path())
+        .find(|p| p.join("manifest.json").exists())
+        .expect("backup");
+    let manifest: Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("manifest.json")).expect("read"))
+            .expect("json");
+    assert_eq!(manifest["live"], true);
+    assert!(dir.join("pm2/live.json").exists());
+    std::fs::write(pm2_home.join("dump.pm2"), "[]").expect("write");
+    let out = env.ok(&[
+        "migrate",
+        "--from-pm2",
+        "--apply",
+        "--yes",
+        "--pm2-home",
+        ph,
+        "--pm2",
+        pm2,
+    ]);
+    assert!(out.contains("from PM2's process list as of"), "{out}");
+    assert_eq!(pm2_calls(&log), ["stop web", "stop idle"]);
+    assert_eq!(env.list().len(), 2);
 }
 
 #[test]

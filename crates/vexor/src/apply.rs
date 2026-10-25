@@ -163,13 +163,7 @@ pub fn find_backup(home: &Path, id: Option<&str>) -> Result<Backup, String> {
 }
 
 fn find_pm2(explicit: Option<PathBuf>) -> Result<PathBuf, String> {
-    if let Some(p) = explicit {
-        return Ok(p);
-    }
-    let path = std::env::var("PATH").unwrap_or_default();
-    std::env::split_paths(&path)
-        .map(|d| d.join("pm2"))
-        .find(|p| p.is_file())
+    migrate::find_pm2(explicit)
         .ok_or_else(|| "`pm2` is not on PATH; pass --pm2 /path/to/pm2".to_owned())
 }
 
@@ -187,8 +181,12 @@ struct LiveProcess {
 }
 
 impl Pm2 {
-    /// Every PM2 process by app name, from `pm2 jlist`.
+    /// Every PM2 process by app name, from `pm2 jlist`; none when PM2's
+    /// daemon isn't running (asking would start it).
     fn live(&self) -> Result<BTreeMap<String, Vec<LiveProcess>>, String> {
+        if !migrate::pm2_daemon_running(&self.home) {
+            return Ok(BTreeMap::new());
+        }
         let out = Command::new(&self.bin)
             .arg("jlist")
             .env("PM2_HOME", &self.home)
@@ -309,29 +307,6 @@ fn live_running(ps: &[LiveProcess]) -> bool {
     })
 }
 
-/// Apps whose running state under PM2 now differs from the saved dump, as
-/// "name (saved X, now Y)". The plan was made from the dump, so applying it
-/// to such an app would do the wrong thing: one saved as stopped but running
-/// again would be added to Vexor stopped and left running under PM2.
-fn stale_in_dump(
-    apps: &[&migrate::AppPlan],
-    live: &BTreeMap<String, Vec<LiveProcess>>,
-) -> Vec<String> {
-    let word = |running: bool| if running { "running" } else { "stopped" };
-    apps.iter()
-        .filter_map(|a| {
-            let now = live.get(&a.name).is_some_and(|ps| live_running(ps));
-            (now != a.running).then(|| {
-                let shown = match live.get(&a.name) {
-                    None => "not in PM2".to_owned(),
-                    Some(_) => word(now).to_owned(),
-                };
-                format!("{} (saved {}, now {shown})", a.name, word(a.running))
-            })
-        })
-        .collect()
-}
-
 /// Healthy: every instance online with no restart, and the same live
 /// processes, for `settle`. The process check guards against a status that
 /// lags behind a process that already exited.
@@ -405,22 +380,39 @@ fn apply(home: &Path, pm2_home: &Path, dump: &Path, opts: Options) -> Result<u8,
     let backup = find_backup(home, opts.backup_id.as_deref())?;
     let id = backup.manifest.id.clone();
 
-    // Apply exactly what was reviewed: the dump must be unchanged since the
-    // backup, and the backup's plan intact.
-    let (now, _) =
-        migrate::read_regular(dump).map_err(|e| format!("cannot read {}: {e}", dump.display()))?;
-    let saved = backup
-        .manifest
-        .files
-        .iter()
-        .find(|f| f.copy == "pm2/dump.pm2")
-        .ok_or_else(|| format!("backup {id} has no dump.pm2"))?;
-    if migrate::sha256(&now) != saved.sha256 {
-        return Err(format!(
-            "{} changed since backup {id}; run `vexor migrate --from-pm2 --backup` again and review the new plan",
-            dump.display()
-        ));
-    }
+    // Apply exactly what was reviewed: the app definitions it was made from
+    // (PM2's live list kept in the backup, or a dump that must be unchanged
+    // since), and the backup's plan intact.
+    let saved = |copy: &str| {
+        backup
+            .manifest
+            .files
+            .iter()
+            .find(|f| f.copy == copy)
+            .ok_or_else(|| format!("backup {id} has no {copy}"))
+    };
+    let report: Report = if backup.manifest.live {
+        let f = saved("pm2/live.json")?;
+        let (snapshot, _) = migrate::read_regular(&backup.dir.join(&f.copy))
+            .map_err(|e| format!("backup {id}: cannot read {}: {e}", f.copy))?;
+        if migrate::sha256(&snapshot) != f.sha256 {
+            return Err(format!(
+                "backup {id}: {} does not match its manifest",
+                f.copy
+            ));
+        }
+        migrate::plan_live(&snapshot, pm2_home)?
+    } else {
+        let (now, _) = migrate::read_regular(dump)
+            .map_err(|e| format!("cannot read {}: {e}", dump.display()))?;
+        if migrate::sha256(&now) != saved("pm2/dump.pm2")?.sha256 {
+            return Err(format!(
+                "{} changed since backup {id}; run `vexor migrate --from-pm2 --backup` again and review the new plan",
+                dump.display()
+            ));
+        }
+        migrate::plan(dump, pm2_home)?
+    };
     let (plan_bytes, _) = migrate::read_regular(&backup.dir.join("plan.json"))
         .map_err(|e| format!("backup {id}: cannot read plan.json: {e}"))?;
     if migrate::sha256(&plan_bytes) != backup.manifest.plan_sha256 {
@@ -429,7 +421,6 @@ fn apply(home: &Path, pm2_home: &Path, dump: &Path, opts: Options) -> Result<u8,
         ));
     }
 
-    let report: Report = migrate::plan(dump, pm2_home)?;
     for o in &opts.only {
         if !report.apps.iter().any(|a| &a.name == o) {
             return Err(format!("--only {o}: no app with that name in the PM2 dump"));
@@ -468,7 +459,14 @@ fn apply(home: &Path, pm2_home: &Path, dump: &Path, opts: Options) -> Result<u8,
     println!(
         "{} {}",
         crate::ui::bold(&format!("Migration {id}")),
-        crate::ui::dim(&format!("from {}", dump.display()))
+        crate::ui::dim(&if backup.manifest.live {
+            format!(
+                "from PM2's process list as of {}",
+                backup.manifest.created_at
+            )
+        } else {
+            format!("from {}", dump.display())
+        })
     );
     if !already.is_empty() {
         println!("  already migrated: {}", already.join(", "));
@@ -487,39 +485,56 @@ fn apply(home: &Path, pm2_home: &Path, dump: &Path, opts: Options) -> Result<u8,
             crate::code::PARTIAL
         });
     }
-    // The plan says which apps PM2 runs as of `pm2 save`; check that still
-    // holds before changing anything. Apps interrupted mid-move were stopped
-    // under PM2 by us, so they are left out.
+    // Whether PM2 runs an app now decides its move, whatever it did when
+    // the plan was made: one started since is stopped under PM2 and moved,
+    // one stopped since is added to Vexor stopped. An app interrupted after
+    // `pm2 stop` was running.
     let pm2 = Pm2 {
         bin: find_pm2(opts.pm2)?,
         home: pm2_home.to_path_buf(),
     };
     let live = pm2.live()?;
-    let fresh: Vec<&migrate::AppPlan> = todo
+    let mut stopped_by_us: BTreeMap<&str, bool> = BTreeMap::new();
+    for e in &journal_entries {
+        match e.step {
+            Step::Begin => {
+                stopped_by_us.insert(&e.app, false);
+            }
+            Step::Pm2Stopped => {
+                stopped_by_us.insert(&e.app, true);
+            }
+            _ => {}
+        }
+    }
+    let running: BTreeMap<&str, bool> = todo
         .iter()
-        .copied()
-        .filter(|a| {
-            !matches!(
+        .map(|a| {
+            let resumed = matches!(
                 last.get(&a.name),
                 Some(Step::Begin | Step::Pm2Stopped | Step::VexorStarted)
-            )
+            );
+            let now = live.get(&a.name).is_some_and(|ps| live_running(ps))
+                || (resumed && stopped_by_us.get(a.name.as_str()) == Some(&true));
+            (a.name.as_str(), now)
         })
         .collect();
-    let stale = stale_in_dump(&fresh, &live);
-    if !stale.is_empty() {
-        return Err(format!(
-            "PM2's saved process list is out of date: {}. Nothing was changed. \
-             Run `pm2 save`, then `vexor migrate --from-pm2 --backup`, review the new plan and run --apply again",
-            stale.join(", ")
-        ));
-    }
     for a in &todo {
-        let what = match a.downtime {
-            Downtime::Brief => "stop under PM2, start under Vexor",
-            _ => "add to Vexor stopped (not running under PM2)",
+        let run = running[a.name.as_str()];
+        let what = if run {
+            "stop under PM2, start under Vexor"
+        } else {
+            "add to Vexor stopped (not running under PM2)"
+        };
+        let changed = if run == a.running {
+            String::new()
+        } else {
+            crate::ui::dim(&format!(
+                " ({} when planned)",
+                if a.running { "running" } else { "stopped" }
+            ))
         };
         println!(
-            "  {} {}: {what}",
+            "  {} {}: {what}{changed}",
             crate::ui::info_mark(),
             crate::ui::app(&a.name)
         );
@@ -547,6 +562,7 @@ fn apply(home: &Path, pm2_home: &Path, dump: &Path, opts: Options) -> Result<u8,
 
     for a in todo {
         let name = a.name.as_str();
+        let run = running[name];
         let spec = a
             .full_spec
             .clone()
@@ -572,7 +588,7 @@ fn apply(home: &Path, pm2_home: &Path, dump: &Path, opts: Options) -> Result<u8,
         if !resumed {
             journal.write(name, Step::Begin, None)?;
         }
-        if a.running {
+        if run {
             if let Err(e) = pm2.run(&["stop", name]) {
                 // Nothing changed for this app yet.
                 journal.write(name, Step::Failed, Some(e.clone()))?;
@@ -601,13 +617,13 @@ fn apply(home: &Path, pm2_home: &Path, dump: &Path, opts: Options) -> Result<u8,
                 home,
                 &Request::Start {
                     spec: Box::new(spec.clone()),
-                    start: a.running,
+                    start: run,
                 },
             )
         };
         let health = started.and_then(|()| {
             journal.write(name, Step::VexorStarted, None)?;
-            if a.running {
+            if run {
                 wait_healthy(home, &spec, opts.timeout)
             } else {
                 Ok(())
@@ -618,7 +634,7 @@ fn apply(home: &Path, pm2_home: &Path, dump: &Path, opts: Options) -> Result<u8,
                 journal.write(name, Step::Done, None)?;
                 println!(
                     "{} {}",
-                    if a.running {
+                    if run {
                         crate::ui::bold_green("running under Vexor")
                     } else {
                         crate::ui::green("added to Vexor (stopped)")
@@ -637,7 +653,7 @@ fn apply(home: &Path, pm2_home: &Path, dump: &Path, opts: Options) -> Result<u8,
                 // if Vexor never added it (the start was refused), there is
                 // nothing to delete, but PM2 must still start it again.
                 let deleted = vexor_delete(home, name);
-                let restarted = if a.running {
+                let restarted = if run {
                     pm2.run(&["start", name])
                 } else {
                     Ok(())
@@ -680,7 +696,7 @@ fn apply(home: &Path, pm2_home: &Path, dump: &Path, opts: Options) -> Result<u8,
                         eprintln!(
                             "vexor: {name}: removed from Vexor{}; the migration stopped here. \
                              Fix the cause, then run --apply again to continue.",
-                            if a.running {
+                            if run {
                                 " and running under PM2 again"
                             } else {
                                 ""

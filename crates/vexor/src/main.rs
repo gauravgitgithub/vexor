@@ -232,8 +232,8 @@ enum Command {
         #[arg(long)]
         raw: bool,
     },
-    /// Plan a move from PM2: reads the process list PM2 saved (`pm2 save`)
-    /// and shows how each app would run under Vexor, what can't be moved
+    /// Plan a move from PM2: reads what PM2 runs now (`pm2 jlist`), or its
+    /// saved list when PM2 isn't running, and shows how each app would run under Vexor, what can't be moved
     /// yet, and the expected downtime. Changes nothing.
     Migrate {
         /// Migrate from PM2.
@@ -270,7 +270,8 @@ enum Command {
         /// With --apply or --rollback: don't ask for confirmation.
         #[arg(long, short = 'y')]
         yes: bool,
-        /// With --apply or --rollback: the pm2 command [default: pm2 on PATH].
+        /// The pm2 command, to read PM2's live process list and, with --apply
+        /// or --rollback, to stop and start apps [default: pm2 on PATH].
         #[arg(long)]
         pm2: Option<PathBuf>,
         /// With --apply or --rollback: seconds to wait for each app to
@@ -486,10 +487,8 @@ fn main() -> ExitCode {
             verbose,
         } => {
             let moving = apply || rollback.is_some();
-            if !moving && (only.is_some() || yes || pm2.is_some() || timeout.is_some()) {
-                eprintln!(
-                    "vexor: --only, --yes, --pm2 and --timeout go with --apply or --rollback"
-                );
+            if !moving && (only.is_some() || yes || timeout.is_some()) {
+                eprintln!("vexor: --only, --yes and --timeout go with --apply or --rollback");
                 return ExitCode::from(2);
             }
             let only: Vec<String> = only
@@ -530,7 +529,7 @@ fn main() -> ExitCode {
                     },
                 ))
             } else {
-                migrate_cmd(&home, pm2_home, dump, backup, json, env_names, verbose)
+                migrate_cmd(&home, pm2_home, dump, pm2, backup, json, env_names, verbose)
             }
         }
         Command::Monit => monit::run(&home),
@@ -1518,27 +1517,53 @@ fn print_table(apps: &[AppStatus]) {
     println!(" {}", parts.join(&ui::dim(" · ")));
 }
 
+#[allow(clippy::too_many_arguments)]
 fn migrate_cmd(
     home: &std::path::Path,
     pm2_home: Option<PathBuf>,
     dump: Option<PathBuf>,
+    pm2: Option<PathBuf>,
     backup: bool,
     json: bool,
     env_names: bool,
     verbose: bool,
 ) -> ExitCode {
     let pm2_home = pm2_home.unwrap_or_else(migrate::default_pm2_home);
+    // What PM2 runs now, unless a dump file was asked for or PM2 isn't
+    // running; then its saved list.
+    let live = if dump.is_some() {
+        None
+    } else {
+        match migrate::find_pm2(pm2).map(|p| migrate::live_snapshot(&p, &pm2_home)) {
+            Some(Ok(s)) => s,
+            Some(Err(e)) => {
+                eprintln!("vexor: warning: {e}; using PM2's saved list instead");
+                None
+            }
+            None => None,
+        }
+    };
     let dump = dump.unwrap_or_else(|| pm2_home.join("dump.pm2"));
-    let report = match migrate::plan(&dump, &pm2_home) {
+    let planned = match &live {
+        Some(s) => migrate::plan_live(s, &pm2_home),
+        None => migrate::plan(&dump, &pm2_home),
+    };
+    let report = match planned {
         Ok(r) => r,
         Err(e) => return fail(&e),
     };
     if backup {
-        let (dir, manifest) =
-            match migrate::backup(home, &pm2_home, &dump, &report, describe::now_ms()) {
-                Ok(x) => x,
-                Err(e) => return fail(&format!("backup failed, nothing was kept: {e}")),
-            };
+        let (dir, manifest) = match migrate::backup(
+            home,
+            &pm2_home,
+            &dump,
+            live.as_deref(),
+            &report,
+            describe::now_ms(),
+        ) {
+            Ok(x) => x,
+            Err(e) => return fail(&format!("backup failed, nothing was kept: {e}")),
+        };
         if json {
             let out = serde_json::json!({ "backup": dir, "manifest": manifest });
             println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());

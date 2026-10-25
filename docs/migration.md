@@ -2,7 +2,7 @@
 
 ## Sources inspected (read-only)
 
-`$PM2_HOME` (default `~/.pm2`): `dump.pm2` (JSON array, one object per process, env flattened into top-level keys), `pids/`, `logs/`, ecosystem files referenced by the user, systemd/launchd units named `pm2-<user>`. Live state comes from `pm2 jlist` only if the user passes `--use-pm2-cli`. By default the dump file is used, so Vexor never talks to a running PM2 daemon unless asked.
+`$PM2_HOME` (default `~/.pm2`): `dump.pm2` (JSON array, one object per process, env flattened into top-level keys), `pids/`, `logs/`, ecosystem files referenced by the user, systemd/launchd units named `pm2-<user>`. When PM2's daemon is running (`pm2.pid` names a live process and `rpc.sock` exists), the process list comes from `pm2 jlist`: each process's `pm2_env` is the object `pm2 save` writes to the dump, so it is read the same way, and PM2 modules (`pmx_module`) are left out as `pm2 save` does. No `pm2 save` is needed. Otherwise, or with `--dump FILE`, the dump file is used; no `pm2` command is run then, since one would start a PM2 daemon. If `pm2 jlist` fails, the dry run warns and uses the dump.
 
 ## Commands
 
@@ -16,7 +16,7 @@ vexor migrate --status [<id>]
 
 ## Dry-run report (per app)
 
-Implemented (plan 5.1): `vexor migrate --from-pm2 [--dry-run] [--pm2-home DIR] [--dump FILE] [--json]`. It reads `dump.pm2` only: no PM2 command is run, no Vexor app is added, and the Vexor daemon is not started. Exit code 0 when every app can be migrated, 4 when some are blocked, 1 when the dump can't be read (the message says to run `pm2 save`).
+Implemented (plan 5.1): `vexor migrate --from-pm2 [--dry-run] [--pm2-home DIR] [--dump FILE] [--json]`. It reads PM2's live process list, or `dump.pm2` (see above; `--pm2 PATH` names the `pm2` command): no Vexor app is added, and the Vexor daemon is not started. Exit code 0 when every app can be migrated, 4 when some are blocked, 1 when the dump can't be read (the message says to run `pm2 save`).
 
 How the dump is read (checked against dumps written by PM2 7.1.0):
 
@@ -52,7 +52,7 @@ Implemented (plan 5.2): `vexor migrate --from-pm2 --backup [--pm2-home DIR] [--d
 
 Implemented (plan 5.3): `vexor migrate --from-pm2 --apply [--backup-id ID] [--only a,b] [--yes] [--pm2 PATH] [--timeout SECS]`.
 
-1. Pre-flight: the backup (newest, or `--backup-id`) exists; PM2's current `dump.pm2` has the same SHA-256 as the backup's copy (otherwise: back up again and review the new plan); the backup's `plan.json` matches its manifest hash; and PM2 still runs (or doesn't run) each app as the dump says, per `pm2 jlist`: a dump saved before apps were started or stopped would otherwise leave a running app on PM2 while marking it migrated, so the run refuses and asks for `pm2 save` and a new backup (apps interrupted mid-move are exempt). Blocked apps are listed and stay on PM2. The plan is shown and confirmed (`--yes` when not on a terminal). One `--apply` per backup at a time (lock file).
+1. Pre-flight: the backup (newest, or `--backup-id`) exists; the app definitions come from the backup's `pm2/live.json` when the plan was made from live PM2 (its SHA-256 must match the manifest), else PM2's current `dump.pm2` must have the same SHA-256 as the backup's copy (otherwise: back up again and review the new plan); the backup's `plan.json` matches its manifest hash. Whether an app is moved as running or added stopped is decided by what PM2 runs now (`pm2 jlist`), not by what it ran when the plan was made, and the plan shows apps whose state changed since; an app interrupted after `pm2 stop` counts as running. Blocked apps are listed and stay on PM2. The plan is shown and confirmed (`--yes` when not on a terminal). One `--apply` per backup at a time (lock file).
 2. Journal `begin(app)`, after checking Vexor has no app by that name (if it has, PM2 is not touched and the run stops).
 3. Running under PM2: `pm2 stop <app>` (with `PM2_HOME` set). Never `delete`, so PM2 still holds its definition for rollback. A failing `pm2 stop` stops the run; nothing changed for that app.
 4. Start under Vexor with the translated spec (apps PM2 had stopped are added stopped). Healthy = every instance `online`, no restart, and the same live processes for `min_uptime` (at least 1 s, at most 15 s), within `--timeout` (default 30 s) plus `listen_timeout`.

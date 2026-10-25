@@ -44,9 +44,15 @@ project() {
   label=$1; install=$2
   d=$(mktemp -d "$T/p.XXXX")
   echo '{"name":"p","version":"1.0.0","private":true}' >"$d/package.json"
-  if ! (cd "$d" && sh -c "$install") >"$d/install.log" 2>&1; then
-    echo "FAIL  $label: install"; tail -n 5 "$d/install.log"; FAILED=1; return
-  fi
+  # Three tries: right after publishing, a mirror can still miss a package.
+  n=0
+  until (cd "$d" && sh -c "$install") >"$d/install.log" 2>&1; do
+    n=$((n + 1))
+    if [ "$n" -ge 3 ]; then
+      echo "FAIL  $label: install"; tail -n 5 "$d/install.log"; FAILED=1; return
+    fi
+    sleep 20
+  done
   if [ -x "$d/node_modules/.bin/vexor" ]; then
     smoke "$label" "$d/node_modules/.bin/vexor"
   else
@@ -55,10 +61,12 @@ project() {
   fi
 }
 
-# The registry may not have the version yet.
+# The registry may not have the version yet: the launcher, and the binary
+# package for this machine (published separately, seen a little later).
+platform=$(node -p '"vexord-" + process.platform + "-" + process.arch')
 i=0
-until npm view "vexord@$V" version >/dev/null 2>&1; do
-  i=$((i + 1)); [ "$i" -gt 30 ] && { echo "FAIL  vexord@$V is not on the registry"; exit 1; }
+until npm view "vexord@$V" version >/dev/null 2>&1 && npm view "$platform@$V" version >/dev/null 2>&1; do
+  i=$((i + 1)); [ "$i" -gt 30 ] && { echo "FAIL  vexord@$V or $platform@$V is not on the registry"; exit 1; }
   sleep 10
 done
 

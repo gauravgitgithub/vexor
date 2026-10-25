@@ -3,6 +3,17 @@
 All notable changes to Vexor. Versions follow [Semantic Versioning](https://semver.org/);
 before 1.0, minor versions may include breaking changes, which are listed here.
 
+## 0.12.0 (2026-10-25, prerelease)
+
+### Added
+- `vexor timeline <app> [--since 6h] [--json]`: one app's history on one
+  time axis in the terminal: CPU, memory, requests, 5xx, p95 latency,
+  and markers for crashes, alerts, failing health checks, reloads,
+  restarts and starts, followed by the latest notable events. Built from
+  the history Vexor already keeps; no web server.
+- `vexor routes --json` and the `routes` answer carry `totals`: all routes
+  together per bucket.
+
 ## 0.11.0 (2026-10-25, prerelease)
 
 ### Added

@@ -1620,14 +1620,23 @@ mod tests {
             panic!("warnings: {:?}", ev.warnings());
         };
         ev.send(Write::LimitPages(1));
-        for i in 0..50 {
-            ev.record_daemon(None, "filler", json!({ "data": "x".repeat(2000), "i": i }));
+        // Keep writing while full: a small write can still fit in a free
+        // page and clear the warning, as it should, so look while writing.
+        let mut seen = None;
+        for i in 0..3000 {
+            ev.record_daemon(None, "filler", json!({ "data": "x".repeat(4000), "i": i }));
+            if let Some(w) = ev
+                .warnings()
+                .into_iter()
+                .find(|w| w.contains("can't be written"))
+            {
+                seen = Some(w);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
         }
-        let w = wait(&|w| w.iter().any(|w| w.contains("can't be written")));
-        assert!(
-            w.iter().any(|w| w.contains("full") && w.contains("lost")),
-            "{w:?}"
-        );
+        let w = seen.expect("never warned");
+        assert!(w.contains("full") && w.contains("lost"), "{w}");
         ev.send(Write::LimitPages(1_000_000));
         ev.record_daemon(None, "after", json!({}));
         wait(&|w| w.is_empty());

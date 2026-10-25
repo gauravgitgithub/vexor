@@ -101,11 +101,14 @@ CLUSTER_END
 "$VEXOR" shim --spec "$D/cluster.json" > "$D/cl.events" 2>&1 & pid=$!
 # Event fields are in alphabetical order, so count `online` states rather
 # than matching instance and state together.
+# Up to 30 s: an old Node on a cold CI runner can take over 10 s to fork
+# both workers.
+online() { grep -c '"state":"online"' "$D/cl.events" 2>/dev/null || echo 0; }
 i=0
-while [ "$(grep -c '"state":"online"' "$D/cl.events" 2>/dev/null)" -lt 2 ]; do
-  i=$((i + 1)); [ "$i" -gt 100 ] && break; sleep 0.1
+while [ "$(online)" -lt 2 ]; do
+  i=$((i + 1)); [ "$i" -gt 300 ] && break; sleep 0.1
 done
-if [ "$(grep -c '"state":"online"' "$D/cl.events")" -ge 2 ]; then
+if [ "$(online)" -ge 2 ]; then
   kill -TERM "$pid"; wait "$pid"; code=$?
   if [ "$code" = 0 ] && grep -q 'bye 0' "$D/cl.out" && grep -q 'bye 1' "$D/cl.out"; then
     pass "cluster mode"; else fail "cluster mode" "exit=$code out=$(tr '\n' ';' < "$D/cl.out")"; fi

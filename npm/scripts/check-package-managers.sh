@@ -61,12 +61,17 @@ project() {
   fi
 }
 
-# The registry may not have the version yet: the launcher, and the binary
-# package for this machine (published separately, seen a little later).
-platform=$(node -p '"vexord-" + process.platform + "-" + process.arch')
+# The registry may not have the version yet: the launcher and every
+# binary package (published separately, seen a little later). Yarn resolves
+# all four, not only this machine's.
+published() {
+  for p in vexord vexord-linux-x64 vexord-linux-arm64 vexord-darwin-x64 vexord-darwin-arm64; do
+    npm view "$p@$V" version >/dev/null 2>&1 || return 1
+  done
+}
 i=0
-until npm view "vexord@$V" version >/dev/null 2>&1 && npm view "$platform@$V" version >/dev/null 2>&1; do
-  i=$((i + 1)); [ "$i" -gt 30 ] && { echo "FAIL  vexord@$V or $platform@$V is not on the registry"; exit 1; }
+until published; do
+  i=$((i + 1)); [ "$i" -gt 30 ] && { echo "FAIL  vexord@$V and its binary packages are not all on the registry"; exit 1; }
   sleep 10
 done
 

@@ -3,6 +3,21 @@
 All notable changes to Vexor. Versions follow [Semantic Versioning](https://semver.org/);
 before 1.0, minor versions may include breaking changes, which are listed here.
 
+## 0.13.1 (2026-10-25, prerelease)
+
+### Fixed
+- `vexor migrate --apply` trusted the state in PM2's saved list
+  (`dump.pm2`). When apps had been started under PM2 after the last
+  `pm2 save`, it added them to Vexor stopped, left them running under PM2
+  and marked them migrated; running `--apply` again then failed with
+  "Vexor already has an app by this name". `--apply` now compares the dump
+  with `pm2 jlist` before changing anything and, when they differ, names
+  the apps and asks for `pm2 save` and a new backup.
+- An app crash-looping under PM2 could look healthy there at the moment
+  of the check (`online` between restarts); its unstable restarts now
+  count, so it is left on PM2 and the migration carries on with the other
+  apps.
+
 ## 0.13.0 (2026-10-25, prerelease)
 
 ### Added

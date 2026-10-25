@@ -39,7 +39,7 @@ commands several times faster. Each app has its own small supervisor, so your
 apps keep running and stay managed even if the main daemon crashes or is
 upgraded.
 
-> **Status: prerelease (0.12).** Used for evaluation and real migrations;
+> **Status: prerelease (0.13).** Used for evaluation and real migrations;
 > see the [changelog](CHANGELOG.md) and the [known limits](#is-vexor-production-ready).
 
 ## Why Vexor
@@ -218,6 +218,7 @@ Methodology and how to reproduce: [docs/benchmarks.md](docs/benchmarks.md).
 | Cluster mode (shared port across CPU cores) | ✓ | ✓ | ✓ | ✗ |
 | Zero-downtime reload, health-gated | ✓ | ✓ | ✓ | ✗ |
 | Apps keep running and stay managed if the daemon is killed | ✓ ³ | ✗ ³ | ✓ ³ | – |
+| Supervisor upgrades without restarting apps | ✓ (fork mode) | ✗ (`pm2 update` restarts them) | ✗ ⁵ | – |
 | HTTP/TCP health checks | ✓ | ✗ | command checks | ✗ |
 | Restart on memory limit / cron / file change | ✓ / ✓ / ✓ | ✓ / ✓ / ✓ | ✓ / ✓ / ✓ | ✗ / ✗ / ✓ |
 | Built-in log rotation | ✓ | module (pm2-logrotate) | ✓ | ✗ |

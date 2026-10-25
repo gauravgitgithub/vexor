@@ -111,6 +111,12 @@ pub fn print(status: &AppStatus, spec: &AppSpec, events: &[Value], show_env: boo
         if let Some(r) = s["error"]["reason"].as_str() {
             parts.push(format!("error: {r}"));
         }
+        if s["adopted"] == true {
+            parts.push(format!(
+                "adopted after its supervisor died: output not captured until it restarts (vexor restart {})",
+                spec.name
+            ));
+        }
         row(
             &format!("#{}", s["instance"]),
             format!(

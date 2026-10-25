@@ -223,18 +223,36 @@ How it works:
   reconcile. A shim found running is never restarted. A desired app with no live
   shim gets a new one.
 - Daemon upgrade: stop the old daemon, start the new one. Apps aren't touched.
-- Shim upgrade (Phase 6): the shim `execve`s the new binary in place. The PID and
-  child relationships are preserved by exec, and state plus fds are handed over
-  through an inherited fd, so apps aren't restarted. Until that lands, a version
-  skew between shim and daemon is supported for N-1 protocol versions and
-  flagged by `doctor`. Implemented: protocol 2 added metrics, 3 added scaling,
-  4 added per-route stats;
-  shims accept every version from 1, and a daemon refused by an older shim
-  says hello again one version lower until it is accepted.
-- If a shim itself dies (it is small and does little), its children re-parent
-  to the daemon (subreaper), which adopts them identity-checked and starts a
-  replacement shim at the app's next restart. Logs stop for those children
-  until then, and that is reported. This is the R1 path, used only as a fallback.
+- Shim upgrade (implemented in 0.13, fork mode): a daemon that finds an older
+  shim speaking protocol 5 or later sends `upgrade` (once per shim, and never
+  to downgrade). Each instance freezes as soon as nothing is in progress (no
+  reload, stop or retiring process), the log pumps forward what their pipes
+  hold and hand the pipes back, the log writers flush, and the shim `execve`s
+  the new `vexor` with `--handover <file>`. The PID stays, so the apps stay
+  its children (reaped with `waitpid` from then on). Kept open across the exec:
+  each app's stdout/stderr pipe and Node IPC channel, the control socket (the
+  daemon reconnects to the same listener) and the app lock. The handover file
+  (0600, removed when read) holds the descriptor numbers, every instance's
+  process identity and restart count, the instance count, and the event
+  buffer with its sequence numbers, so the daemon's resume cursor stays
+  valid. If the exec fails, the same program resumes from the same handover.
+  Cluster mode isn't handed over (the cluster primary's state lives in the
+  shim); it is skipped with a reason and moves to the new version at its next
+  reload or restart. Shims older than 0.13 (protocol 4 or less) can't do
+  this; they keep working under a newer daemon: protocol 2 added metrics, 3
+  scaling, 4 per-route stats, 5 upgrades; shims accept every version from 1,
+  and a daemon refused by an older shim says hello again one version lower
+  until it is accepted.
+- If a shim itself dies (it is small and does little), its processes keep
+  running. The daemon starts a new shim at once; the shim reads the dead
+  one's `<app>.pids.json` (identities and instance numbers), and adopts each
+  live, identity-checked process as its instance (fork mode): online, health
+  and memory checks as usual, polled for exit since it isn't the new shim's
+  child, restarted when it exits. Its output went to the dead shim, so it
+  isn't captured until it restarts (`describe` and `doctor` say so). Cluster
+  mode, and processes beyond the instance count, are stopped instead
+  (identity-checked) before anything starts. This is the R1 path, used only
+  as a fallback.
 - One shim per **app**, not per instance: `-i 8` is still one shim.
 
 Cost: one extra process per app. Text pages of the shared binary are shared
@@ -256,8 +274,8 @@ across processes, so per-shim private RSS is expected to be well under 1 MB
   `apps/*.json` connects to the shim or launches it (own process group,
   output to the shim log). If no shim holds the lock but its recorded
   instances are still alive (a shim crash), it does **not** launch a new
-  shim: it logs `orphaned_instances` and waits. The adoption fallback
-  described above is not implemented yet.
+  shim: it logs `orphaned_instances` and launches a shim that adopts them
+  (0.13; before, it waited).
 - Verified: HTTP app under back-to-back requests from one client while the
   daemon is `kill -9`ed and restarted 100 times: 0 failed requests, same app
   PID, one shim launched, every request logged exactly once in order
@@ -268,7 +286,8 @@ across processes, so per-shim private RSS is expected to be well under 1 MB
 Not yet: resume across daemon restarts (needs `events.db`, step 2.6b; a fresh
 daemon gets the current snapshot, not missed history), operator commands
 (step 2.5), desired state so a deliberately stopped shim is not relaunched
-(2.6), in-place shim upgrade, and adopting a dead shim's instances.
+(2.6). In-place shim upgrade and adopting a dead shim's instances: done
+in 0.13 (above). Fault-injection tests: docs/faults.md.
 
 ### What zero downtime does and does not cover
 

@@ -12,6 +12,22 @@ use vexor_proto::{ClientRequest, MAX_LINE, PROTOCOL, Request, Response};
 const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(5);
 /// Long enough for `stop` of an app with a long kill_timeout.
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(300);
+/// Questions the daemon answers from memory or its database: no answer in
+/// this long means it is stuck, and saying so beats waiting minutes.
+const QUERY_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn timeout(req: &Request) -> Duration {
+    match req {
+        Request::List
+        | Request::Version
+        | Request::Describe { .. }
+        | Request::Events { .. }
+        | Request::Alerts
+        | Request::Metrics { .. }
+        | Request::Routes { .. } => QUERY_TIMEOUT,
+        _ => RESPONSE_TIMEOUT,
+    }
+}
 
 pub fn request(home: &Path, req: &Request) -> Result<Response, String> {
     if *req != Request::Version {
@@ -22,8 +38,9 @@ pub fn request(home: &Path, req: &Request) -> Result<Response, String> {
 
 fn send(home: &Path, req: &Request) -> Result<Response, String> {
     let mut stream = connect_or_start(home)?;
+    let limit = timeout(req);
     stream
-        .set_read_timeout(Some(RESPONSE_TIMEOUT))
+        .set_read_timeout(Some(limit))
         .map_err(|e| e.to_string())?;
     let msg = ClientRequest {
         protocol: PROTOCOL,
@@ -37,9 +54,15 @@ fn send(home: &Path, req: &Request) -> Result<Response, String> {
 
     let mut reader = BufReader::new(stream).take(u64::try_from(MAX_LINE).unwrap_or(u64::MAX));
     let mut buf = Vec::new();
-    reader
-        .read_until(b'\n', &mut buf)
-        .map_err(|e| format!("no answer from the daemon: {e}"))?;
+    reader.read_until(b'\n', &mut buf).map_err(|e| match e.kind() {
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => format!(
+            "the daemon did not answer within {}s; it may be stuck. Apps keep running under their own supervisors: see {}, or stop the daemon (kill {}) and run the command again",
+            limit.as_secs(),
+            home.join("daemon.err").display(),
+            daemon_pid(home).map_or_else(|| "<pid>".to_owned(), |p| p.to_string())
+        ),
+        _ => format!("no answer from the daemon: {e}"),
+    })?;
     if buf.is_empty() {
         return Err("the daemon closed the connection without answering".into());
     }

@@ -162,7 +162,7 @@ struct Actor {
     live: BTreeSet<u32>,
     /// Spawn requests sent but not yet answered.
     pending: BTreeSet<u32>,
-    log_tasks: Vec<JoinHandle<()>>,
+    log_tasks: Vec<JoinHandle<Option<std::os::fd::OwnedFd>>>,
 }
 
 impl Actor {
@@ -257,9 +257,9 @@ impl Actor {
         });
         let args = vec!["-e".to_owned(), PRIMARY_JS.to_owned(), config.to_string()];
         let s = process::spawn_with(&self.spec, &args, None, true, &self.out, &self.err)?;
-        self.managed.insert(s.pid, Identity::of(s.pid).ok());
+        self.managed.insert(s.pid, Identity::of(s.pid).ok(), None);
         self.log_tasks.retain(|t| !t.is_finished());
-        self.log_tasks.extend(s.log_tasks);
+        self.log_tasks.extend(s.pumps.into_tasks());
         let stream = s
             .ipc
             .ok_or_else(|| std::io::Error::other("no IPC channel to the primary"))?;

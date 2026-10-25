@@ -22,8 +22,10 @@ mod memory;
 mod metrics;
 mod orphan;
 mod output;
+mod proc;
 mod process;
 mod routes;
+mod upgrade;
 mod user;
 
 use std::path::{Path, PathBuf};
@@ -54,13 +56,23 @@ pub mod exit {
 }
 
 /// Load a spec file, then supervise the app. With `home`, run daemon-managed
-/// (see the crate docs).
-pub fn run_from_file(path: &Path, home: Option<&Path>) -> i32 {
+/// (see the crate docs). With `handover`, continue where the previous
+/// program image of this shim left off (in-place upgrade).
+pub fn run_from_file(path: &Path, home: Option<&Path>, handover: Option<&Path>) -> i32 {
     let spec = match load_spec(path) {
         Ok(s) => s,
         Err(msg) => {
             eprintln!("vexor shim: {msg}");
             return exit::BAD_SPEC;
+        }
+    };
+    let handover = match handover.map(upgrade::read).transpose() {
+        Ok(h) => h,
+        Err(msg) => {
+            // The apps are still our children, but nothing says which pipes
+            // are theirs. Exiting frees the lock: the next shim adopts them.
+            eprintln!("vexor shim: cannot resume after an upgrade: {msg}");
+            return exit::INTERNAL;
         }
     };
     let rt = match tokio::runtime::Builder::new_current_thread()
@@ -73,7 +85,7 @@ pub fn run_from_file(path: &Path, home: Option<&Path>) -> i32 {
             return exit::INTERNAL;
         }
     };
-    rt.block_on(run(spec, home.map(Path::to_path_buf)))
+    rt.block_on(run(spec, home.map(Path::to_path_buf), handover))
 }
 
 fn load_spec(path: &Path) -> Result<AppSpec, String> {
@@ -156,9 +168,53 @@ pub fn validate(spec: &AppSpec) -> Result<(), String> {
     Ok(())
 }
 
+/// How one run of the supervisor ended.
+enum Outcome {
+    Exit(i32),
+    /// `ToShim::Upgrade`: every instance is frozen; replace the program.
+    Upgrade {
+        exe: PathBuf,
+        handover: upgrade::Handover,
+    },
+}
+
 /// Supervise `spec`. SIGTERM or SIGINT (or `ToShim::Stop`) stops all
-/// instances gracefully.
-pub async fn run(spec: AppSpec, home: Option<PathBuf>) -> i32 {
+/// instances gracefully. `ToShim::Upgrade` replaces the program in place;
+/// if that fails, supervision carries on in this program from the same
+/// handover.
+pub async fn run(spec: AppSpec, home: Option<PathBuf>, handover: Option<upgrade::Handover>) -> i32 {
+    let mut handover = handover;
+    let mut failed: Option<String> = None;
+    loop {
+        match run_once(spec.clone(), home.clone(), handover.take(), failed.take()).await {
+            Outcome::Exit(code) => return code,
+            Outcome::Upgrade { exe, handover: h } => {
+                let Some(home) = &home else {
+                    return exit::INTERNAL;
+                };
+                let path = upgrade::path(&control::shims_dir(home), &spec.name);
+                let err = match upgrade::write(&path, &h) {
+                    Ok(()) => upgrade::exec(&exe, &path),
+                    Err(e) => e,
+                };
+                let _ = std::fs::remove_file(&path);
+                eprintln!(
+                    "vexor shim: in-place upgrade to {} failed: {err}; carrying on",
+                    exe.display()
+                );
+                failed = Some(format!("exec {}: {err}", exe.display()));
+                handover = Some(h);
+            }
+        }
+    }
+}
+
+async fn run_once(
+    spec: AppSpec,
+    home: Option<PathBuf>,
+    mut resumed: Option<upgrade::Handover>,
+    failed: Option<String>,
+) -> Outcome {
     let (stop_tx, stop_rx) = watch::channel(false);
     let stop_tx = Arc::new(stop_tx);
     let (restart_tx, _) = tokio::sync::broadcast::channel::<instance::Control>(16);
@@ -169,7 +225,7 @@ pub async fn run(spec: AppSpec, home: Option<PathBuf>) -> i32 {
         (Ok(t), Ok(i)) => (t, i),
         (Err(e), _) | (_, Err(e)) => {
             eprintln!("vexor shim: cannot install signal handlers: {e}");
-            return exit::INTERNAL;
+            return Outcome::Exit(exit::INTERNAL);
         }
     };
 
@@ -179,6 +235,11 @@ pub async fn run(spec: AppSpec, home: Option<PathBuf>) -> i32 {
         );
     }
     let out = output::Output::new(true);
+    if let Some(h) = resumed.as_mut() {
+        out.restore(std::mem::take(&mut h.output));
+    }
+    // `ToShim::Upgrade` from the daemon connection.
+    let (upgrade_tx, mut upgrade_rx) = tokio::sync::mpsc::unbounded_channel::<PathBuf>();
 
     // Latest resource samples, for the daemon connection.
     let (metrics_tx, metrics_rx) = watch::channel(Vec::new());
@@ -196,15 +257,18 @@ pub async fn run(spec: AppSpec, home: Option<PathBuf>) -> i32 {
 
     // Daemon-managed mode: lock, control socket, persisted identities.
     let mut presence = None;
-    let managed = match &home {
-        None => orphan::Managed::default(),
-        Some(home) => match claim(home, &spec.name) {
+    let (managed, survivors) = match &home {
+        None => (orphan::Managed::default(), Vec::new()),
+        Some(home) => match match &resumed {
+            Some(h) => reclaim(home, &spec.name, h),
+            None => claim(home, &spec.name),
+        } {
             Ok(Claim::Taken) => {
                 eprintln!(
                     "vexor shim: another shim already supervises {:?}",
                     spec.name
                 );
-                return exit::ALREADY_RUNNING;
+                return Outcome::Exit(exit::ALREADY_RUNNING);
             }
             Ok(Claim::Ours {
                 lock,
@@ -215,8 +279,13 @@ pub async fn run(spec: AppSpec, home: Option<PathBuf>) -> i32 {
                     Ok(me) => me,
                     Err(e) => {
                         eprintln!("vexor shim: cannot read own identity: {e}");
-                        return exit::INTERNAL;
+                        return Outcome::Exit(exit::INTERNAL);
                     }
+                };
+                // Kept for an in-place upgrade: the socket stays bound.
+                let listener_fd = {
+                    use std::os::fd::AsFd;
+                    listener.as_fd().try_clone_to_owned().ok()
                 };
                 let server = tokio::spawn(control::serve(
                     listener,
@@ -229,15 +298,26 @@ pub async fn run(spec: AppSpec, home: Option<PathBuf>) -> i32 {
                         metrics: metrics_rx.clone(),
                         scale: scale_tx.clone(),
                         routes: tap.clone().map(|t| (t, route_interval)),
+                        upgrade: upgrade_tx.clone(),
                     },
                 ));
-                let managed = orphan::Managed::persisted(paths.pids.clone());
-                presence = Some((lock, server, paths));
-                managed
+                let (managed, survivors) = orphan::Managed::persisted(paths.pids.clone());
+                presence = Some((lock, server, paths, listener_fd));
+                // Processes handed over in place are ours, not survivors.
+                let ours: Vec<u32> = resumed
+                    .iter()
+                    .flat_map(|h| &h.instances)
+                    .filter_map(|i| i.process.as_ref().map(|p| p.pid))
+                    .collect();
+                let survivors = survivors
+                    .into_iter()
+                    .filter(|l| !ours.contains(&l.identity.pid))
+                    .collect();
+                (managed, survivors)
             }
             Err(e) => {
                 eprintln!("vexor shim: cannot set up {}: {e}", home.display());
-                return exit::INTERNAL;
+                return Outcome::Exit(exit::INTERNAL);
             }
         },
     };
@@ -245,9 +325,68 @@ pub async fn run(spec: AppSpec, home: Option<PathBuf>) -> i32 {
         Ok(l) => l,
         Err(e) => {
             eprintln!("vexor shim: cannot set up log files: {e}");
-            return exit::INTERNAL;
+            return Outcome::Exit(exit::INTERNAL);
         }
     };
+    // A shim that died left these running: fork-mode instances are taken
+    // over as they are; anything else (a cluster primary, which can't be
+    // controlled without its channel to the dead shim, or instances beyond
+    // the count) is stopped before anything new starts.
+    let (adopt, leftovers) = assign_survivors(&survivors, &spec);
+    if !leftovers.is_empty() {
+        for id in &leftovers {
+            out.emit(&output::ShimEvent::LeftoverStopped {
+                app: &spec.name,
+                pid: id.pid,
+            });
+        }
+        orphan::stop_leftovers(&leftovers, spec.policy.to_policy().kill_timeout).await;
+        for id in &leftovers {
+            managed.remove(id.pid);
+        }
+    }
+    let mut adopt = adopt;
+    // Instances handed over in place, by number.
+    let mut inherited: std::collections::BTreeMap<u32, instance::Inherited> = Default::default();
+    let mut wanted = spec.instances;
+    if let Some(h) = resumed.take() {
+        wanted = h.wanted.max(1);
+        for i in h.instances {
+            let Some(p) = i.process else { continue };
+            let fd = |n: Option<i32>| {
+                n.and_then(|n| {
+                    upgrade::take(n)
+                        .map_err(|e| eprintln!("vexor shim: handed-over descriptor {n}: {e}"))
+                        .ok()
+                })
+            };
+            inherited.insert(
+                i.index,
+                instance::Inherited {
+                    restarts: i.restarts,
+                    identity: Identity {
+                        pid: p.pid,
+                        start: p.start,
+                    },
+                    adopted: p.adopted,
+                    ipc: fd(p.ipc_fd),
+                    stdout: fd(p.stdout_fd),
+                    stderr: fd(p.stderr_fd),
+                },
+            );
+        }
+        match &failed {
+            None => out.emit(&output::ShimEvent::Upgraded {
+                app: &spec.name,
+                from: &h.from_version,
+                to: env!("CARGO_PKG_VERSION"),
+            }),
+            Some(reason) => out.emit(&output::ShimEvent::UpgradeSkipped {
+                app: &spec.name,
+                reason,
+            }),
+        }
+    }
     let reaper = tokio::spawn(watch_orphans(
         spec.name.clone(),
         managed.clone(),
@@ -312,7 +451,9 @@ pub async fn run(spec: AppSpec, home: Option<PathBuf>) -> i32 {
     // ones a scale-down removes.
     let mut stops: std::collections::BTreeMap<u32, watch::Sender<bool>> = Default::default();
     let spawn = |index: u32,
-                 set: &mut tokio::task::JoinSet<(u32, State)>,
+                 adopt: Option<Identity>,
+                 inherit: Option<instance::Inherited>,
+                 set: &mut tokio::task::JoinSet<(u32, instance::RunEnd)>,
                  stops: &mut std::collections::BTreeMap<u32, watch::Sender<bool>>| {
         let (tx, rx) = watch::channel(*stop_rx.borrow());
         stops.insert(index, tx);
@@ -325,20 +466,36 @@ pub async fn run(spec: AppSpec, home: Option<PathBuf>) -> i32 {
             (logs.out.clone(), logs.err.clone()),
             cluster.clone(),
         );
+        let runner = match (inherit, adopt) {
+            (Some(i), _) => runner.inheriting(i),
+            (None, Some(id)) => runner.adopting(id),
+            (None, None) => runner,
+        };
         let control = restart_tx.subscribe();
         set.spawn(async move { (index, runner.run(rx, control, exit_when_idle).await) });
     };
-    for index in 0..spec.instances {
-        spawn(index, &mut set, &mut stops);
+    for index in 0..wanted {
+        spawn(
+            index,
+            adopt.remove(&index),
+            inherited.remove(&index),
+            &mut set,
+            &mut stops,
+        );
     }
 
-    let mut wanted = spec.instances;
     let mut global_stop = stop_rx.clone();
     let mut states = Vec::with_capacity(set.len());
+    let mut upgrading: Option<PathBuf> = None;
+    let mut frozen: Vec<instance::Frozen> = Vec::new();
     loop {
         tokio::select! {
             joined = set.join_next() => match joined {
-                Some(Ok((index, state))) => {
+                Some(Ok((index, instance::RunEnd::Frozen(f)))) => {
+                    stops.remove(&index);
+                    frozen.push(f);
+                }
+                Some(Ok((index, instance::RunEnd::Done(state)))) => {
                     stops.remove(&index);
                     let stopping = *stop_rx.borrow();
                     if index >= wanted && !stopping {
@@ -347,7 +504,7 @@ pub async fn run(spec: AppSpec, home: Option<PathBuf>) -> i32 {
                         out.emit(&output::ShimEvent::InstanceRemoved { app: &spec.name, instance: index });
                     } else if index < wanted && !stopping && home.is_some() {
                         // Scaled back up while it was stopping.
-                        spawn(index, &mut set, &mut stops);
+                        spawn(index, None, None, &mut set, &mut stops);
                     } else {
                         states.push(state);
                     }
@@ -365,16 +522,36 @@ pub async fn run(spec: AppSpec, home: Option<PathBuf>) -> i32 {
                     }
                 }
             }
+            Some(exe) = upgrade_rx.recv() => {
+                let reason = if cluster.is_some() {
+                    Some("cluster mode: the cluster primary can't be handed over; reload or restart the app to run it under the new version")
+                } else if *stop_rx.borrow() {
+                    Some("the app is stopping")
+                } else if upgrading.is_some() {
+                    Some("an upgrade is already in progress")
+                } else if !exe.is_absolute() || !exe.is_file() {
+                    Some("the new program was not found")
+                } else {
+                    None
+                };
+                match reason {
+                    Some(reason) => out.emit(&output::ShimEvent::UpgradeSkipped { app: &spec.name, reason }),
+                    None => {
+                        upgrading = Some(exe);
+                        let _ = restart_tx.send(instance::Control::Freeze);
+                    }
+                }
+            }
             Some(n) = scale_rx.recv() => {
                 let n = n.max(1);
-                if !*stop_rx.borrow() {
+                if !*stop_rx.borrow() && upgrading.is_none() {
                     for i in wanted.min(n)..wanted.max(n) {
                         if i >= n {
                             if let Some(tx) = stops.get(&i) {
                                 tx.send_replace(true);
                             }
                         } else if !stops.contains_key(&i) {
-                            spawn(i, &mut set, &mut stops);
+                            spawn(i, None, None, &mut set, &mut stops);
                         }
                     }
                     wanted = n;
@@ -386,7 +563,7 @@ pub async fn run(spec: AppSpec, home: Option<PathBuf>) -> i32 {
         }
     }
 
-    if let Some(c) = cron {
+    if let Some(c) = cron.as_ref() {
         c.abort();
     }
     if let Some(w) = watcher {
@@ -398,6 +575,47 @@ pub async fn run(spec: AppSpec, home: Option<PathBuf>) -> i32 {
     if let Some(s) = sampler {
         s.abort();
     }
+    if let (Some(exe), false) = (upgrading, frozen.is_empty()) {
+        // Every instance is frozen: collect their pipes once the pumps
+        // have forwarded what is buffered, flush the logs, hand over.
+        logs.freeze();
+        let mut instances = Vec::with_capacity(frozen.len());
+        for f in frozen {
+            let process = match f.process {
+                Some(p) => {
+                    let (stdout, stderr) = p.pumps.into_fds().await;
+                    Some(upgrade::SavedProcess {
+                        pid: p.identity.pid,
+                        start: p.identity.start,
+                        adopted: p.adopted,
+                        ipc_fd: p.ipc.and_then(kept),
+                        stdout_fd: stdout.and_then(kept),
+                        stderr_fd: stderr.and_then(kept),
+                    })
+                }
+                None => None,
+            };
+            instances.push(upgrade::SavedInstance {
+                index: f.index,
+                restarts: f.restarts,
+                process,
+            });
+        }
+        logs.finish(std::time::Duration::from_secs(5)).await;
+        reaper.abort();
+        let (lock, server, _, listener) = presence.expect("only daemon-managed shims upgrade");
+        server.abort();
+        let handover = upgrade::Handover {
+            format: upgrade::FORMAT,
+            from_version: env!("CARGO_PKG_VERSION").to_owned(),
+            listener_fd: listener.and_then(kept).unwrap_or(-1),
+            lock_fd: kept(std::os::fd::OwnedFd::from(lock)).unwrap_or(-1),
+            output: out.save(),
+            wanted,
+            instances,
+        };
+        return Outcome::Upgrade { exe, handover };
+    }
     if let Some(c) = &cluster {
         c.shutdown().await;
     }
@@ -407,17 +625,24 @@ pub async fn run(spec: AppSpec, home: Option<PathBuf>) -> i32 {
     if spec.treekill {
         orphan::stop_all(&managed, spec.policy.to_policy().kill_timeout).await;
     }
-    if let Some((lock, server, paths)) = presence {
+    if let Some((lock, server, paths, _)) = presence {
         server.abort();
         let _ = std::fs::remove_file(&paths.socket);
         let _ = std::fs::remove_file(&paths.pids);
         drop(lock);
     }
-    if states.contains(&State::Errored) {
+    Outcome::Exit(if states.contains(&State::Errored) {
         exit::ERRORED
     } else {
         exit::STOPPED
-    }
+    })
+}
+
+/// Keep `fd` open across the exec; `None` (logged) if that failed.
+fn kept(fd: std::os::fd::OwnedFd) -> Option<i32> {
+    upgrade::keep(fd)
+        .map_err(|e| eprintln!("vexor shim: cannot keep a descriptor across the upgrade: {e}"))
+        .ok()
 }
 
 enum Claim {
@@ -427,6 +652,19 @@ enum Claim {
         listener: tokio::net::UnixListener,
         paths: control::Paths,
     },
+}
+
+/// The lock and control socket the previous program image handed over:
+/// already ours, nothing to wait for.
+fn reclaim(home: &Path, app: &str, h: &upgrade::Handover) -> std::io::Result<Claim> {
+    let lock = std::fs::File::from(upgrade::take(h.lock_fd)?);
+    let listener = std::os::unix::net::UnixListener::from(upgrade::take(h.listener_fd)?);
+    listener.set_nonblocking(true)?;
+    Ok(Claim::Ours {
+        lock,
+        listener: tokio::net::UnixListener::from_std(listener)?,
+        paths: control::Paths::new(home, app),
+    })
 }
 
 fn claim(home: &Path, app: &str) -> std::io::Result<Claim> {
@@ -517,6 +755,40 @@ async fn cluster_health(
     }
 }
 
+/// Which survivors of a dead shim each instance takes over, and which must
+/// be stopped instead: recorded instance numbers first, then (files from
+/// before 0.13 have none) the lowest free numbers. Cluster mode adopts
+/// nothing.
+fn assign_survivors(
+    survivors: &[orphan::Leader],
+    spec: &AppSpec,
+) -> (std::collections::BTreeMap<u32, Identity>, Vec<Identity>) {
+    let mut adopt = std::collections::BTreeMap::new();
+    let mut leftovers = Vec::new();
+    if spec.cluster.is_some() {
+        return (adopt, survivors.iter().map(|l| l.identity).collect());
+    }
+    let mut unnumbered = Vec::new();
+    for l in survivors {
+        match l.instance {
+            Some(i) if i < spec.instances && !adopt.contains_key(&i) => {
+                adopt.insert(i, l.identity);
+            }
+            Some(_) => leftovers.push(l.identity),
+            None => unnumbered.push(l.identity),
+        }
+    }
+    for id in unnumbered {
+        match (0..spec.instances).find(|i| !adopt.contains_key(i)) {
+            Some(i) => {
+                adopt.insert(i, id);
+            }
+            None => leftovers.push(id),
+        }
+    }
+    (adopt, leftovers)
+}
+
 /// Reap adopted orphans as they exit, and report each new live one once.
 async fn watch_orphans(app: String, managed: orphan::Managed, out: output::Output) {
     let mut sigchld = signal(SignalKind::child()).ok();
@@ -559,6 +831,39 @@ mod tests {
             r#"{"name":"a","exec":"/bin/true","cwd":"/","logs":{"out":"/tmp/o","err":"/tmp/e"}}"#,
         )
         .expect("valid")
+    }
+
+    #[test]
+    fn survivors_go_to_their_instances_then_to_free_ones() {
+        let l = |pid, instance| orphan::Leader {
+            identity: Identity { pid, start: 1 },
+            instance,
+        };
+        let mut s = spec();
+        s.instances = 3;
+        // 0.12 files have no instance numbers; #5 no longer exists; two
+        // claim #1 (a reload was in progress).
+        let survivors = [
+            l(10, Some(1)),
+            l(11, None),
+            l(12, Some(5)),
+            l(13, Some(1)),
+            l(14, None),
+        ];
+        let (adopt, leftovers) = assign_survivors(&survivors, &s);
+        let pids: Vec<(u32, u32)> = adopt.iter().map(|(i, id)| (*i, id.pid)).collect();
+        assert_eq!(pids, [(0, 11), (1, 10), (2, 14)]);
+        let left: Vec<u32> = leftovers.iter().map(|id| id.pid).collect();
+        assert_eq!(left, [12, 13]);
+        // Cluster mode adopts nothing.
+        s.cluster = Some(vexor_core::ClusterSpec {
+            script: "/a.js".into(),
+            node_args: Vec::new(),
+            args: Vec::new(),
+        });
+        let (adopt, leftovers) = assign_survivors(&survivors, &s);
+        assert!(adopt.is_empty());
+        assert_eq!(leftovers.len(), 5);
     }
 
     #[test]

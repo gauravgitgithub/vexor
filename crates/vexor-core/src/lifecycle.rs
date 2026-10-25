@@ -256,6 +256,19 @@ impl Instance {
         }
     }
 
+    /// An instance whose process is already running, handed over by the
+    /// previous program image of the same shim (in-place upgrade): online,
+    /// with its restart count kept. Uptime counts from `now`.
+    pub fn inherited(policy: InstancePolicy, restarts: u64, now: Millis) -> Self {
+        Instance {
+            state: State::Online,
+            desired: Desired::Running,
+            started_at: Some(now),
+            spawns: restarts + 1,
+            ..Instance::new(policy)
+        }
+    }
+
     pub fn state(&self) -> State {
         self.state
     }

@@ -196,6 +196,16 @@ pub fn checks(home: &Path) -> Vec<Finding> {
             ));
             continue;
         }
+        let adopted = a.snapshot.iter().filter(|s| s["adopted"] == true).count();
+        if adopted > 0 {
+            out.push(warn(
+                format!(
+                    "{}: {adopted} instance(s) kept running after their supervisor died; their output is not captured",
+                    a.name
+                ),
+                format!("vexor restart {} (or reload) when convenient", a.name),
+            ));
+        }
         healthy += 1;
         if let Ok((_, spec, _)) = describe_app(home, a.name.clone()) {
             if !spec.exec.exists() {

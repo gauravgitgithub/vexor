@@ -61,7 +61,9 @@ dry-run, backup, journaled apply, rollback (docs/migration.md).
 Phase 5 done: dry run, backup, apply and rollback.
 
 ## Phase 6: hardening
-HTTP/TCP health checks, readiness-gated reload, max_memory_restart, watch, cron_restart, metrics endpoint, `doctor`, fault-injection suite, uid/gid review, Windows feasibility study.
+HTTP/TCP health checks, readiness-gated reload, max_memory_restart, watch, cron_restart, metrics endpoint, `doctor`, fault-injection suite ✅ (docs/faults.md), uid/gid review, Windows feasibility study.
+
+Phase 6 resilience ✅ (0.13): adopting a dead shim's instances, in-place shim upgrade (fork mode), and the fault-injection suite. Details in docs/architecture.md §7 and docs/faults.md. Tests: daemon tests for adoption (fork: same PIDs, one new shim, adopted process restarted on exit, `restart` restores output capture; cluster: leftovers stopped, app started again, nothing listening twice), `tests/upgrade.rs` (same shim PID and incarnation, same app PIDs, output with no line lost or repeated, event replay continuous, inherited child's exit signal seen; HTTP app with Node IPC under load: 0 failed requests, one process, IPC still connected; missing program skipped; failed exec resumes in the same program), unit tests (survivor assignment, handover file and kept descriptors, version comparison, `Instance::inherited`, `Proc` waits), and `fault_*` daemon tests (hung daemon, hung shim, corrupted event database, unwritable log file). Found and fixed on the way: CLI questions to a hung daemon waited 5 minutes; now 10 s with what to do.
 
 First the three settings that block migrations (and `vexor start` of ecosystem files) today:
 

@@ -10,7 +10,7 @@ use std::io::Write;
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
 use vexor_core::{ErrorReason, ExitStatus, State};
 use vexor_proto::HealthStatus;
@@ -35,6 +35,10 @@ pub enum ShimEvent<'a> {
         exit: Option<ExitStatus>,
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<ErrorReason>,
+        /// The process was taken over from a shim that died: its output is
+        /// not captured until it restarts.
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        adopted: bool,
     },
     /// Processes were still in the instance's group after its main process
     /// exited, and were sent `signal`.
@@ -87,6 +91,24 @@ pub enum ShimEvent<'a> {
         #[serde(skip_serializing_if = "Option::is_none")]
         action: Option<&'static str>,
     },
+    /// A shim that died left this instance's process running; this shim
+    /// took it over without restarting it.
+    Adopted {
+        app: &'a str,
+        instance: u32,
+        pid: u32,
+    },
+    /// A process a dead shim left behind was stopped instead of adopted
+    /// (cluster mode, or more instances than the app now has).
+    LeftoverStopped { app: &'a str, pid: u32 },
+    /// This shim replaced its program image in place (apps untouched).
+    Upgraded {
+        app: &'a str,
+        from: &'a str,
+        to: &'static str,
+    },
+    /// An in-place upgrade was asked for but not done.
+    UpgradeSkipped { app: &'a str, reason: &'a str },
     /// The app now runs `instances` instances (`vexor scale`).
     Scaled { app: &'a str, instances: u32 },
     /// A scale-down stopped this instance; it is no longer part of the app.
@@ -121,6 +143,15 @@ struct Inner {
     latest: BTreeMap<u32, serde_json::Value>,
     /// Latest health result per instance (`None`: app-wide, cluster mode).
     health: BTreeMap<Option<u32>, HealthStatus>,
+}
+
+/// What [`Output`] keeps, as saved for an in-place upgrade.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct Saved {
+    pub next_seq: u64,
+    pub buffer: Vec<(u64, serde_json::Value)>,
+    pub latest: BTreeMap<u32, serde_json::Value>,
+    pub health: Vec<(Option<u32>, HealthStatus)>,
 }
 
 /// Events after a given point, as returned by [`Output::since`].
@@ -194,6 +225,28 @@ impl Output {
             inner.buffer.push_back((seq, value));
         }
         self.0.notify.notify_waiters();
+    }
+
+    /// Everything kept, for the next program image (in-place upgrade).
+    pub fn save(&self) -> Saved {
+        let inner = self.lock();
+        Saved {
+            next_seq: inner.next_seq,
+            buffer: inner.buffer.iter().cloned().collect(),
+            latest: inner.latest.clone(),
+            health: inner.health.iter().map(|(i, h)| (*i, h.clone())).collect(),
+        }
+    }
+
+    /// Continue from what the previous program image kept: sequence
+    /// numbers, buffered events and the latest state of each instance, so
+    /// a daemon resumes where it was.
+    pub fn restore(&self, saved: Saved) {
+        let mut inner = self.lock();
+        inner.next_seq = saved.next_seq;
+        inner.buffer = saved.buffer.into_iter().collect();
+        inner.latest = saved.latest;
+        inner.health = saved.health.into_iter().collect();
     }
 
     /// Sequence number the next event will get.
@@ -313,6 +366,7 @@ mod tests {
                 restarts: 0,
                 exit: None,
                 error: None,
+                adopted: false,
             });
         }
         let snap = out.snapshot();
@@ -344,6 +398,7 @@ mod tests {
             restarts: 1,
             exit: None,
             error: None,
+            adopted: false,
         });
         assert!(out.health(0).expect("app-wide again").ok);
     }

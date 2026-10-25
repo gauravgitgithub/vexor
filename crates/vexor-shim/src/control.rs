@@ -133,6 +133,8 @@ pub struct Links {
     pub scale: mpsc::UnboundedSender<u32>,
     /// Per-route stats, taken once per interval.
     pub routes: Option<(Arc<crate::routes::Tap>, Duration)>,
+    /// `ToShim::Upgrade`: the program to replace this one with.
+    pub upgrade: mpsc::UnboundedSender<PathBuf>,
 }
 
 /// Accept daemon connections until the task is aborted.
@@ -179,6 +181,7 @@ async fn session(stream: UnixStream, out: Output, me: Identity, app: Arc<str>, l
         mut metrics,
         scale,
         routes,
+        upgrade,
     } = links;
     let (read, mut write) = stream.into_split();
 
@@ -225,6 +228,8 @@ async fn session(stream: UnixStream, out: Output, me: Identity, app: Arc<str>, l
         shim_start: me.start,
         next_seq,
         snapshot: out.snapshot(),
+        // Daemons before protocol 5 refuse fields they don't know.
+        version: (protocol >= 5).then(|| env!("CARGO_PKG_VERSION").to_owned()),
     };
     if vexor_proto::send(&mut write, &welcome).await.is_err() {
         return;
@@ -289,6 +294,7 @@ async fn session(stream: UnixStream, out: Output, me: Identity, app: Arc<str>, l
                 Some(ToShim::Restart) => { let _ = restart.send(crate::instance::Control::Restart); }
                 Some(ToShim::Reload) => { let _ = restart.send(crate::instance::Control::Reload); }
                 Some(ToShim::Scale { instances }) => { let _ = scale.send(instances); }
+                Some(ToShim::Upgrade { exec }) => { let _ = upgrade.send(exec); }
                 Some(ToShim::Hello { .. }) => {}
                 None => return,
             },

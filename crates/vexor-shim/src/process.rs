@@ -26,7 +26,53 @@ pub struct Spawned {
     pub pid: u32,
     /// Our end of the Node IPC channel, if one was requested.
     pub ipc: Option<UnixStream>,
-    pub log_tasks: Vec<JoinHandle<()>>,
+    pub pumps: Pumps,
+}
+
+/// The tasks copying one process's stdout and stderr into its log files.
+/// Each ends at EOF with `None`, or, when the logs are frozen for an
+/// in-place upgrade, with the still-open pipe.
+#[derive(Default)]
+pub struct Pumps {
+    pub out: Option<JoinHandle<Option<OwnedFd>>>,
+    pub err: Option<JoinHandle<Option<OwnedFd>>>,
+}
+
+impl Pumps {
+    /// Start copying the read ends of a process's stdout and stderr pipes.
+    pub fn start(
+        out_fd: Option<OwnedFd>,
+        err_fd: Option<OwnedFd>,
+        out: &Sink,
+        err: &Sink,
+    ) -> io::Result<Pumps> {
+        let start = |fd: Option<OwnedFd>, sink: &Sink| -> io::Result<_> {
+            fd.map(|fd| {
+                let rx = tokio::net::unix::pipe::Receiver::from_owned_fd(fd)?;
+                Ok(tokio::spawn(sink.clone().pump_pipe(rx)))
+            })
+            .transpose()
+        };
+        Ok(Pumps {
+            out: start(out_fd, out)?,
+            err: start(err_fd, err)?,
+        })
+    }
+
+    pub fn into_tasks(self) -> impl Iterator<Item = JoinHandle<Option<OwnedFd>>> {
+        self.out.into_iter().chain(self.err)
+    }
+
+    /// After a freeze: the pipes, once both pumps have handed them back.
+    pub async fn into_fds(self) -> (Option<OwnedFd>, Option<OwnedFd>) {
+        let take = |h: Option<JoinHandle<Option<OwnedFd>>>| async move {
+            match h {
+                Some(h) => h.await.ok().flatten(),
+                None => None,
+            }
+        };
+        (take(self.out).await, take(self.err).await)
+    }
 }
 
 /// Start instance `index` of `spec` in fork mode. The process gets exactly
@@ -95,13 +141,9 @@ pub fn spawn_with(
     let pid = child
         .id()
         .ok_or_else(|| io::Error::other("child exited before its pid was read"))?;
-    let mut log_tasks = Vec::with_capacity(2);
-    if let Some(stdout) = child.stdout.take() {
-        log_tasks.push(tokio::spawn(out.clone().pump(stdout)));
-    }
-    if let Some(stderr) = child.stderr.take() {
-        log_tasks.push(tokio::spawn(err.clone().pump(stderr)));
-    }
+    let out_fd = child.stdout.take().map(|s| s.into_owned_fd()).transpose()?;
+    let err_fd = child.stderr.take().map(|s| s.into_owned_fd()).transpose()?;
+    let pumps = Pumps::start(out_fd, err_fd, out, err)?;
     let ipc = match parent_end {
         Some(s) => {
             s.set_nonblocking(true)?;
@@ -113,7 +155,7 @@ pub fn spawn_with(
         child,
         pid,
         ipc,
-        log_tasks,
+        pumps,
     })
 }
 
@@ -168,6 +210,12 @@ impl IpcChannel {
             reader: BufReader::new(stream),
             buf: Vec::new(),
         }
+    }
+
+    /// The channel's socket, for an in-place upgrade. Anything already
+    /// read but not yet parsed is dropped.
+    pub fn into_fd(self) -> Option<OwnedFd> {
+        self.reader.into_inner().into_std().ok().map(OwnedFd::from)
     }
 
     /// Send the message `'shutdown'` (PM2 `shutdown_with_message`). False

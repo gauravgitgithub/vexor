@@ -22,6 +22,7 @@
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
+use std::os::fd::OwnedFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -48,6 +49,8 @@ pub struct Logs {
     pub out: Sink,
     pub err: Sink,
     writers: Vec<std::thread::JoinHandle<()>>,
+    /// Set for an in-place upgrade: every pump stops reading.
+    freeze: tokio::sync::watch::Sender<bool>,
 }
 
 impl Logs {
@@ -58,22 +61,36 @@ impl Logs {
         events: &Output,
         routes: Option<Arc<Tap>>,
     ) -> io::Result<Logs> {
-        let (out, w1) = Sink::start(app, &spec.out, spec, events, routes.clone())?;
+        let (freeze, frozen) = tokio::sync::watch::channel(false);
+        let (out, w1) = Sink::start(app, &spec.out, spec, events, routes.clone(), frozen.clone())?;
         let mut writers = vec![w1];
         let err = if spec.err == spec.out {
             out.clone()
         } else {
-            let (err, w2) = Sink::start(app, &spec.err, spec, events, routes)?;
+            let (err, w2) = Sink::start(app, &spec.err, spec, events, routes, frozen)?;
             writers.push(w2);
             err
         };
-        Ok(Logs { out, err, writers })
+        Ok(Logs {
+            out,
+            err,
+            writers,
+            freeze,
+        })
+    }
+
+    /// Stop every pump (in-place upgrade): each forwards what its pipe
+    /// holds right now, then hands the pipe back (see [`Sink::pump_pipe`]).
+    pub fn freeze(&self) {
+        self.freeze.send_replace(true);
     }
 
     /// Wait (up to `timeout`) for the writers to flush everything queued.
     /// Every sender must have been dropped first, or this times out.
     pub async fn finish(self, timeout: Duration) {
-        let Logs { out, err, writers } = self;
+        let Logs {
+            out, err, writers, ..
+        } = self;
         drop(out);
         drop(err);
         let joined = tokio::task::spawn_blocking(move || {
@@ -104,6 +121,13 @@ pub struct Sink {
     overflow: Overflow,
     dropped: Arc<AtomicU64>,
     timestamps: bool,
+    frozen: tokio::sync::watch::Receiver<bool>,
+}
+
+/// Why a copy loop ended.
+enum Copied {
+    Eof,
+    Frozen,
 }
 
 impl Sink {
@@ -113,6 +137,7 @@ impl Sink {
         spec: &LogSpec,
         events: &Output,
         routes: Option<Arc<Tap>>,
+        frozen: tokio::sync::watch::Receiver<bool>,
     ) -> io::Result<(Sink, std::thread::JoinHandle<()>)> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
@@ -142,51 +167,102 @@ impl Sink {
                 overflow: spec.overflow,
                 dropped,
                 timestamps: spec.timestamps,
+                frozen,
             },
             handle,
         ))
     }
 
-    /// Copy a pipe into this sink until EOF.
+    /// Copy any reader into this sink until EOF (or a freeze). App output
+    /// goes through [`Sink::pump_pipe`].
+    #[cfg(test)]
     pub async fn pump(self, from: impl AsyncRead + Unpin) {
         let pipe = NEXT_PIPE.fetch_add(1, Ordering::Relaxed);
-        self.copy(pipe, from).await;
+        let mut at_line_start = true;
+        self.copy(pipe, from, &mut at_line_start).await;
         let _ = self.tx.send(Queued::Closed(pipe));
     }
 
-    async fn copy(&self, pipe: u32, mut from: impl AsyncRead + Unpin) {
-        // Per pipe: whether the next byte starts a line.
+    /// Copy an app's output pipe into this sink until EOF, or until the
+    /// logs are frozen for an in-place upgrade: then forward what the pipe
+    /// holds right now and return it, still open, for the next program
+    /// image. Output written after that waits in the pipe.
+    pub async fn pump_pipe(self, mut from: tokio::net::unix::pipe::Receiver) -> Option<OwnedFd> {
+        let pipe = NEXT_PIPE.fetch_add(1, Ordering::Relaxed);
         let mut at_line_start = true;
+        let frozen = matches!(
+            self.copy(pipe, &mut from, &mut at_line_start).await,
+            Copied::Frozen
+        );
+        let fd = if frozen {
+            loop {
+                let mut buf = vec![0; CHUNK];
+                match from.try_read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        buf.truncate(n);
+                        if !self.forward(pipe, buf, &mut at_line_start).await {
+                            break;
+                        }
+                    }
+                }
+            }
+            from.into_nonblocking_fd().ok()
+        } else {
+            None
+        };
+        let _ = self.tx.send(Queued::Closed(pipe));
+        fd
+    }
+
+    async fn copy(
+        &self,
+        pipe: u32,
+        mut from: impl AsyncRead + Unpin,
+        at_line_start: &mut bool,
+    ) -> Copied {
+        let mut frozen = self.frozen.clone();
         loop {
             let mut buf = vec![0; CHUNK];
-            let n = match from.read(&mut buf).await {
-                Ok(0) | Err(_) => return,
-                Ok(n) => n,
+            let n = tokio::select! {
+                biased;
+                r = from.read(&mut buf) => match r {
+                    Ok(0) | Err(_) => return Copied::Eof,
+                    Ok(n) => n,
+                },
+                _ = frozen.wait_for(|f| *f) => return Copied::Frozen,
             };
             buf.truncate(n);
+            if !self.forward(pipe, buf, at_line_start).await {
+                return Copied::Eof;
+            }
+        }
+    }
+
+    /// Queue one chunk for the writer. False once the writer is gone.
+    async fn forward(&self, pipe: u32, mut buf: Vec<u8>, at_line_start: &mut bool) -> bool {
+        {
             // Queued chunks must not keep the whole read buffer.
             buf.shrink_to_fit();
             if self.timestamps {
-                buf = stamp(&buf, &mut at_line_start, &now_stamp());
+                buf = stamp(&buf, at_line_start, &now_stamp());
             }
             let need = permits(buf.len(), self.capacity);
             match self.overflow {
                 Overflow::Block => match self.room.acquire_many(need).await {
                     Ok(p) => p.forget(),
-                    Err(_) => return,
+                    Err(_) => return false,
                 },
                 Overflow::Drop => match self.room.try_acquire_many(need) {
                     Ok(p) => p.forget(),
                     Err(tokio::sync::TryAcquireError::NoPermits) => {
                         self.dropped.fetch_add(len_u64(&buf), Ordering::Relaxed);
-                        continue;
+                        return true;
                     }
-                    Err(tokio::sync::TryAcquireError::Closed) => return,
+                    Err(tokio::sync::TryAcquireError::Closed) => return false,
                 },
             }
-            if self.tx.send(Queued::Output { pipe, data: buf }).is_err() {
-                return;
-            }
+            self.tx.send(Queued::Output { pipe, data: buf }).is_ok()
         }
     }
 }

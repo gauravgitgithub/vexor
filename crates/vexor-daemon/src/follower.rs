@@ -181,12 +181,17 @@ impl Follower {
         let mut unreachable_reported = false;
         let mut last_error: Option<String> = None;
         let mut protocol = SHIM_PROTOCOL;
+        // The shim incarnation (`shim_start`) an in-place upgrade was last
+        // asked of: once per shim, so a failed one isn't retried in a loop.
+        let mut upgrade_asked: Option<u64> = None;
         loop {
             match UnixStream::connect(&self.paths.socket).await {
                 Ok(stream) => {
                     unreachable_reported = false;
                     last_error = None;
-                    let refused = self.follow(stream, &mut resume, protocol).await;
+                    let refused = self
+                        .follow(stream, &mut resume, protocol, &mut upgrade_asked)
+                        .await;
                     self.live.disconnected();
                     self.log
                         .write(json!({ "type": "shim_disconnected", "app": self.name }));
@@ -208,15 +213,14 @@ impl Follower {
                             continue;
                         }
                         if let Some(alive) = self.survivors() {
-                            // A shim died and left its instances running.
-                            // Starting a new shim would duplicate them.
+                            // A shim died and left its instances running:
+                            // the new shim adopts them instead of starting
+                            // duplicates (cluster mode: stops, then starts).
                             self.log.write(json!({
                                 "type": "orphaned_instances",
                                 "app": self.name,
                                 "pids": alive,
                             }));
-                            tokio::time::sleep(Duration::from_secs(5)).await;
-                            continue;
                         }
                         self.launch().await;
                     }
@@ -338,6 +342,7 @@ impl Follower {
         stream: UnixStream,
         resume: &mut Option<Resume>,
         protocol: u32,
+        upgrade_asked: &mut Option<u64>,
     ) -> bool {
         if !same_user(&stream) {
             self.log.write(json!({
@@ -388,7 +393,23 @@ impl Follower {
             }
             tokio::select! {
                 msg = messages.recv() => match msg {
-                    Some(Ok(m)) => if !self.handle(m, resume) { return true },
+                    Some(Ok(m)) => {
+                        let upgrade = upgrade_target(&m, upgrade_asked);
+                        if !self.handle(m, resume) {
+                            return true;
+                        }
+                        if let Some((from, exec)) = upgrade {
+                            self.log.write(json!({
+                                "type": "shim_upgrade",
+                                "app": self.name,
+                                "from": from,
+                                "to": env!("CARGO_PKG_VERSION"),
+                            }));
+                            if vexor_proto::send(&mut write, &ToShim::Upgrade { exec }).await.is_err() {
+                                return false;
+                            }
+                        }
+                    }
                     Some(Err(e)) => {
                         self.log.write(json!({
                             "type": "error",
@@ -497,6 +518,40 @@ impl Follower {
     }
 }
 
+/// A shim older than this daemon that can upgrade in place (protocol 5):
+/// its version and the program to run. Asked once per shim incarnation.
+fn upgrade_target(msg: &FromShim, asked: &mut Option<u64>) -> Option<(String, PathBuf)> {
+    let FromShim::Welcome {
+        protocol,
+        shim_start,
+        version: Some(version),
+        ..
+    } = msg
+    else {
+        return None;
+    };
+    if *protocol < 5 || *asked == Some(*shim_start) || !older(version, env!("CARGO_PKG_VERSION")) {
+        return None;
+    }
+    *asked = Some(*shim_start);
+    Some((version.clone(), std::env::current_exe().ok()?))
+}
+
+/// `a` is an older release than `b` (`major.minor.patch`; a pre-release
+/// suffix is ignored). Never true for versions that don't parse: a newer
+/// shim is never "upgraded" to an older program.
+fn older(a: &str, b: &str) -> bool {
+    let parse = |v: &str| -> Option<(u64, u64, u64)> {
+        let mut it = v
+            .split(['-', '+'])
+            .next()?
+            .split('.')
+            .map(|n| n.parse().ok());
+        Some((it.next()??, it.next()??, it.next()??))
+    };
+    matches!((parse(a), parse(b)), (Some(a), Some(b)) if a < b)
+}
+
 pub fn same_user(stream: &UnixStream) -> bool {
     stream
         .peer_cred()
@@ -508,5 +563,42 @@ struct AbortOnDrop(tokio::task::JoinHandle<()>);
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
         self.0.abort();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_older_shims_are_upgraded_once_each() {
+        assert!(older("0.12.0", "0.13.0"));
+        assert!(older("0.9.9", "0.10.0"));
+        assert!(older("1.2.3-beta.1", "1.2.4"));
+        assert!(!older("0.13.0", "0.13.0"));
+        assert!(!older("0.14.0", "0.13.0"), "never downgraded");
+        assert!(!older("garbage", "0.13.0"));
+        let welcome = |protocol, version: &str| FromShim::Welcome {
+            protocol,
+            app: "a".into(),
+            shim_pid: 1,
+            shim_start: 7,
+            next_seq: 0,
+            snapshot: Vec::new(),
+            version: Some(version.into()),
+        };
+        let mut asked = None;
+        assert!(
+            upgrade_target(&welcome(4, "0.0.1"), &mut asked).is_none(),
+            "protocol 4 can't"
+        );
+        assert!(upgrade_target(&welcome(5, "0.0.1"), &mut asked).is_some());
+        assert_eq!(asked, Some(7));
+        assert!(
+            upgrade_target(&welcome(5, "0.0.1"), &mut asked).is_none(),
+            "asked once"
+        );
+        let mut asked = None;
+        assert!(upgrade_target(&welcome(5, env!("CARGO_PKG_VERSION")), &mut asked).is_none());
     }
 }

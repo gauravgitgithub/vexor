@@ -19,7 +19,8 @@ pub const PROTOCOL: u32 = 1;
 /// so a shim accepts every version from [`MIN_SHIM_PROTOCOL`], and a daemon
 /// refused by an older shim says hello again with the minimum.
 /// 2: [`FromShim::Metrics`]. 3: [`ToShim::Scale`]. 4: [`FromShim::Routes`].
-pub const SHIM_PROTOCOL: u32 = 4;
+/// 5: [`ToShim::Upgrade`] and the shim's version in `welcome`.
+pub const SHIM_PROTOCOL: u32 = 5;
 pub const MIN_SHIM_PROTOCOL: u32 = 1;
 
 /// Longest accepted message line, in bytes.
@@ -46,6 +47,9 @@ pub enum ToShim {
     /// Run this many instances, starting or stopping only the difference
     /// (protocol 3).
     Scale { instances: u32 },
+    /// Replace the shim's program with `exec` in place, keeping every app
+    /// process, pipe and channel (protocol 5). Fork mode only.
+    Upgrade { exec: std::path::PathBuf },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,6 +72,9 @@ pub enum FromShim {
         next_seq: u64,
         /// Latest `state` event of each instance.
         snapshot: Vec<serde_json::Value>,
+        /// The shim's Vexor version (protocol 5).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        version: Option<String>,
     },
     Event {
         seq: u64,

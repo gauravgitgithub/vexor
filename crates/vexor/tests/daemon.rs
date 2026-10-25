@@ -505,38 +505,89 @@ fn control_files_are_private() {
     }
 }
 
-#[test]
-fn no_new_shim_while_a_dead_shims_instances_survive() {
-    let mut home = Home::new();
-    home.add_app("keep", "/bin/sh", &["-c", "sleep 300"], json!({}));
-    home.start_daemon();
-    home.wait_count("shim_connected", 1);
-    let shim = *home.shim_pids().iter().next().expect("shim pid");
-    let pids: Vec<u64> = serde_json::from_str::<Vec<Value>>(
-        &std::fs::read_to_string(home.path("shims/keep.pids.json")).expect("pids file"),
-    )
-    .expect("json")
-    .iter()
-    .filter_map(|i| i["pid"].as_u64())
-    .collect();
-    assert_eq!(pids.len(), 1);
+fn snapshot(home: &Home) -> Vec<Value> {
+    let out = home.cli(&["list", "--json"]);
+    let apps: Vec<Value> = serde_json::from_slice(&out.stdout).expect("json");
+    apps[0]["snapshot"].as_array().cloned().unwrap_or_default()
+}
 
-    // Simulate a shim crash: its app keeps running.
+/// Wait until every instance of the only app satisfies `ok`.
+fn wait_snapshot(home: &Home, what: &str, ok: impl Fn(&[Value]) -> bool) -> Vec<Value> {
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let snap = snapshot(home);
+        if ok(&snap) {
+            return snap;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{what}: {snap:?}\n{}",
+            home.diagnostics("keep")
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Plan step 2.4b fallback (architecture §7): a shim that dies leaves its
+/// instances running; the next shim adopts them (same PIDs, no duplicate),
+/// supervises them (restarted when they exit), and `vexor restart` brings
+/// back their output capture.
+#[test]
+fn a_dead_shims_instances_are_adopted_not_duplicated() {
+    let mut home = Home::new();
+    home.add_app(
+        "keep",
+        "/bin/sh",
+        &["-c", "echo started; exec sleep 300"],
+        json!({ "instances": 2, "policy": { "restart_delay_ms": 0 } }),
+    );
+    home.start_daemon();
+    let before = wait_snapshot(&home, "started", |s| {
+        s.len() == 2 && s.iter().all(|i| i["state"] == "online")
+    });
+    let pid = |s: &[Value], i: usize| s[i]["pid"].as_u64().expect("pid");
+    let (p0, p1) = (pid(&before, 0), pid(&before, 1));
+    let shim = *home.shim_pids().iter().next().expect("shim pid");
+
+    // A shim crash, with the daemon down too: the app keeps running.
     home.kill_daemon();
     let _ = Command::new("kill")
         .args(["-KILL", &shim.to_string()])
         .status();
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(alive(p0) && alive(p1));
     home.start_daemon();
-    home.wait_count("orphaned_instances", 1);
-    assert_eq!(
-        home.count("shim_launched"),
-        1,
-        "must not launch a duplicate"
-    );
-    assert!(alive(pids[0]));
+    let adopted = wait_snapshot(&home, "adopted", |s| {
+        s.len() == 2
+            && s.iter()
+                .all(|i| i["state"] == "online" && i["adopted"] == true)
+    });
+    assert_eq!((pid(&adopted, 0), pid(&adopted, 1)), (p0, p1));
+    assert_eq!(home.count("shim_launched"), 2, "one new shim, no duplicate");
+    let events = home.cli(&["events", "keep", "--json"]);
+    let events: Vec<Value> = serde_json::from_slice(&events.stdout).expect("json");
+    assert_eq!(events.iter().filter(|e| e["type"] == "adopted").count(), 2);
+
+    // Supervised: an adopted process that dies is restarted, with output.
     let _ = Command::new("kill")
-        .args(["-KILL", &pids[0].to_string()])
+        .args(["-KILL", &p0.to_string()])
         .status();
+    let restarted = wait_snapshot(&home, "restarted", |s| {
+        s.len() == 2 && s[0]["state"] == "online" && s[0]["pid"].as_u64() != Some(p0)
+    });
+    assert!(restarted[0].get("adopted").is_none(), "{restarted:?}");
+    assert_eq!(pid(&restarted, 1), p1);
+
+    // A restart replaces the other one too.
+    let out = home.cli(&["restart", "keep"]);
+    assert!(out.status.success());
+    wait_snapshot(&home, "all spawned", |s| {
+        s.len() == 2
+            && s.iter()
+                .all(|i| i["state"] == "online" && i.get("adopted").is_none())
+            && s[1]["pid"].as_u64() != Some(p1)
+    });
+    assert!(!alive(p1), "the adopted process was stopped by the restart");
 }
 
 // ------------------------------------------------------------------ reload
@@ -570,6 +621,58 @@ fn reloadable_app(home: &mut Home, node: &str, port: u16, cluster: bool, extra_p
     };
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     home.add_app("web", node, &args, extra);
+}
+
+/// Cluster mode: the primary a dead shim left can't be controlled (its
+/// channel went with the shim), so the next shim stops it, workers
+/// included, and starts the app again; nothing is left listening twice.
+#[test]
+fn a_dead_shims_cluster_is_stopped_and_started_again() {
+    let Some(node) = which("node") else {
+        eprintln!("skipping: node not found on PATH");
+        return;
+    };
+    let mut home = Home::new();
+    let port = free_port();
+    let addr: SocketAddr = ([127, 0, 0, 1], port).into();
+    reloadable_app(&mut home, &node, port, true, json!({}));
+    home.start_daemon();
+    let worker = server_pid(&wait_http(addr));
+    let shim = *home.shim_pids().iter().next().expect("shim pid");
+    home.kill_daemon();
+    let _ = Command::new("kill")
+        .args(["-KILL", &shim.to_string()])
+        .status();
+    // The old cluster keeps serving with no supervisor.
+    assert_eq!(server_pid(&wait_http(addr)), worker);
+    home.start_daemon();
+    let deadline = Instant::now() + TIMEOUT;
+    let stopped = loop {
+        let out = home.cli(&["events", "web", "--json"]);
+        let events: Vec<Value> = serde_json::from_slice(&out.stdout).expect("json");
+        if let Some(e) = events.iter().find(|e| e["type"] == "leftover_stopped") {
+            break e["pid"].as_u64().expect("pid");
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{events:?}\n{}",
+            home.diagnostics("web")
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert!(!alive(stopped), "old primary still running");
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        if let Ok(body) = get(addr, "/") {
+            let pid = server_pid(&body);
+            if pid != worker {
+                break;
+            }
+        }
+        assert!(Instant::now() < deadline, "new cluster not serving");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(!alive(worker), "old worker still running");
 }
 
 fn restarts(home: &Home) -> u64 {
@@ -985,9 +1088,9 @@ fn daemon_falls_back_to_protocol_1_for_an_older_shim() {
     // Steps down one version at a time until the shim accepts.
     assert_eq!(
         *seen.lock().expect("lock"),
-        [json!(4), json!(3), json!(2), json!(1)]
+        [json!(5), json!(4), json!(3), json!(2), json!(1)]
     );
-    assert_eq!(home.count("shim_refused"), 3);
+    assert_eq!(home.count("shim_refused"), 4);
     let out = home.cli(&["list", "--json"]);
     let apps: Vec<Value> = serde_json::from_slice(&out.stdout).expect("json");
     assert_eq!(apps[0]["snapshot"][0]["state"], "online", "{apps:?}");
@@ -1263,4 +1366,199 @@ fn scale_starts_and_stops_only_the_difference() {
     let now = pids(&home);
     assert_eq!(now.len(), 2, "{now:?}");
     assert!(now.contains(&before[0]), "{before:?} -> {now:?}");
+}
+
+// ----------------------------------------------------------- fault injection
+//
+// docs/faults.md: each test injects one fault and checks the outcome the
+// architecture promises. (Daemon kill -9 under load, a dead shim, and an
+// in-place upgrade under load have their own tests above and in
+// tests/upgrade.rs.)
+
+fn signal(pid: u64, sig: &str) {
+    let _ = Command::new("kill")
+        .args([&format!("-{sig}"), &pid.to_string()])
+        .status();
+}
+
+fn app_field(home: &Home, app: &str, field: &str) -> Value {
+    let out = home.cli(&["list", "--json"]);
+    let apps: Vec<Value> = serde_json::from_slice(&out.stdout).unwrap_or_default();
+    apps.iter()
+        .find(|a| a["name"] == app)
+        .map(|a| a[field].clone())
+        .unwrap_or(Value::Null)
+}
+
+fn lines_in(home: &Home, file: &str, needle: &str) -> usize {
+    std::fs::read_to_string(home.path(file))
+        .unwrap_or_default()
+        .matches(needle)
+        .count()
+}
+
+/// A hung daemon (SIGSTOP): apps keep running and keep being restarted by
+/// their shims; CLI questions fail within seconds and say what to do, not
+/// after minutes; the daemon carries on when it resumes.
+#[test]
+fn fault_hung_daemon() {
+    let mut home = Home::new();
+    home.add_app(
+        "keep",
+        "/bin/sh",
+        &["-c", "echo started; sleep 0.4; exit 1"],
+        json!({ "policy": { "restart_delay_ms": 0, "min_uptime_ms": 100, "max_restarts": 1000 } }),
+    );
+    home.start_daemon();
+    home.wait_count("shim_connected", 1);
+    let daemon = u64::from(home.daemon.as_ref().expect("daemon").id());
+    signal(daemon, "STOP");
+    let before = lines_in(&home, "keep.out", "started");
+    let started = Instant::now();
+    let out = home.cli(&["ls"]);
+    let took = started.elapsed();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert!(err.contains("did not answer within 10s"), "{err}");
+    assert!(took < Duration::from_secs(30), "took {took:?}");
+    // Restarts went on meanwhile, without the daemon.
+    assert!(
+        lines_in(&home, "keep.out", "started") >= before + 3,
+        "app not restarted while the daemon hung"
+    );
+    signal(daemon, "CONT");
+    let out = home.cli(&["ls", "--json"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// One app's hung shim doesn't stall the daemon or the other apps.
+#[test]
+fn fault_hung_shim() {
+    let mut home = Home::new();
+    home.add_app("a", "/bin/sh", &["-c", "exec sleep 300"], json!({}));
+    home.add_app("b", "/bin/sh", &["-c", "exec sleep 300"], json!({}));
+    home.start_daemon();
+    home.wait_count("shim_connected", 2);
+    let shim_a = app_field(&home, "a", "shim_pid").as_u64().expect("shim a");
+    signal(shim_a, "STOP");
+    let started = Instant::now();
+    let out = home.cli(&["restart", "b"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = home.cli(&["ls", "--json"]);
+    assert!(out.status.success());
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        started.elapsed()
+    );
+    signal(shim_a, "CONT");
+    let out = home.cli(&["restart", "a"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A corrupted event database: the daemon keeps supervising, keeps the bad
+/// file for inspection, starts a fresh one and says so.
+#[test]
+fn fault_corrupt_event_database() {
+    let mut home = Home::new();
+    home.add_app("keep", "/bin/sh", &["-c", "exec sleep 300"], json!({}));
+    home.start_daemon();
+    home.wait_count("shim_connected", 1);
+    let pid = snapshot(&home)[0]["pid"].as_u64().expect("pid");
+    home.kill_daemon();
+    std::fs::write(home.path("events.db"), vec![0x5a; 64 * 1024]).expect("corrupt");
+    for side in ["events.db-wal", "events.db-shm"] {
+        let _ = std::fs::remove_file(home.path(side));
+    }
+    home.start_daemon();
+    home.wait_count("shim_connected", 2);
+    let out = home.cli(&["ls", "--json"]);
+    assert!(out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("event history was unreadable"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        snapshot(&home)[0]["pid"].as_u64(),
+        Some(pid),
+        "app untouched"
+    );
+    let kept = std::fs::read_dir(home.dir.path())
+        .expect("dir")
+        .flatten()
+        .any(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with("events.db.corrupt-")
+        });
+    assert!(kept, "bad file not kept");
+    // History works again.
+    let out = home.cli(&["events", "--json"]);
+    assert!(out.status.success());
+}
+
+/// The log file can't be written (here: replaced by a directory): the
+/// error is reported once, the app keeps running, and logging resumes as
+/// soon as the path is usable again.
+#[test]
+fn fault_unwritable_log_file() {
+    let mut home = Home::new();
+    home.add_app(
+        "keep",
+        "/bin/sh",
+        &[
+            "-c",
+            "i=0; while :; do echo line $i; i=$((i+1)); sleep 0.05; done",
+        ],
+        json!({}),
+    );
+    home.start_daemon();
+    home.wait_count("shim_connected", 1);
+    let pid = wait_snapshot(&home, "online", |s| {
+        s.len() == 1 && s[0]["state"] == "online"
+    })[0]["pid"]
+        .as_u64()
+        .expect("pid");
+    let log = home.path("keep.out");
+    let deadline = Instant::now() + TIMEOUT;
+    while lines_in(&home, "keep.out", "line") < 3 {
+        assert!(Instant::now() < deadline, "no output");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::fs::remove_file(&log).expect("rm");
+    std::fs::create_dir(&log).expect("mkdir");
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let out = home.cli(&["events", "keep", "--json"]);
+        let events: Vec<Value> = serde_json::from_slice(&out.stdout).unwrap_or_default();
+        if events.iter().any(|e| e["type"] == "log_error") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "no log_error: {events:?}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(
+        snapshot(&home)[0]["pid"].as_u64(),
+        Some(pid),
+        "app kept running"
+    );
+    std::fs::remove_dir(&log).expect("rmdir");
+    let deadline = Instant::now() + TIMEOUT;
+    while lines_in(&home, "keep.out", "line") < 3 {
+        assert!(Instant::now() < deadline, "logging did not resume");
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }

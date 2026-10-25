@@ -309,6 +309,9 @@ enum Command {
         /// the control socket.
         #[arg(long)]
         managed: bool,
+        /// Resume from this handover file (in-place upgrade; internal).
+        #[arg(long, hide = true)]
+        handover: Option<PathBuf>,
     },
 }
 
@@ -398,9 +401,14 @@ fn main() -> ExitCode {
     };
     match command {
         Command::Daemon => exit_code(vexor_daemon::run(&home)),
-        Command::Shim { spec, managed } => exit_code(vexor_shim::run_from_file(
+        Command::Shim {
+            spec,
+            managed,
+            handover,
+        } => exit_code(vexor_shim::run_from_file(
             &spec,
             managed.then_some(home.as_path()),
+            handover.as_deref(),
         )),
         Command::Start(args) => match spec::start_plan(&args, &home) {
             Ok(plan) => run_plan(&home, plan, args.allow_unsupported),

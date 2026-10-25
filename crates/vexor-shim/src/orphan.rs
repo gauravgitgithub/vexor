@@ -13,31 +13,63 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use serde::{Deserialize, Serialize};
+
 use crate::identity::Identity;
 
-/// PIDs of instance leaders. They are the shim's own children, waited on by
-/// tokio; orphan handling must never reap them. In daemon mode their
-/// identities are also persisted, so the daemon can detect survivors of a
-/// shim crash.
+/// PIDs of instance leaders (and of the cluster primary). They are the
+/// shim's own children, waited on by tokio; orphan handling must never reap
+/// them. In daemon mode their identities are also persisted, so the daemon
+/// can detect survivors of a shim crash and the next shim can adopt them.
 #[derive(Debug, Clone, Default)]
 pub struct Managed(Arc<Mutex<Leaders>>);
 
 #[derive(Debug, Default)]
 struct Leaders {
-    pids: BTreeMap<u32, Option<Identity>>,
+    pids: BTreeMap<u32, (Option<Identity>, Option<u32>)>,
     persist: Option<PathBuf>,
 }
 
+/// One recorded process: its identity and, for an instance leader, the
+/// instance number (absent in files from before 0.13, and for a cluster
+/// primary).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Leader {
+    #[serde(flatten)]
+    pub identity: Identity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance: Option<u32>,
+}
+
 impl Managed {
-    pub fn persisted(path: PathBuf) -> Self {
+    /// Record leaders in `path` from now on. Returns the leaders the
+    /// previous shim recorded there that are still alive (it died without
+    /// stopping them).
+    pub fn persisted(path: PathBuf) -> (Self, Vec<Leader>) {
+        let survivors: Vec<Leader> = std::fs::read(&path)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Vec<Leader>>(&b).ok())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|l| l.identity.is_alive())
+            .collect();
         let m = Managed::default();
-        m.lock().persist = Some(path);
+        {
+            let mut l = m.lock();
+            l.persist = Some(path);
+            // Still ours to account for until adopted or stopped.
+            for s in &survivors {
+                l.pids
+                    .insert(s.identity.pid, (Some(s.identity), s.instance));
+            }
+        }
         m.save();
-        m
+        (m, survivors)
     }
 
-    pub fn insert(&self, pid: u32, identity: Option<Identity>) {
-        self.lock().pids.insert(pid, identity);
+    /// A leader started (or adopted) for `instance`, or the cluster primary.
+    pub fn insert(&self, pid: u32, identity: Option<Identity>, instance: Option<u32>) {
+        self.lock().pids.insert(pid, (identity, instance));
         self.save();
     }
 
@@ -56,7 +88,16 @@ impl Managed {
         let Some(path) = &leaders.persist else {
             return;
         };
-        let ids: Vec<&Identity> = leaders.pids.values().flatten().collect();
+        let ids: Vec<Leader> = leaders
+            .pids
+            .values()
+            .filter_map(|&(identity, instance)| {
+                Some(Leader {
+                    identity: identity?,
+                    instance,
+                })
+            })
+            .collect();
         let result = serde_json::to_vec(&ids)
             .map_err(std::io::Error::other)
             .and_then(|json| crate::control::write_atomic(path, &json));
@@ -141,6 +182,33 @@ fn signal_if_same(id: &Identity, sig: rustix::process::Signal) {
     {
         let _ = rustix::process::kill_process(pid, sig);
     }
+}
+
+/// Stop processes a dead shim left behind that won't be adopted: their
+/// process groups get SIGTERM, then SIGKILL after `grace`. Identity-checked,
+/// since they are not our children and their PIDs could be reused.
+pub async fn stop_leftovers(leftovers: &[Identity], grace: std::time::Duration) {
+    use rustix::process::Signal;
+
+    let signal = |sig| {
+        for id in leftovers {
+            if id.is_alive()
+                && let Some(pid) = to_pid(id.pid)
+            {
+                let _ = rustix::process::kill_process_group(pid, sig)
+                    .or_else(|_| rustix::process::kill_process(pid, sig));
+            }
+        }
+    };
+    signal(Signal::TERM);
+    let deadline = tokio::time::Instant::now() + grace;
+    while tokio::time::Instant::now() < deadline {
+        if !leftovers.iter().any(Identity::is_alive) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    signal(Signal::KILL);
 }
 
 fn to_pid(pid: u32) -> Option<rustix::process::Pid> {

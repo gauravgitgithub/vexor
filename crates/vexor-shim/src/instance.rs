@@ -17,7 +17,9 @@ use rustix::process::Signal;
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
-use vexor_core::{AppSpec, Ctx, Effect, Event, ExitStatus, Instance, Millis, State, Timer};
+use vexor_core::{
+    AppSpec, Ctx, Desired, Effect, Event, ExitStatus, Instance, Millis, State, Timer,
+};
 
 use crate::cluster::{Cluster, WorkerEvent, WorkerMsg};
 use crate::identity::Identity;
@@ -25,7 +27,8 @@ use crate::logs::Sink;
 use crate::memory;
 use crate::orphan::{self, Managed};
 use crate::output::{Output, ShimEvent};
-use crate::process::{self, IpcChannel, IpcMessage};
+use crate::proc::Proc;
+use crate::process::{self, IpcChannel, IpcMessage, Pumps};
 
 /// How long to wait for log pipes to drain after the instance has finished.
 /// A grandchild that inherited stdout can hold a pipe open indefinitely.
@@ -39,6 +42,42 @@ const POLL: Duration = Duration::from_millis(25);
 pub enum Control {
     Restart,
     Reload,
+    /// Hand the instance over to the shim's next program image (in-place
+    /// upgrade), as soon as nothing is in progress.
+    Freeze,
+}
+
+/// How [`Runner::run`] ended.
+pub enum RunEnd {
+    Done(State),
+    Frozen(Frozen),
+}
+
+/// An instance handed over for an in-place upgrade.
+pub struct Frozen {
+    pub index: u32,
+    pub restarts: u64,
+    pub process: Option<FrozenProcess>,
+}
+
+/// The running process of a frozen instance. Its pumps are still copying
+/// output until the logs are frozen; then they return its pipes.
+pub struct FrozenProcess {
+    pub identity: Identity,
+    /// Left by a shim that died: not our child (see [`Proc::Adopted`]).
+    pub adopted: bool,
+    pub ipc: Option<std::os::fd::OwnedFd>,
+    pub pumps: Pumps,
+}
+
+/// What [`Runner::inheriting`] resumes.
+pub struct Inherited {
+    pub restarts: u64,
+    pub identity: Identity,
+    pub adopted: bool,
+    pub ipc: Option<std::os::fd::OwnedFd>,
+    pub stdout: Option<std::os::fd::OwnedFd>,
+    pub stderr: Option<std::os::fd::OwnedFd>,
 }
 
 /// A cluster worker as this instance knows it.
@@ -69,12 +108,12 @@ pub struct Runner {
     err_log: Sink,
     cluster: Option<(Cluster, mpsc::UnboundedReceiver<WorkerMsg>)>,
 
-    cur_child: Option<tokio::process::Child>,
+    cur_child: Option<Proc>,
     cur_ipc: Option<IpcChannel>,
     cur_fork: Option<Forked>,
     cur_worker: Option<Worker>,
 
-    rep_child: Option<tokio::process::Child>,
+    rep_child: Option<Proc>,
     rep_ipc: Option<IpcChannel>,
     rep_fork: Option<Forked>,
     rep_worker: Option<Worker>,
@@ -82,7 +121,10 @@ pub struct Runner {
     abandoned: BTreeSet<u32>,
 
     timer: Option<(Timer, u64, Instant)>,
-    log_tasks: Vec<JoinHandle<()>>,
+    /// Pumps of processes that are not current any more, until they end.
+    log_tasks: Vec<JoinHandle<Option<std::os::fd::OwnedFd>>>,
+    cur_pumps: Option<Pumps>,
+    rep_pumps: Option<Pumps>,
     retiring: Vec<JoinHandle<()>>,
     queue: VecDeque<Event>,
     rand: std::collections::hash_map::RandomState,
@@ -92,6 +134,13 @@ pub struct Runner {
     /// HTTP/TCP health check (fork mode; cluster mode checks the app as a
     /// whole, in `lib.rs`).
     health: Option<HealthRun>,
+    /// A process left running by a shim that died, to take over instead of
+    /// starting one (see [`Runner::adopting`]).
+    adopt: Option<Identity>,
+    /// Handed over by the previous program image (in-place upgrade).
+    inherit: Option<Inherited>,
+    /// `Control::Freeze` arrived: hand over once nothing is in progress.
+    freezing: bool,
 }
 
 type ProbeResult = (u32, Result<(), String>);
@@ -144,13 +193,34 @@ impl Runner {
             abandoned: BTreeSet::new(),
             timer: None,
             log_tasks: Vec::new(),
+            cur_pumps: None,
+            rep_pumps: None,
             retiring: Vec::new(),
             queue: VecDeque::new(),
             rand: std::collections::hash_map::RandomState::new(),
             rand_counter: 0,
             memory_check: None,
             health: None,
+            adopt: None,
+            inherit: None,
+            freezing: false,
         }
+    }
+
+    /// Resume an instance the previous program image of this shim handed
+    /// over: its process keeps running, its output keeps flowing.
+    pub fn inheriting(mut self, inherited: Inherited) -> Self {
+        self.inherit = Some(inherited);
+        self
+    }
+
+    /// Take over `identity`, an instance process a shim that died left
+    /// running (fork mode), instead of starting one: it stays online and is
+    /// supervised as usual, but its output went to the dead shim and is not
+    /// captured until it is restarted.
+    pub fn adopting(mut self, identity: Identity) -> Self {
+        self.adopt = Some(identity);
+        self
     }
 
     /// Start the instance and supervise it. Ends once `shutdown` turns true
@@ -161,8 +231,30 @@ impl Runner {
         mut shutdown: watch::Receiver<bool>,
         mut control: broadcast::Receiver<Control>,
         exit_when_idle: bool,
-    ) -> State {
-        self.queue.push_back(Event::Start);
+    ) -> RunEnd {
+        let inherited = self.inherit.take().filter(|i| i.identity.is_alive());
+        if let Some(i) = inherited {
+            self.resume(i);
+        } else {
+            match self.adopt.take() {
+                Some(id) if self.cluster.is_none() && id.is_alive() => {
+                    self.inst = Instance::recovering(self.spec.instance_policy(), Desired::Running);
+                    self.managed.insert(id.pid, Some(id), Some(self.index));
+                    self.cur_fork = Some(Forked {
+                        pid: id.pid,
+                        identity: Some(id),
+                    });
+                    self.cur_child = Some(Proc::Adopted(id));
+                    self.out.emit(&ShimEvent::Adopted {
+                        app: &self.spec.name,
+                        instance: self.index,
+                        pid: id.pid,
+                    });
+                    self.queue.push_back(Event::Recovered { alive: true });
+                }
+                _ => self.queue.push_back(Event::Start),
+            }
+        }
         if self.spec.policy.max_memory_bytes.is_some() {
             let period = Duration::from_millis(self.spec.policy.memory_check_interval_ms.max(100));
             let mut tick = tokio::time::interval_at(Instant::now() + period, period);
@@ -193,6 +285,9 @@ impl Runner {
             while let Some(event) = self.queue.pop_front() {
                 self.dispatch(event);
             }
+            if self.freezing && self.freezable() {
+                return RunEnd::Frozen(self.freeze());
+            }
             let idle =
                 !self.alive() && matches!(self.inst.state(), State::Stopped | State::Errored);
             if idle && (exit_when_idle || shutting_down) {
@@ -204,6 +299,9 @@ impl Runner {
                 status = wait_child(&mut self.cur_child), if self.cur_child.is_some() => {
                     self.cur_child = None;
                     self.cur_ipc = None;
+                    if let Some(p) = self.cur_pumps.take() {
+                        self.keep_log_tasks(p);
+                    }
                     if let Some(f) = self.cur_fork.take() {
                         self.managed.remove(f.pid);
                         if self.spec.treekill {
@@ -215,6 +313,9 @@ impl Runner {
                 status = wait_child(&mut self.rep_child), if self.rep_child.is_some() => {
                     self.rep_child = None;
                     self.rep_ipc = None;
+                    if let Some(p) = self.rep_pumps.take() {
+                        self.keep_log_tasks(p);
+                    }
                     if let Some(f) = self.rep_fork.take() {
                         self.managed.remove(f.pid);
                         // A failed replacement never served: don't wait.
@@ -261,6 +362,7 @@ impl Runner {
                 c = control.recv(), if control_open && !shutting_down => match c {
                     Ok(Control::Restart) => self.queue.push_back(Event::Restart),
                     Ok(Control::Reload) => self.queue.push_back(Event::Reload),
+                    Ok(Control::Freeze) => self.freezing = true,
                     Err(broadcast::error::RecvError::Lagged(_)) => {}
                     Err(broadcast::error::RecvError::Closed) => control_open = false,
                 },
@@ -268,7 +370,71 @@ impl Runner {
         }
         self.finish_retiring().await;
         self.drain_logs().await;
-        self.inst.state()
+        RunEnd::Done(self.inst.state())
+    }
+
+    /// Nothing is in progress that the next program image couldn't pick up:
+    /// no reload, no stop, no retiring process. Cluster mode never freezes.
+    fn freezable(&self) -> bool {
+        self.cluster.is_none()
+            && self.rep_child.is_none()
+            && !self.inst.reloading()
+            && self.inst.state() != State::Stopping
+            && self.retiring.iter().all(JoinHandle::is_finished)
+    }
+
+    fn freeze(&mut self) -> Frozen {
+        let process = match (self.cur_fork, self.cur_child.take()) {
+            (
+                Some(Forked {
+                    identity: Some(identity),
+                    ..
+                }),
+                Some(child),
+            ) => Some(FrozenProcess {
+                identity,
+                adopted: matches!(child, Proc::Adopted(_)),
+                ipc: self.cur_ipc.take().and_then(IpcChannel::into_fd),
+                pumps: self.cur_pumps.take().unwrap_or_default(),
+            }),
+            _ => None,
+        };
+        Frozen {
+            index: self.index,
+            restarts: self.inst.restarts(),
+            process,
+        }
+    }
+
+    fn resume(&mut self, i: Inherited) {
+        let now = self.now();
+        self.inst = Instance::inherited(self.spec.instance_policy(), i.restarts, now);
+        let pid = i.identity.pid;
+        self.managed.insert(pid, Some(i.identity), Some(self.index));
+        self.cur_fork = Some(Forked {
+            pid,
+            identity: Some(i.identity),
+        });
+        self.cur_child = Some(if i.adopted {
+            Proc::Adopted(i.identity)
+        } else {
+            Proc::Inherited(pid)
+        });
+        self.cur_ipc = i
+            .ipc
+            .and_then(|fd| {
+                let s = std::os::unix::net::UnixStream::from(fd);
+                s.set_nonblocking(true).ok()?;
+                tokio::net::UnixStream::from_std(s).ok()
+            })
+            .map(IpcChannel::new);
+        match Pumps::start(i.stdout, i.stderr, &self.out_log, &self.err_log) {
+            Ok(p) => self.cur_pumps = Some(p),
+            Err(e) => eprintln!(
+                "vexor shim: {}[{}]: output not resumed: {e}",
+                self.spec.name, self.index
+            ),
+        }
     }
 
     /// The current process is running.
@@ -496,14 +662,16 @@ impl Runner {
                 match process::spawn(&self.spec, self.index, &self.out_log, &self.err_log) {
                     Ok(s) => {
                         let identity = Identity::of(s.pid).ok();
-                        self.managed.insert(s.pid, identity);
+                        self.managed.insert(s.pid, identity, Some(self.index));
                         self.cur_fork = Some(Forked {
                             pid: s.pid,
                             identity,
                         });
-                        self.cur_child = Some(s.child);
+                        self.cur_child = Some(Proc::Spawned(s.child));
                         self.cur_ipc = s.ipc.map(IpcChannel::new);
-                        self.keep_log_tasks(s.log_tasks);
+                        if let Some(old) = self.cur_pumps.replace(s.pumps) {
+                            self.keep_log_tasks(old);
+                        }
                         self.queue.push_back(Event::Spawned);
                     }
                     Err(e) => {
@@ -541,14 +709,16 @@ impl Runner {
         match process::spawn(&self.spec, self.index, &self.out_log, &self.err_log) {
             Ok(s) => {
                 let identity = Identity::of(s.pid).ok();
-                self.managed.insert(s.pid, identity);
+                self.managed.insert(s.pid, identity, Some(self.index));
                 self.rep_fork = Some(Forked {
                     pid: s.pid,
                     identity,
                 });
-                self.rep_child = Some(s.child);
+                self.rep_child = Some(Proc::Spawned(s.child));
                 self.rep_ipc = s.ipc.map(IpcChannel::new);
-                self.keep_log_tasks(s.log_tasks);
+                if let Some(old) = self.rep_pumps.replace(s.pumps) {
+                    self.keep_log_tasks(old);
+                }
                 self.queue.push_back(Event::ReplacementSpawned);
             }
             Err(e) => {
@@ -573,6 +743,9 @@ impl Runner {
             self.cur_ipc = self.rep_ipc.take();
             self.cur_child = self.rep_child.take();
             self.cur_fork = self.rep_fork.take();
+            if let Some(old) = std::mem::replace(&mut self.cur_pumps, self.rep_pumps.take()) {
+                self.keep_log_tasks(old);
+            }
         }
         self.out.emit(&ShimEvent::Reload {
             app: &self.spec.name,
@@ -594,6 +767,9 @@ impl Runner {
         if let (Some(child), Some(f)) = (self.rep_child.take(), self.rep_fork.take()) {
             self.retire_child(child, f.pid, rep_ipc);
         }
+        if let Some(p) = self.rep_pumps.take() {
+            self.keep_log_tasks(p);
+        }
         self.out.emit(&ShimEvent::Reload {
             app: &self.spec.name,
             instance: self.index,
@@ -604,12 +780,7 @@ impl Runner {
     /// Stop a forked process gracefully in the background: the stop signal
     /// (or the `'shutdown'` message), then SIGKILL after `kill_timeout`,
     /// then clear its process group.
-    fn retire_child(
-        &mut self,
-        mut child: tokio::process::Child,
-        pid: u32,
-        ipc: Option<IpcChannel>,
-    ) {
+    fn retire_child(&mut self, mut child: Proc, pid: u32, ipc: Option<IpcChannel>) {
         let messaged =
             self.spec.shutdown_with_message && ipc.as_ref().is_some_and(IpcChannel::send_shutdown);
         let treekill = self.spec.treekill;
@@ -685,9 +856,9 @@ impl Runner {
         }
     }
 
-    fn keep_log_tasks(&mut self, tasks: Vec<JoinHandle<()>>) {
+    fn keep_log_tasks(&mut self, pumps: Pumps) {
         self.log_tasks.retain(|t| !t.is_finished());
-        self.log_tasks.extend(tasks);
+        self.log_tasks.extend(pumps.into_tasks());
     }
 
     fn spawn_error(&self, error: String) {
@@ -726,11 +897,16 @@ impl Runner {
             return;
         }
         // Only while our child is unreaped: its PID (and group) can't have
-        // been reused yet.
+        // been reused yet. An adopted process isn't our child: checked by
+        // identity instead.
         let Some(pid) = self
             .cur_fork
             .map(|f| f.pid)
-            .filter(|_| self.cur_child.is_some())
+            .filter(|_| match &self.cur_child {
+                Some(Proc::Adopted(id)) => id.is_alive(),
+                Some(_) => true,
+                None => false,
+            })
         else {
             return;
         };
@@ -758,6 +934,7 @@ impl Runner {
             restarts: self.inst.restarts(),
             exit: self.inst.last_exit().filter(|_| !running),
             error: self.inst.error(),
+            adopted: matches!(self.cur_child, Some(Proc::Adopted(_))),
         });
     }
 
@@ -825,7 +1002,13 @@ impl Runner {
     /// writer alive forever, so readers still running after the timeout are
     /// cancelled.
     async fn drain_logs(&mut self) {
-        let tasks = std::mem::take(&mut self.log_tasks);
+        let mut tasks = std::mem::take(&mut self.log_tasks);
+        for p in [self.cur_pumps.take(), self.rep_pumps.take()]
+            .into_iter()
+            .flatten()
+        {
+            tasks.extend(p.into_tasks());
+        }
         let aborts: Vec<_> = tasks.iter().map(JoinHandle::abort_handle).collect();
         let all = async {
             for t in tasks {
@@ -840,22 +1023,10 @@ impl Runner {
     }
 }
 
-async fn wait_child(child: &mut Option<tokio::process::Child>) -> ExitStatus {
-    let Some(c) = child else {
-        return std::future::pending().await;
-    };
-    match c.wait().await {
-        Ok(status) => {
-            use std::os::unix::process::ExitStatusExt;
-            ExitStatus {
-                code: status.code(),
-                signal: status.signal(),
-            }
-        }
-        Err(e) => {
-            eprintln!("vexor shim: wait failed: {e}");
-            ExitStatus::default()
-        }
+async fn wait_child(child: &mut Option<Proc>) -> ExitStatus {
+    match child {
+        Some(c) => c.wait().await,
+        None => std::future::pending().await,
     }
 }
 

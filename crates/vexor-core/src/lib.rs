@@ -10,8 +10,8 @@ pub mod spec;
 pub mod time;
 
 pub use lifecycle::{
-    AfterStop, Ctx, Effect, ErrorReason, Event, ExitStatus, HealthPolicy, Instance, InstancePolicy,
-    ReplacementReady, State, Timer,
+    AfterStop, Ctx, Desired, Effect, ErrorReason, Event, ExitStatus, HealthPolicy, Instance,
+    InstancePolicy, ReplacementReady, State, Timer,
 };
 pub use restart::{Backoff, Jitter, MIN_RESTART_INTERVAL, RestartPolicy};
 pub use spec::{

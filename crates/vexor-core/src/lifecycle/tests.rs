@@ -109,6 +109,23 @@ fn start_spawns_and_goes_online() {
 }
 
 #[test]
+fn an_inherited_instance_is_online_and_keeps_its_restarts() {
+    let mut i = Instance::inherited(InstancePolicy::default(), 4, Millis(1_000));
+    check_invariants(&i);
+    assert_eq!(
+        (i.state(), i.desired(), i.restarts()),
+        (State::Online, Desired::Running, 4)
+    );
+    assert_eq!(i.uptime(Millis(3_000)), Some(MS(2_000)));
+    // Supervised as usual: a crash restarts it and counts.
+    let fx = step(&mut i, exit(1), 3_000);
+    assert!(!fx.is_empty());
+    let fx = fire(&mut i, 10_000);
+    assert_eq!(fx, vec![Effect::Spawn]);
+    assert_eq!(i.restarts(), 5);
+}
+
+#[test]
 fn start_is_idempotent_while_running() {
     let mut i = online(InstancePolicy::default());
     assert_eq!(step(&mut i, Event::Start, 10), vec![]);

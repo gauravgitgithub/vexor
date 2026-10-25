@@ -103,7 +103,7 @@ CLUSTER_END
 # than matching instance and state together.
 # Up to 30 s: an old Node on a cold CI runner can take over 10 s to fork
 # both workers.
-online() { grep -c '"state":"online"' "$D/cl.events" 2>/dev/null || echo 0; }
+online() { n=$(grep -c '"state":"online"' "$D/cl.events" 2>/dev/null); echo "${n:-0}"; }
 i=0
 while [ "$(online)" -lt 2 ]; do
   i=$((i + 1)); [ "$i" -gt 300 ] && break; sleep 0.1

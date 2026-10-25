@@ -3,9 +3,29 @@
 All notable changes to Vexor. Versions follow [Semantic Versioning](https://semver.org/);
 before 1.0, minor versions may include breaking changes, which are listed here.
 
-## Unreleased
+## 0.13.0 (2026-10-25, prerelease)
+
+### Added
+- In-place shim upgrade: after upgrading Vexor, the daemon asks each app's
+  supervisor (shim) to replace itself with the new version. Apps keep
+  running in the same processes, output keeps flowing, nothing is
+  restarted. Fork mode; cluster-mode apps move to the new version at their
+  next reload or restart. Works for shims from 0.13 on.
+- A shim that dies no longer leaves its apps unsupervised: the next shim
+  adopts the running processes (same PIDs, identity-checked) and restarts
+  them when they exit; `describe` and `doctor` say their output isn't
+  captured until then. Cluster mode: the leftover cluster is stopped and
+  started again.
+- docs/faults.md: the faults Vexor is tested against and what happens.
+
+### Fixed
+- CLI questions (`ls`, `describe`, `events`, `metrics`, `routes`, `alerts`)
+  to a hung daemon failed only after 5 minutes; now after 10 s, saying what
+  to do. Commands that can take long (`stop`, `restart`, ...) keep 5
+  minutes.
 
 ### Changed
+- Shim protocol 5. `<app>.pids.json` records instance numbers.
 - Every release is installed and run with npm, pnpm and Yarn (1, and 4
   with Plug'n'Play and `node_modules`), in a project and globally, on Linux
   x64 and arm64, macOS arm64 and macOS x64 on Intel hardware
